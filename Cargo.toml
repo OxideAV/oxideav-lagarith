@@ -1,0 +1,17 @@
+[package]
+name = "oxideav-lagarith"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+repository = "https://github.com/OxideAV/oxideav-lagarith"
+authors = ["Mark Karpeles"]
+description = "Pure-Rust Lagarith lossless video decoder for the oxideav framework"
+
+readme = "README.md"
+homepage = "https://github.com/OxideAV/oxideav-lagarith"
+keywords = ["multimedia", "video", "lagarith", "lossless", "codec"]
+categories = ["multimedia::encoding", "multimedia::video"]
+
+[dependencies]
+oxideav-core = "0.1"
