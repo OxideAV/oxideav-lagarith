@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.1](https://github.com/OxideAV/oxideav-lagarith/compare/v0.0.0...v0.0.1) - 2026-05-03
+
+### Other
+
+- replace never-match regex with semver_check = false
+
 - Initial scaffold:
   - Frame-header parser (1-byte frametype + 4 / 8 / 12-byte plane offset
     table).
