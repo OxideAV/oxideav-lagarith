@@ -1,18 +1,20 @@
-//! Lookup tables used by the residual-RLE escape (`spec/05`) and the
-//! range coder's reciprocal-multiply path (`spec/02` §5 Step C).
+//! Lookup tables used by the residual-RLE escape (`spec/05`).
 //!
-//! The numeric extracts at `docs/video/lagarith/tables/01..02-*.csv`
-//! are pulled in via [`include_str!`] and parsed at module-init time
-//! by [`once_cell`-style] `OnceLock`s — the values are validated
-//! against the algebraic forms in `spec/05` §3.2 / §5.2 as a static
-//! cross-check, so a stale CSV would surface as a unit-test failure.
+//! The numeric extracts at `tables/01..02-*.csv` are mirrored from
+//! the cleanroom workspace's `docs/video/lagarith/tables/`
+//! (re-extracted from the proprietary DLL by
+//! `extract-luts.sh`). They are pulled in via [`include_str!`] at
+//! compile time and parsed once into static caches; the values are
+//! validated against the algebraic forms in `spec/05` §3.2 / §5.2
+//! as a unit-test cross-check, so a stale CSV would surface as a
+//! test failure.
 //!
-//! The reciprocal-multiply LUT is *not* used in this build's decoder
-//! path: `spec/02` §5 explicitly invites the clean-room implementation
-//! to substitute a "straight cumulative search" loop, which produces
-//! bit-identical output without depending on the LUT. We still ship
-//! the CSV-loading scaffolding so a later round can drop the slow
-//! path in.
+//! The range-coder reciprocal-multiply LUT (`spec/02` §5 step C) is
+//! *not* used by this build's decoder path: `spec/02` §5 explicitly
+//! invites the clean-room implementation to substitute a "straight
+//! cumulative search" loop, which produces bit-identical output
+//! without depending on the LUT. The decoder uses the search loop;
+//! the LUT is therefore not shipped here.
 
 use std::sync::OnceLock;
 
@@ -20,7 +22,7 @@ use std::sync::OnceLock;
 /// is the value; upper bytes always zero — see CSV header block).
 const RLE_FWD_LUT_CSV: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../docs/video/lagarith/tables/01-residual-rle-decoder-lut.csv",
+    "/tables/01-residual-rle-decoder-lut.csv",
 ));
 
 /// CSV source for the residual-RLE inverse LUT (256 × u8). Used by
@@ -29,7 +31,7 @@ const RLE_FWD_LUT_CSV: &str = include_str!(concat!(
 #[cfg(test)]
 const RLE_INV_LUT_CSV: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../docs/video/lagarith/tables/02-residual-rle-encoder-inv-lut.csv",
+    "/tables/02-residual-rle-encoder-inv-lut.csv",
 ));
 
 /// Forward residual-RLE LUT: `LUT[supplement_byte] -> run_length`.
