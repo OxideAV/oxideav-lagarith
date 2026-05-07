@@ -1,32 +1,83 @@
-//! Pure-Rust Lagarith lossless video codec.
+//! Pure-Rust Lagarith lossless video decoder.
 //!
-//! **Round 0 — clean-room rebuild scaffold.** This is a fresh orphan
-//! `master`; the previous implementation was retired alongside the
-//! OxideAV docs audit dated 2026-05-06. See `README.md` for the
-//! rebuild scope and the strict-isolation clean-room workspace the
-//! Implementer rounds will draw from.
+//! **Round 1 of the clean-room rebuild.** Implements the modern
+//! arithmetic-coded RGB24 / RGB32 / RGBA decode pipeline plus the
+//! Uncompressed (type 1) and Solid (types 5 / 6 / 9) literal frames
+//! per the strict-isolation cleanroom workspace at
+//! `docs/video/lagarith/`. Frame types 3 (YUY2), 7 (legacy RGB),
+//! 10 (YV12), and 11 (reduced-resolution) are deferred to future
+//! rounds.
+//!
+//! ## Pipeline (arithmetic-coded RGB family)
+//!
+//! 1. **Frame layout** ([`spec/01`]): byte 0 is the frame-type
+//!    selector; non-NULL frames carry an `(n_channels - 1) * 4`
+//!    byte channel-offset table next. RGB24/RGB32 use 3 channels;
+//!    RGBA uses 4.
+//! 2. **Per-channel header dispatcher** ([`spec/03` §2.1] +
+//!    [`spec/06` §1]): the channel's first byte selects between
+//!    arithmetic decode, raw memcpy, RLE-only, and solid-fill.
+//! 3. **Fibonacci probability prefix** ([`spec/04`]): bit-stream
+//!    (MSB-first) decode of the 256-entry frequency table.
+//! 4. **Modern range coder** ([`spec/02`]): TOP = 2^23, init range
+//!    = 2^31, four-byte priming with a 31-bit init state, byte
+//!    refill with cross-byte LSB rotation, four-byte flush tail.
+//! 5. **Residual zero-run RLE escape** ([`spec/05`]): post-process
+//!    expansion of `escape_len + LUT[supplement_byte]`-zero runs.
+//! 6. **Spatial predictor** ([`spec/03` §3]): left for row 0,
+//!    JPEG-LS clamped median for rows ≥ 1, with the
+//!    `TL = L = plane[y-1][W-1]` first-column rule.
+//! 7. **Cross-plane decorrelation** ([`spec/03` §4]): RGB families
+//!    only — `R += G; B += G` after spatial prediction; alpha
+//!    plane (RGBA) is unchanged.
+//!
+//! ## Public API
+//!
+//! - [`decode_frame`] — decode one Lagarith-encoded frame's bytes.
+//! - [`PixelKind`] — host-side pixel format selector
+//!   (`Bgr24` / `Bgra32`).
+//! - [`Error`] / [`Result`] — crate-local error type.
+//!
+//! ## Cargo features
+//!
+//! - **`registry`** (default): wire the crate into `oxideav-core`'s
+//!   codec registry.
+//!
+//! [`spec/01`]: https://github.com/OxideAV/docs/blob/master/video/lagarith/spec/01-frame-data-layout.md
+//! [`spec/02`]: https://github.com/OxideAV/docs/blob/master/video/lagarith/spec/02-range-coder-framing.md
+//! [`spec/03` §2.1]: https://github.com/OxideAV/docs/blob/master/video/lagarith/spec/03-channel-decorrelation-and-predictors.md
+//! [`spec/03` §3]: https://github.com/OxideAV/docs/blob/master/video/lagarith/spec/03-channel-decorrelation-and-predictors.md
+//! [`spec/03` §4]: https://github.com/OxideAV/docs/blob/master/video/lagarith/spec/03-channel-decorrelation-and-predictors.md
+//! [`spec/04`]: https://github.com/OxideAV/docs/blob/master/video/lagarith/spec/04-fibonacci-probability-prefix.md
+//! [`spec/05`]: https://github.com/OxideAV/docs/blob/master/video/lagarith/spec/05-rle-escape-bit-format.md
+//! [`spec/06` §1]: https://github.com/OxideAV/docs/blob/master/video/lagarith/spec/06-simd-predictor-rle-entropy-channel-dispatcher.md
 
 #![forbid(unsafe_code)]
 
-/// Crate-local error type. Concrete variants land as the Implementer
-/// rounds populate the codec pipeline.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Error {
-    /// Reserved placeholder. Replaced by real variants in round 1.
-    NotImplemented,
-}
+mod channel;
+mod decoder;
+#[cfg(test)]
+mod encoder;
+mod error;
+mod fibonacci;
+mod frame;
+mod predict;
+mod range_coder;
+#[cfg(feature = "registry")]
+pub mod registry;
+mod rle;
+mod tables;
 
-impl core::fmt::Display for Error {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Error::NotImplemented => f.write_str(
-                "oxideav-lagarith: clean-room rebuild in progress — see crates/oxideav-lagarith/README.md",
-            ),
-        }
-    }
-}
+#[cfg(test)]
+mod roundtrip_tests;
 
-impl std::error::Error for Error {}
+pub use crate::decoder::{decode_frame, DecodedFrame, PixelKind};
+pub use crate::error::{Error, Result};
+pub use crate::frame::FrameType;
 
-/// Crate-local Result alias.
-pub type Result<T> = core::result::Result<T, Error>;
+// Framework integration — only when the `registry` feature is on.
+#[cfg(feature = "registry")]
+pub use crate::registry::{register, register_codecs, CODEC_ID_STR};
+
+#[cfg(feature = "registry")]
+oxideav_core::register!("oxideav-lagarith", register);
