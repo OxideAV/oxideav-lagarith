@@ -5,7 +5,7 @@ Pure-Rust Lagarith lossless video codec for the
 
 ## Status
 
-**Round 1 — modern arithmetic-coded RGB family decoder.** This
+**Rounds 1+2 — arithmetic-coded RGB+YV12 + NULL-frame replay.** This
 `master` branch is the clean-room rebuild against the strict-
 isolation cleanroom workspace at
 [`docs/video/lagarith/`](https://github.com/OxideAV/docs/tree/master/video/lagarith).
@@ -17,19 +17,20 @@ but is forbidden input.
 
 ## Coverage
 
-| Frame type | Wire form | Round 1 |
-| ---------- | --------- | ------- |
-| 1 — Uncompressed | raw pixel data | yes |
-| 2 — Unaligned-RGB24 | arithmetic, `width % 4 != 0` | yes |
+| Frame type | Wire form | Round |
+| ---------- | --------- | ----- |
+| 1 — Uncompressed | raw pixel data | 1 |
+| 2 — Unaligned-RGB24 | arithmetic, `width % 4 != 0` | 1 |
 | 3 — Arithmetic-YUY2 | packed→planar | deferred |
-| 4 — Arithmetic-RGB24 / RGB32 | arithmetic, `width % 4 == 0` | yes |
-| 5 — Solid Grey | byte fill | yes |
-| 6 — Solid RGB | three-byte fill | yes |
+| 4 — Arithmetic-RGB24 / RGB32 | arithmetic, `width % 4 == 0` | 1 |
+| 5 — Solid Grey | byte fill | 1 |
+| 6 — Solid RGB | three-byte fill | 1 |
 | 7 — Legacy RGB (decode-only) | pre-1.1.0 prob format | deferred |
-| 8 — Arithmetic-RGBA | four planes incl. alpha | yes |
-| 9 — Solid RGBA | four-byte fill | yes |
-| 10 — Arithmetic-YV12 | three-plane Y/V/U | deferred |
+| 8 — Arithmetic-RGBA | four planes incl. alpha | 1 |
+| 9 — Solid RGBA | four-byte fill | 1 |
+| 10 — Arithmetic-YV12 | three-plane Y/V/U | **2** |
 | 11 — Reduced-resolution | type 10 + 2× upscale | deferred |
+| NULL ("JUMP") | zero-byte payload, replay previous | **2** |
 
 ## Pipeline
 
@@ -57,6 +58,8 @@ but is forbidden input.
 
 ## API
 
+Stateless decode of a single frame:
+
 ```rust
 use oxideav_lagarith::{decode_frame, PixelKind};
 
@@ -64,13 +67,36 @@ let decoded = decode_frame(&payload, width, height, PixelKind::Bgra32)?;
 assert_eq!(decoded.pixels.len(), (width as usize) * (height as usize) * 4);
 ```
 
+YV12 produces concatenated Y / V / U planes:
+
+```rust
+use oxideav_lagarith::{decode_frame, PixelKind};
+
+let yv12 = decode_frame(&payload, width, height, PixelKind::Yv12)?;
+assert_eq!(yv12.pixels.len(), PixelKind::Yv12.buffer_len(width, height));
+```
+
+Stateful decode that handles NULL ("JUMP") frames by replaying the
+predecessor (`spec/01` §1.1):
+
+```rust
+use oxideav_lagarith::{Decoder, PixelKind};
+
+let mut dec = Decoder::new();
+let frame_a = dec.decode(&payload_a, width, height, PixelKind::Bgra32)?;
+// Empty payload -> a clone of frame_a.
+let frame_b = dec.decode(&[], width, height, PixelKind::Bgra32)?;
+```
+
 `oxideav-core` framework registration is gated on the default-on
 `registry` Cargo feature and claims the `LAGS` FOURCC.
 
 ## Tests
 
-42 unit + integration tests cover the range coder, Fibonacci
+55 unit + integration tests cover the range coder, Fibonacci
 prefix, RLE escape, predictor + decorrelation, channel-header
-dispatcher, and an end-to-end encode → decode round-trip for each
-of types 1, 2, 4, 5, 6, 8, 9 plus the channel-header `0x01..=0x03`
-arithmetic-with-RLE path and the `0x05..=0x07` raw-RLE path.
+dispatcher, the channel-header `0x01..=0x03` arithmetic-with-RLE
+path and the `0x05..=0x07` raw-RLE path, an end-to-end encode →
+decode round-trip for each of types 1, 2, 4, 5, 6, 8, 9, 10
+(round 2 YV12), and the NULL-frame ("JUMP") replay path through
+both the `Decoder` wrapper and the `decode_frame_with_prev` helper.

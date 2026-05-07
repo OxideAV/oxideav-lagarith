@@ -14,10 +14,10 @@
 #![cfg(test)]
 
 use crate::channel::decode_channel;
-use crate::decoder::{decode_frame, PixelKind};
+use crate::decoder::{decode_frame, decode_frame_with_prev, Decoder, PixelKind};
 use crate::encoder::{
-    encode_arith_rgb24, encode_arith_rgba, encode_channel_arith_rle, encode_solid_grey,
-    encode_solid_rgb, encode_solid_rgba, encode_uncompressed,
+    encode_arith_rgb24, encode_arith_rgba, encode_arith_yv12, encode_channel_arith_rle,
+    encode_null, encode_solid_grey, encode_solid_rgb, encode_solid_rgba, encode_uncompressed,
 };
 
 fn pattern_bgr24(width: u32, height: u32) -> Vec<u8> {
@@ -41,6 +41,28 @@ fn pattern_bgra32(width: u32, height: u32) -> Vec<u8> {
         out.push(((v >> 4) & 0xff) as u8);
         out.push(((v >> 9) & 0xff) as u8);
         out.push(((v >> 14) & 0xff) as u8);
+    }
+    out
+}
+
+/// Y + V + U planes concatenated. `width` and `height` must both be
+/// even so the chroma sub-sampling lands on whole pixels.
+fn pattern_yv12(width: u32, height: u32) -> Vec<u8> {
+    debug_assert!(width % 2 == 0 && height % 2 == 0);
+    let y_pixels = width as usize * height as usize;
+    let c_pixels = y_pixels / 4;
+    let mut out = Vec::with_capacity(y_pixels + 2 * c_pixels);
+    // Y plane: smooth gradient.
+    for i in 0..y_pixels {
+        out.push((i as u32).wrapping_mul(31).wrapping_add(7) as u8);
+    }
+    // V plane: different texture.
+    for i in 0..c_pixels {
+        out.push((i as u32).wrapping_mul(53).wrapping_add(101) as u8);
+    }
+    // U plane: yet another.
+    for i in 0..c_pixels {
+        out.push((i as u32).wrapping_mul(89).wrapping_add(151) as u8);
     }
     out
 }
@@ -160,7 +182,10 @@ fn invalid_frame_type_byte() {
 
 #[test]
 fn unsupported_frame_types_surface_distinct_error() {
-    for b in &[3u8, 7, 10, 11] {
+    // YUY2 (3), legacy RGB (7), and reduced-resolution (11) remain
+    // unsupported; YV12 (10) is round-2 supported and exits the
+    // unsupported set.
+    for b in &[3u8, 7, 11] {
         let r = decode_frame(&[*b], 4, 4, PixelKind::Bgr24);
         assert!(matches!(r, Err(crate::Error::UnsupportedFrameType(_))));
     }
@@ -231,4 +256,188 @@ fn channel_header_ff_solid_fill() {
     for b in &decoded {
         assert_eq!(*b, 0x42);
     }
+}
+
+// ───────── Round 2: YV12 (type 10) ─────────
+
+#[test]
+fn arith_yv12_roundtrip_4x4() {
+    // Smallest even-dimensioned fixture — 4×4 luma, 2×2 chroma.
+    let (w, h) = (4, 4);
+    let pixels = pattern_yv12(w, h);
+    let frame = encode_arith_yv12(&pixels, w, h);
+    assert_eq!(frame[0], 10, "type 10 (YV12) expected");
+    let dec = decode_frame(&frame, w, h, PixelKind::Yv12).unwrap();
+    assert_eq!(dec.pixels, pixels);
+    assert_eq!(dec.pixel_kind, PixelKind::Yv12);
+    // Buffer length: 4*4 + 2*2 + 2*2 = 24
+    assert_eq!(dec.pixels.len(), 16 + 4 + 4);
+}
+
+#[test]
+fn arith_yv12_roundtrip_8x6() {
+    let (w, h) = (8, 6);
+    let pixels = pattern_yv12(w, h);
+    let frame = encode_arith_yv12(&pixels, w, h);
+    let dec = decode_frame(&frame, w, h, PixelKind::Yv12).unwrap();
+    assert_eq!(dec.pixels, pixels);
+    // 48 luma + 12 V + 12 U = 72
+    assert_eq!(dec.pixels.len(), 48 + 12 + 12);
+}
+
+#[test]
+fn arith_yv12_roundtrip_16x16() {
+    let (w, h) = (16, 16);
+    let pixels = pattern_yv12(w, h);
+    let frame = encode_arith_yv12(&pixels, w, h);
+    let dec = decode_frame(&frame, w, h, PixelKind::Yv12).unwrap();
+    assert_eq!(dec.pixels, pixels);
+}
+
+#[test]
+fn arith_yv12_solid_planes_roundtrip() {
+    // Each plane filled with a constant — exercises the encoder's
+    // header-0xff fast path for all three channels.
+    let (w, h) = (4, 4);
+    let mut pixels = vec![0x42u8; 16];
+    pixels.extend(vec![0x80u8; 4]);
+    pixels.extend(vec![0xc0u8; 4]);
+    let frame = encode_arith_yv12(&pixels, w, h);
+    let dec = decode_frame(&frame, w, h, PixelKind::Yv12).unwrap();
+    assert_eq!(dec.pixels, pixels);
+}
+
+#[test]
+fn yv12_pixel_kind_required_for_type_10() {
+    // Asking for Bgr24 / Bgra32 against a YV12 frame is a host-
+    // integration error, surfaced as PixelFormatMismatch.
+    let pixels = pattern_yv12(4, 4);
+    let frame = encode_arith_yv12(&pixels, 4, 4);
+    let r = decode_frame(&frame, 4, 4, PixelKind::Bgr24);
+    assert!(matches!(
+        r,
+        Err(crate::Error::PixelFormatMismatch { frame_type: 10 })
+    ));
+    let r = decode_frame(&frame, 4, 4, PixelKind::Bgra32);
+    assert!(matches!(
+        r,
+        Err(crate::Error::PixelFormatMismatch { frame_type: 10 })
+    ));
+}
+
+#[test]
+fn yv12_buffer_len_matches_expected() {
+    assert_eq!(PixelKind::Yv12.buffer_len(4, 4), 16 + 4 + 4);
+    assert_eq!(PixelKind::Yv12.buffer_len(8, 6), 48 + 12 + 12);
+    assert_eq!(PixelKind::Yv12.buffer_len(16, 16), 256 + 64 + 64);
+    assert_eq!(PixelKind::Bgr24.buffer_len(7, 5), 7 * 5 * 3);
+    assert_eq!(PixelKind::Bgra32.buffer_len(7, 5), 7 * 5 * 4);
+}
+
+// ───────── Round 2: NULL frame (JUMP) replay ─────────
+
+#[test]
+fn null_frame_with_no_predecessor_errors() {
+    let r = decode_frame_with_prev(&[], 4, 4, PixelKind::Bgr24, None);
+    assert!(matches!(r, Err(crate::Error::NullFrameWithoutPredecessor)));
+}
+
+#[test]
+fn null_frame_replays_predecessor_via_helper() {
+    let (w, h) = (4, 4);
+    let pixels = pattern_bgr24(w, h);
+    let frame = encode_arith_rgb24(&pixels, w, h);
+    let prev = decode_frame(&frame, w, h, PixelKind::Bgr24).unwrap();
+    // NULL frame: empty payload + Some(prev) -> clone of prev.
+    let null = encode_null();
+    let replay = decode_frame_with_prev(&null, w, h, PixelKind::Bgr24, Some(&prev)).unwrap();
+    assert_eq!(replay.pixels, prev.pixels);
+    assert_eq!(replay.width, prev.width);
+    assert_eq!(replay.height, prev.height);
+}
+
+#[test]
+fn null_frame_replays_predecessor_via_stateful_decoder() {
+    let (w, h) = (4, 4);
+    let pixels = pattern_bgr24(w, h);
+    let frame = encode_arith_rgb24(&pixels, w, h);
+    let mut dec = Decoder::new();
+    // First non-NULL frame primes the predecessor.
+    let f0 = dec.decode(&frame, w, h, PixelKind::Bgr24).unwrap();
+    assert_eq!(f0.pixels, pixels);
+    // Subsequent NULL frame replays.
+    let f1 = dec.decode(&[], w, h, PixelKind::Bgr24).unwrap();
+    assert_eq!(f1.pixels, pixels);
+    let f2 = dec.decode(&[], w, h, PixelKind::Bgr24).unwrap();
+    assert_eq!(f2.pixels, pixels);
+    // Reset clears the predecessor.
+    dec.reset();
+    assert!(dec.previous().is_none());
+    let r = dec.decode(&[], w, h, PixelKind::Bgr24);
+    assert!(matches!(r, Err(crate::Error::NullFrameWithoutPredecessor)));
+}
+
+#[test]
+fn null_frame_replay_yv12() {
+    let (w, h) = (4, 4);
+    let pixels = pattern_yv12(w, h);
+    let frame = encode_arith_yv12(&pixels, w, h);
+    let mut dec = Decoder::new();
+    let f0 = dec.decode(&frame, w, h, PixelKind::Yv12).unwrap();
+    let f1 = dec.decode(&[], w, h, PixelKind::Yv12).unwrap();
+    assert_eq!(f0.pixels, f1.pixels);
+    assert_eq!(f1.pixels, pixels);
+}
+
+#[test]
+fn stateful_decoder_updates_predecessor_on_each_decode() {
+    let (w, h) = (4, 4);
+    let mut dec = Decoder::new();
+
+    // Solid grey frame -> first predecessor.
+    let solid = encode_solid_grey(0x33);
+    let f0 = dec.decode(&solid, w, h, PixelKind::Bgr24).unwrap();
+    for c in f0.pixels.chunks_exact(3) {
+        assert_eq!(c, &[0x33, 0x33, 0x33]);
+    }
+
+    // NULL replays solid.
+    let f1 = dec.decode(&[], w, h, PixelKind::Bgr24).unwrap();
+    assert_eq!(f1.pixels, f0.pixels);
+
+    // New non-NULL frame -> predecessor updates.
+    let pixels = pattern_bgr24(w, h);
+    let frame = encode_arith_rgb24(&pixels, w, h);
+    let f2 = dec.decode(&frame, w, h, PixelKind::Bgr24).unwrap();
+    assert_eq!(f2.pixels, pixels);
+
+    // NULL now replays the patterned frame, not the solid.
+    let f3 = dec.decode(&[], w, h, PixelKind::Bgr24).unwrap();
+    assert_eq!(f3.pixels, pixels);
+}
+
+#[test]
+fn null_frame_dimension_mismatch_errors() {
+    // Replay against the wrong (W, H) tuple is a host-integration
+    // error.
+    let (w, h) = (4, 4);
+    let pixels = pattern_bgr24(w, h);
+    let frame = encode_arith_rgb24(&pixels, w, h);
+    let prev = decode_frame(&frame, w, h, PixelKind::Bgr24).unwrap();
+    let r = decode_frame_with_prev(&[], 5, 4, PixelKind::Bgr24, Some(&prev));
+    assert!(matches!(
+        r,
+        Err(crate::Error::PixelFormatMismatch { frame_type: 0 })
+    ));
+}
+
+#[test]
+fn yv12_unsupported_pixel_format_for_rgb_frame() {
+    // Asking for Yv12 against an RGB frame is also a mismatch.
+    let pixels = pattern_bgr24(4, 4);
+    let frame = encode_arith_rgb24(&pixels, 4, 4);
+    let r = decode_frame(&frame, 4, 4, PixelKind::Yv12);
+    // The RGB decoder returns PixelFormatMismatch via its packed_bpp
+    // unwrap. Either error flavour is valid; check it errors.
+    assert!(r.is_err());
 }

@@ -44,6 +44,18 @@ pub enum Error {
         /// Height as understood by the caller.
         height: u32,
     },
+    /// A NULL frame (zero-byte payload) was supplied to the stateful
+    /// decoder before any predecessor frame existed. Per `spec/01`
+    /// §1.1 a NULL frame "is presumed unchanged from the previous
+    /// frame"; with no previous frame to copy, the decoder cannot
+    /// produce output.
+    NullFrameWithoutPredecessor,
+    /// Caller-requested pixel format does not match the frame on the
+    /// wire (e.g. asking for `Bgr24` while decoding a YV12 frame).
+    PixelFormatMismatch {
+        /// Frame-type byte from the wire (informative).
+        frame_type: u8,
+    },
 }
 
 impl core::fmt::Display for Error {
@@ -75,6 +87,13 @@ impl core::fmt::Display for Error {
             Error::BadDimensions { width, height } => {
                 write!(f, "Lagarith: width={width} height={height} not supported")
             }
+            Error::NullFrameWithoutPredecessor => f.write_str(
+                "Lagarith: NULL frame supplied to stateful decoder before any predecessor frame",
+            ),
+            Error::PixelFormatMismatch { frame_type } => write!(
+                f,
+                "Lagarith: caller-requested pixel format does not match frame-type byte {frame_type}"
+            ),
         }
     }
 }

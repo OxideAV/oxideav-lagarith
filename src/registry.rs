@@ -110,17 +110,52 @@ impl Decoder for LagarithDecoder {
 }
 
 fn map_to_video_frame(frame: DecodedFrame, pts: Option<i64>) -> VideoFrame {
-    let bpp = match frame.pixel_kind {
-        PixelKind::Bgr24 => 3,
-        PixelKind::Bgra32 => 4,
-    };
-    let stride = frame.width as usize * bpp;
-    VideoFrame {
-        pts,
-        planes: vec![VideoPlane {
-            stride,
-            data: frame.pixels,
-        }],
+    match frame.pixel_kind {
+        PixelKind::Bgr24 | PixelKind::Bgra32 => {
+            let bpp = if frame.pixel_kind == PixelKind::Bgra32 {
+                4
+            } else {
+                3
+            };
+            let stride = frame.width as usize * bpp;
+            VideoFrame {
+                pts,
+                planes: vec![VideoPlane {
+                    stride,
+                    data: frame.pixels,
+                }],
+            }
+        }
+        PixelKind::Yv12 => {
+            // YV12: split the concatenated Y / V / U buffer back
+            // into three `VideoPlane`s with their respective strides.
+            let w = frame.width as usize;
+            let h = frame.height as usize;
+            let y_pixels = w * h;
+            let c_pixels = y_pixels / 4;
+            let cw = w / 2;
+            let mut data = frame.pixels;
+            let plane_y: Vec<u8> = data.drain(..y_pixels).collect();
+            let plane_v: Vec<u8> = data.drain(..c_pixels).collect();
+            let plane_u: Vec<u8> = data.drain(..c_pixels).collect();
+            VideoFrame {
+                pts,
+                planes: vec![
+                    VideoPlane {
+                        stride: w,
+                        data: plane_y,
+                    },
+                    VideoPlane {
+                        stride: cw,
+                        data: plane_v,
+                    },
+                    VideoPlane {
+                        stride: cw,
+                        data: plane_u,
+                    },
+                ],
+            }
+        }
     }
 }
 

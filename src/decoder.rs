@@ -1,4 +1,4 @@
-//! Frame-level decoder API. Round 1 supports:
+//! Frame-level decoder API. Round 1+2 coverage:
 //!
 //! - **Uncompressed** (frame type 1): raw pixel data verbatim.
 //! - **Solid frames** (types 5, 6, 9): byte fill.
@@ -9,6 +9,16 @@
 //!   plus a constant `0xff` alpha byte.
 //! - **Arithmetic RGBA** (type 8): four planes including alpha; G
 //!   decorrelation applies to R and B only.
+//! - **Arithmetic YV12** (type 10, round 2): three planes — Y at
+//!   `W * H`, V and U at `(W * H) / 4` each — with per-plane left +
+//!   median predictor and **no** cross-plane decorrelation
+//!   (`spec/03` §6.1, §4.4). Output layout is concatenated
+//!   Y / V / U planes (`PixelKind::Yv12`).
+//! - **NULL frame / JUMP** (round 2): zero-byte payload signals
+//!   "frame unchanged from predecessor" (`spec/01` §1.1). The
+//!   stateless [`decode_frame`] reports [`Error::NullFrame`]; the
+//!   stateful [`Decoder`] wrapper (or [`decode_frame_with_prev`])
+//!   replays the predecessor frame as required.
 
 use crate::channel::decode_channel;
 use crate::error::{Error, Result};
@@ -22,13 +32,34 @@ pub enum PixelKind {
     Bgr24,
     /// 32-bpp BGRA, alpha = 0xff for non-RGBA frames.
     Bgra32,
+    /// 12-bpp planar YV12 — Y plane (`W * H` bytes) followed by V
+    /// (`(W * H) / 4` bytes) followed by U (`(W * H) / 4` bytes).
+    /// `spec/03` §6.1 plane order.
+    Yv12,
 }
 
 impl PixelKind {
-    fn bytes_per_pixel(self) -> usize {
+    /// Byte length of the decoded buffer for this pixel format at
+    /// the given dimensions.
+    pub fn buffer_len(self, width: u32, height: u32) -> usize {
+        let n = width as usize * height as usize;
         match self {
-            Self::Bgr24 => 3,
-            Self::Bgra32 => 4,
+            Self::Bgr24 => n * 3,
+            Self::Bgra32 => n * 4,
+            // YV12: Y + V + U with chroma at quarter resolution.
+            // Chroma is `floor((W * H) / 4)` per `spec/03` §6.1.1.
+            Self::Yv12 => n + 2 * (n / 4),
+        }
+    }
+
+    /// `Some(bytes-per-pixel)` for packed RGB pixel formats; `None`
+    /// for planar formats like YV12 where bytes-per-pixel is not a
+    /// single integer.
+    fn packed_bpp(self) -> Option<usize> {
+        match self {
+            Self::Bgr24 => Some(3),
+            Self::Bgra32 => Some(4),
+            Self::Yv12 => None,
         }
     }
 }
@@ -46,6 +77,10 @@ pub struct DecodedFrame {
 /// Decode one Lagarith-encoded frame given its payload bytes
 /// (everything from the AVI `00dc` chunk after the chunk header)
 /// and the host's expected dimensions / pixel format.
+///
+/// Stateless — surfaces zero-byte payloads as [`Error::NullFrame`].
+/// For NULL-frame ("JUMP") handling that replays the predecessor
+/// frame, use [`Decoder`] or [`decode_frame_with_prev`].
 pub fn decode_frame(
     payload: &[u8],
     width: u32,
@@ -73,6 +108,89 @@ pub fn decode_frame(
             // BGR24 we drop alpha after the decode.
             decode_arith_rgba(payload, width, height, pixel_kind)
         }
+        FrameType::ArithmeticYv12 => decode_arith_yv12(payload, width, height, pixel_kind),
+    }
+}
+
+/// Decode one frame with optional predecessor-frame state for
+/// NULL-frame ("JUMP") replay per `spec/01` §1.1.
+///
+/// - Non-NULL payloads decode normally and the result replaces the
+///   predecessor.
+/// - A zero-byte payload returns a clone of `prev` if `prev` is
+///   `Some`; otherwise [`Error::NullFrameWithoutPredecessor`].
+///
+/// The non-stateful [`decode_frame`] rejects all NULL frames; this
+/// helper centralises the state-management contract for callers
+/// that don't want to carry the [`Decoder`] wrapper.
+pub fn decode_frame_with_prev(
+    payload: &[u8],
+    width: u32,
+    height: u32,
+    pixel_kind: PixelKind,
+    prev: Option<&DecodedFrame>,
+) -> Result<DecodedFrame> {
+    if payload.is_empty() {
+        return match prev {
+            Some(p) => {
+                // `spec/01` §1.1: "presumably the frame is unchanged
+                // from the previous frame". Cross-check the
+                // (width, height, pixel_kind) tuple before replaying;
+                // a NULL frame applied to a different surface is a
+                // host-integration error, not a wire-format event.
+                if p.width != width || p.height != height || p.pixel_kind != pixel_kind {
+                    return Err(Error::PixelFormatMismatch { frame_type: 0 });
+                }
+                Ok(p.clone())
+            }
+            None => Err(Error::NullFrameWithoutPredecessor),
+        };
+    }
+    decode_frame(payload, width, height, pixel_kind)
+}
+
+/// Stateful Lagarith frame decoder.
+///
+/// Tracks the last successfully decoded frame so that subsequent
+/// NULL-frame ("JUMP") payloads can be expanded to a clone of the
+/// predecessor per `spec/01` §1.1. The stateless [`decode_frame`]
+/// rejects NULL frames; this wrapper accepts them once a predecessor
+/// is present.
+#[derive(Debug, Default, Clone)]
+pub struct Decoder {
+    /// Most recent successfully decoded frame, or `None` before any
+    /// frame has been decoded.
+    prev: Option<DecodedFrame>,
+}
+
+impl Decoder {
+    /// Construct a fresh stateful decoder with no predecessor frame.
+    pub fn new() -> Self {
+        Self { prev: None }
+    }
+
+    /// Decode one frame, applying the NULL-frame replay rule when
+    /// the payload is empty.
+    pub fn decode(
+        &mut self,
+        payload: &[u8],
+        width: u32,
+        height: u32,
+        pixel_kind: PixelKind,
+    ) -> Result<DecodedFrame> {
+        let frame = decode_frame_with_prev(payload, width, height, pixel_kind, self.prev.as_ref())?;
+        self.prev = Some(frame.clone());
+        Ok(frame)
+    }
+
+    /// Drop any cached predecessor frame (e.g. on stream seek).
+    pub fn reset(&mut self) {
+        self.prev = None;
+    }
+
+    /// Read-only view of the cached predecessor frame, if any.
+    pub fn previous(&self) -> Option<&DecodedFrame> {
+        self.prev.as_ref()
     }
 }
 
@@ -89,8 +207,10 @@ fn decode_uncompressed(
     height: u32,
     pixel_kind: PixelKind,
 ) -> Result<DecodedFrame> {
-    let bpp = pixel_kind.bytes_per_pixel();
-    let n = width as usize * height as usize * bpp;
+    // Uncompressed frames are byte-for-byte the host's pixel format;
+    // any of `Bgr24`, `Bgra32`, or `Yv12` is fine here (the buffer
+    // length differs but the wire payload is the same shape).
+    let n = pixel_kind.buffer_len(width, height);
     if payload.len() < 1 + n {
         return Err(Error::Truncated {
             context: "uncompressed frame body",
@@ -111,7 +231,13 @@ fn decode_solid(
     pixel_kind: PixelKind,
     shape: SolidShape,
 ) -> Result<DecodedFrame> {
-    let bpp = pixel_kind.bytes_per_pixel();
+    let bpp = pixel_kind.packed_bpp().ok_or(Error::PixelFormatMismatch {
+        frame_type: match shape {
+            SolidShape::Grey => 5,
+            SolidShape::Rgb => 6,
+            SolidShape::Rgba => 9,
+        },
+    })?;
     let need = match shape {
         SolidShape::Grey => 2,
         SolidShape::Rgb => 4,
@@ -144,6 +270,7 @@ fn decode_solid(
                 pixels.push(r);
                 pixels.push(a);
             }
+            PixelKind::Yv12 => unreachable!("guarded by packed_bpp() above"),
         }
     }
     Ok(DecodedFrame {
@@ -178,7 +305,9 @@ fn decode_arith_rgb(
     // is unchanged.
     cross_plane_decorrelate_rgb(&mut plane_b, &plane_g, &mut plane_r);
 
-    let bpp = pixel_kind.bytes_per_pixel();
+    let bpp = pixel_kind.packed_bpp().ok_or(Error::PixelFormatMismatch {
+        frame_type: payload[0],
+    })?;
     let mut pixels = Vec::with_capacity(n_pixels * bpp);
     for i in 0..n_pixels {
         match pixel_kind {
@@ -193,6 +322,7 @@ fn decode_arith_rgb(
                 pixels.push(plane_r[i]);
                 pixels.push(0xff);
             }
+            PixelKind::Yv12 => unreachable!("guarded by packed_bpp() above"),
         }
     }
     Ok(DecodedFrame {
@@ -225,7 +355,9 @@ fn decode_arith_rgba(
     // Alpha plane has no cross-plane decorrelation per `spec/03`
     // §4.3.
 
-    let bpp = pixel_kind.bytes_per_pixel();
+    let bpp = pixel_kind.packed_bpp().ok_or(Error::PixelFormatMismatch {
+        frame_type: payload[0],
+    })?;
     let mut pixels = Vec::with_capacity(n_pixels * bpp);
     for i in 0..n_pixels {
         match pixel_kind {
@@ -240,8 +372,83 @@ fn decode_arith_rgba(
                 pixels.push(plane_r[i]);
                 pixels.push(plane_a[i]);
             }
+            PixelKind::Yv12 => unreachable!("guarded by packed_bpp() above"),
         }
     }
+    Ok(DecodedFrame {
+        width,
+        height,
+        pixel_kind,
+        pixels,
+    })
+}
+
+/// Decode an arithmetic YV12 frame (type 10).
+///
+/// Per `spec/03` §6.1: three planes — Y at full `W * H`, V and U at
+/// `floor((W * H) / 4)` each — decoded by the channel-header
+/// dispatcher (same as RGB) and then **independently** processed by
+/// the per-plane left + median predictor (no cross-plane
+/// decorrelation, per `spec/03` §4.4). Plane order on the wire is
+/// **Y, V, U** — `frame.bytes[1..5]` is the V offset, `frame.bytes[5..9]`
+/// is the U offset, Y starts at byte 9. Output is concatenated
+/// Y / V / U planes (same on-disk layout as the standard YV12 raw
+/// pixel buffer the decoder writes per `spec/03` §6.1).
+fn decode_arith_yv12(
+    payload: &[u8],
+    width: u32,
+    height: u32,
+    pixel_kind: PixelKind,
+) -> Result<DecodedFrame> {
+    if pixel_kind != PixelKind::Yv12 {
+        return Err(Error::PixelFormatMismatch {
+            frame_type: payload[0],
+        });
+    }
+    let w = width as usize;
+    let h = height as usize;
+    let y_pixels = w * h;
+    // `spec/03` §6.1.1 audit-resolved: chroma plane size is the
+    // integer truncation `floor((W * H) / 4)`. For odd W or H,
+    // some output positions therefore have no chroma sample on
+    // the wire — host integration concern, not a wire-format event.
+    let c_pixels = y_pixels / 4;
+
+    let slices = split_channels(payload, 3)?;
+    // Wire plane order: Y at slice 0 (W*H), V at slice 1
+    // (floor(W*H/4)), U at slice 2 (floor(W*H/4)).
+    let mut plane_y = decode_channel(slices[0], y_pixels)?;
+    let mut plane_v = decode_channel(slices[1], c_pixels)?;
+    let mut plane_u = decode_channel(slices[2], c_pixels)?;
+
+    // Per-plane spatial predictor reverse. Width/height for the
+    // chroma planes is W/2 × H/2 — but since `apply_plane_inverse`
+    // only uses width × height = pixel-count and the per-row /
+    // per-column offsets, integer-truncated sub-sample sizes
+    // (W/2, H/2) match what the proprietary's predictor at
+    // `lagarith.dll!0x180009f30` walks (spec/03 §6.1).
+    apply_plane_inverse(&mut plane_y, w, h);
+    let cw = w / 2;
+    let ch = h / 2;
+    if cw * ch == c_pixels {
+        apply_plane_inverse(&mut plane_v, cw, ch);
+        apply_plane_inverse(&mut plane_u, cw, ch);
+    } else {
+        // SPECGAP fallback: spec/03 §6.1.1 leaves the row/column
+        // breakdown for odd-dimensioned chroma to host integration.
+        // We treat the plane as a single row of `c_pixels` bytes —
+        // bit-accurate for the cumulative-sum row-0 rule and a
+        // best-effort placeholder for fractional rows. Tests in
+        // round 2 use even dimensions only.
+        apply_plane_inverse(&mut plane_v, c_pixels, 1);
+        apply_plane_inverse(&mut plane_u, c_pixels, 1);
+    }
+
+    let mut pixels = Vec::with_capacity(y_pixels + 2 * c_pixels);
+    pixels.extend_from_slice(&plane_y);
+    pixels.extend_from_slice(&plane_v);
+    pixels.extend_from_slice(&plane_u);
+
     Ok(DecodedFrame {
         width,
         height,

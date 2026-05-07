@@ -21,6 +21,12 @@ pub fn encode_uncompressed(payload: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Encode a NULL ("JUMP") frame: an empty payload that signals to a
+/// stateful decoder to replay the previous frame (`spec/01` §1.1).
+pub fn encode_null() -> Vec<u8> {
+    Vec::new()
+}
+
 /// Encode a Solid-Grey (type 5) frame.
 pub fn encode_solid_grey(value: u8) -> Vec<u8> {
     vec![5, value]
@@ -162,6 +168,43 @@ pub fn encode_arith_rgb24(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
     // Choose type 4 (width % 4 == 0) or type 2 (otherwise).
     let type_byte = if width % 4 == 0 { 4 } else { 2 };
     pack_channels(type_byte, &[&ch_b, &ch_g, &ch_r])
+}
+
+/// Encode an arithmetic YV12 frame (type 10). Input is concatenated
+/// `Y || V || U` planes (the same layout the YV12 decoder produces
+/// per `spec/03` §6.1). Each plane goes through the per-plane
+/// forward predictor independently — no cross-plane decorrelation.
+pub fn encode_arith_yv12(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let w = width as usize;
+    let h = height as usize;
+    let y_pixels = w * h;
+    let c_pixels = y_pixels / 4;
+    debug_assert_eq!(pixels.len(), y_pixels + 2 * c_pixels);
+
+    let plane_y = &pixels[..y_pixels];
+    let plane_v = &pixels[y_pixels..y_pixels + c_pixels];
+    let plane_u = &pixels[y_pixels + c_pixels..];
+
+    let res_y = apply_plane_forward(plane_y, w, h);
+    let cw = w / 2;
+    let ch = h / 2;
+    let (res_v, res_u) = if cw * ch == c_pixels {
+        (
+            apply_plane_forward(plane_v, cw, ch),
+            apply_plane_forward(plane_u, cw, ch),
+        )
+    } else {
+        (
+            apply_plane_forward(plane_v, c_pixels, 1),
+            apply_plane_forward(plane_u, c_pixels, 1),
+        )
+    };
+
+    let ch_y = encode_channel_simple(&res_y);
+    let ch_v = encode_channel_simple(&res_v);
+    let ch_u = encode_channel_simple(&res_u);
+
+    pack_channels(10, &[&ch_y, &ch_v, &ch_u])
 }
 
 /// Encode an arithmetic RGBA frame (type 8). Input is packed BGRA.

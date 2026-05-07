@@ -3,10 +3,10 @@
 
 use crate::error::{Error, Result};
 
-/// Recognised frame types this build's decoder accepts. Round 1
-/// covers every type the spec calls out except YUY2 (3), legacy RGB
-/// (7), YV12 (10), and reduced-resolution (11) — which are flagged
-/// as future work / out-of-scope.
+/// Recognised frame types this build's decoder accepts. Rounds 1+2
+/// cover every type the spec calls out except YUY2 (3), legacy RGB
+/// (7), and reduced-resolution (11) — which remain flagged as future
+/// work / out-of-scope.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum FrameType {
     Uncompressed,    // 1
@@ -16,6 +16,7 @@ pub enum FrameType {
     SolidRgb,        // 6
     ArithmeticRgba,  // 8
     SolidRgba,       // 9
+    ArithmeticYv12,  // 10
 }
 
 impl FrameType {
@@ -28,7 +29,8 @@ impl FrameType {
             6 => Ok(Self::SolidRgb),
             8 => Ok(Self::ArithmeticRgba),
             9 => Ok(Self::SolidRgba),
-            3 | 7 | 10 | 11 => Err(Error::UnsupportedFrameType(b)),
+            10 => Ok(Self::ArithmeticYv12),
+            3 | 7 | 11 => Err(Error::UnsupportedFrameType(b)),
             0 | 12.. => Err(Error::BadFrameType(b)),
         }
     }
@@ -38,7 +40,7 @@ impl FrameType {
     pub fn n_channels(self) -> usize {
         match self {
             Self::Uncompressed | Self::SolidGrey | Self::SolidRgb | Self::SolidRgba => 0,
-            Self::UnalignedRgb24 | Self::ArithmeticRgb24 => 3,
+            Self::UnalignedRgb24 | Self::ArithmeticRgb24 | Self::ArithmeticYv12 => 3,
             Self::ArithmeticRgba => 4,
         }
     }
@@ -185,13 +187,10 @@ mod tests {
             Err(Error::UnsupportedFrameType(7))
         ));
         assert!(matches!(
-            FrameType::from_byte(10),
-            Err(Error::UnsupportedFrameType(10))
-        ));
-        assert!(matches!(
             FrameType::from_byte(11),
             Err(Error::UnsupportedFrameType(11))
         ));
+        assert_eq!(FrameType::from_byte(10).unwrap(), FrameType::ArithmeticYv12);
         assert_eq!(FrameType::from_byte(1).unwrap(), FrameType::Uncompressed);
         assert_eq!(FrameType::from_byte(2).unwrap(), FrameType::UnalignedRgb24);
         assert_eq!(FrameType::from_byte(4).unwrap(), FrameType::ArithmeticRgb24);

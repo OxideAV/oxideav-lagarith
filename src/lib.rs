@@ -1,12 +1,14 @@
 //! Pure-Rust Lagarith lossless video decoder.
 //!
-//! **Round 1 of the clean-room rebuild.** Implements the modern
+//! **Rounds 1+2 of the clean-room rebuild.** Implements the modern
 //! arithmetic-coded RGB24 / RGB32 / RGBA decode pipeline plus the
 //! Uncompressed (type 1) and Solid (types 5 / 6 / 9) literal frames
-//! per the strict-isolation cleanroom workspace at
-//! `docs/video/lagarith/`. Frame types 3 (YUY2), 7 (legacy RGB),
-//! 10 (YV12), and 11 (reduced-resolution) are deferred to future
-//! rounds.
+//! (round 1), the YV12 (type 10) multi-plane arithmetic decode path
+//! and a stateful [`Decoder`] wrapper that replays NULL ("JUMP")
+//! frames per `spec/01` §1.1 (round 2). All against the strict-
+//! isolation cleanroom workspace at `docs/video/lagarith/`. Frame
+//! types 3 (YUY2), 7 (legacy RGB), and 11 (reduced-resolution) are
+//! deferred to future rounds.
 //!
 //! ## Pipeline (arithmetic-coded RGB family)
 //!
@@ -71,7 +73,7 @@ mod tables;
 #[cfg(test)]
 mod roundtrip_tests;
 
-pub use crate::decoder::{decode_frame, DecodedFrame, PixelKind};
+pub use crate::decoder::{decode_frame, decode_frame_with_prev, DecodedFrame, Decoder, PixelKind};
 pub use crate::error::{Error, Result};
 pub use crate::frame::FrameType;
 

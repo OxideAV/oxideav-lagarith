@@ -8,6 +8,38 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 2 — YV12 (frame type 10) and stateful NULL-frame replay.**
+  - `FrameType::ArithmeticYv12` (frame-type byte `0x0a`) now
+    decodes through the same channel-header dispatcher as the RGB
+    family, with three independent planes (Y at `W * H`, V and U
+    at `floor((W * H) / 4)` each), per-plane left + median
+    predictor, and **no** cross-plane decorrelation per `spec/03`
+    §6.1 + §4.4.
+  - New `PixelKind::Yv12` variant — output buffer is the
+    concatenated Y / V / U planes (the standard YV12 raw layout
+    the proprietary decoder writes per `spec/03` §6.1). The
+    `oxideav-core` framework `Decoder` impl splits this back into
+    three `VideoPlane`s with their respective strides.
+  - Stateful `Decoder` wrapper: `Decoder::decode(payload, ..)`
+    accepts a zero-byte payload as a NULL frame ("JUMP") per
+    `spec/01` §1.1 and replays the predecessor frame; the
+    stateless `decode_frame` continues to surface NULL frames as
+    `Error::NullFrame`. A standalone `decode_frame_with_prev`
+    helper centralises the same replay rule for callers that
+    don't want to carry state.
+  - Two new error variants: `Error::NullFrameWithoutPredecessor`
+    (NULL frame with no prior to replay) and
+    `Error::PixelFormatMismatch` (host-requested pixel format
+    doesn't match the wire frame type, e.g. asking for `Bgr24` on
+    a YV12 frame).
+  - Encoder helpers `encode_arith_yv12` and `encode_null` for the
+    self-roundtrip suite.
+  - +13 tests covering the YV12 path (4×4, 8×6, 16×16, all-solid
+    planes, pixel-format mismatch, buffer-length parity) and the
+    NULL-frame replay (helper-function, stateful-decoder,
+    predecessor update, dimension mismatch, YV12 replay). 55
+    tests total.
+
 - **Round 1 — modern arithmetic-coded RGB family decoder.** Decodes
   Lagarith frame types 1 (Uncompressed), 2 (Unaligned-RGB24), 4
   (Arithmetic-RGB24), 5/6/9 (Solid Grey/RGB/RGBA), and 8
@@ -41,9 +73,11 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Deferred
 
-- Frame types 3 (YUY2), 7 (legacy RGB), 10 (YV12), and 11
-  (reduced-resolution) — surfaced as `Error::UnsupportedFrameType`
-  for now.
+- Frame types 3 (YUY2), 7 (legacy RGB), and 11 (reduced-resolution)
+  — surfaced as `Error::UnsupportedFrameType` for now. (Type 10
+  YV12 landed in round 2; type 11 wire-format mirrors type 10 at
+  half-resolution + 2× upscale per `spec/01` §2.4 — straightforward
+  follow-on once an Auditor fixture exists.)
 - The reciprocal-multiply LUT at RVA `0x1b9a0` is not used by the
   decoder (the cumulative-frequency search loop `spec/02` §5 invites
   is bit-equivalent and simpler).
