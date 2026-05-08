@@ -98,7 +98,7 @@ let frame_b = dec.decode(&[], width, height, PixelKind::Bgra32)?;
 
 ## Tests
 
-100 unit + integration tests cover the range coder, Fibonacci
+110 unit + integration tests cover the range coder, Fibonacci
 prefix, RLE escape, predictor + decorrelation, channel-header
 dispatcher, the channel-header `0x01..=0x03` arithmetic-with-RLE
 path and the `0x05..=0x07` raw-RLE path, an end-to-end encode →
@@ -107,10 +107,12 @@ decode round-trip for each of types 1, 2, 3 (round 3 YUY2), 4,
 channel sub-path), 8, 9, 10 (round 2 YV12), 11 (round 3
 reduced-resolution), the legacy adaptive-CDF range coder + its
 Fibonacci freq-table primitives (round 4), the audit/12
-rare-symbol-cluster signature detector (round 5; future Strategy
-E hook), the YUY2 odd-width floor-chroma layout (audit/00 §9.4),
-and the NULL-frame ("JUMP") replay path through both the
-`Decoder` wrapper and the `decode_frame_with_prev` helper.
+rare-symbol-cluster signature detector (round 5; round-6 encoder
+Strategy E + round-7 decoder defensive harness via the new
+`Error::LegacyRareSymbolClusterUnsupported` variant), the YUY2
+odd-width floor-chroma layout (audit/00 §9.4), and the NULL-frame
+("JUMP") replay path through both the `Decoder` wrapper and the
+`decode_frame_with_prev` helper.
 
 ### SIMD-vs-scalar predictor (`spec/06` §3.5)
 
