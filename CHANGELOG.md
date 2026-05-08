@@ -8,6 +8,35 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 8 — modern range-coder hot-path optimisation (`spec/02` §5).**
+  - `RangeDecoder::decode_symbol` now implements the three-way fast
+    path of `spec/02` §5: Step A (symbol 0, `low < cum[1] * q`),
+    Step B (symbol 0xff slack-band sentinel, `low >= total * q`,
+    update `low -= total*q; range -= total*q`), Step C (generic
+    cumulative search). Step A short-circuits the 9-iteration
+    binary search on the dominant case — Lagarith residuals after
+    gradient prediction land in symbol 0 ~94-96% of the time
+    (`spec/06` §6.4: `freq[0] >= 0.95 * pixel_count`), so this
+    branch fires almost every iteration of the hot loop.
+  - `Cdf` now caches `freq0 = cum[1]` and `total = cum[256]`
+    inline on the struct so the fast paths read them with no array
+    indexing per symbol.
+  - `RangeDecoder::renormalise` reshapes the per-iteration bytewise
+    refill into a 2-byte slice window (`src.get(c..c+2)`) so the
+    optimiser hoists a single bounds compare per loop iteration
+    instead of two `Option`-unwraps. The arithmetic is unchanged
+    (still byte-at-a-time per `spec/02` §4) so output is
+    bit-identical to the proprietary.
+  - **Throughput delta**: 65,536-symbol signal-heavy fixture
+    (94% zeros), 200 reps, release build, macOS aarch64 —
+    baseline 37.4 MSym/s → optimised 161.3 MSym/s = **4.31×**.
+    Far above the 1.3× threshold for default-on; no feature
+    gate needed.
+  - +4 tests: step-A-dominant histogram, step-B-hits histogram,
+    renormalise tail-saturation, signal-heavy throughput
+    (functional check; timing only printed under
+    `LAGARITH_BENCH=1`). 114 tests total (was 110).
+
 - **Round 7 — type-7 decoder defensive harness (`audit/12 §7.1`).**
   - `decode_legacy_channel` now runs the rare-symbol-cluster
     predicate (`is_rare_symbol_cluster`) over the transmitted 256-

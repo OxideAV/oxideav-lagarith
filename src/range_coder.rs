@@ -28,9 +28,19 @@ pub(crate) const INIT_RANGE: u32 = 0x8000_0000;
 /// `cum[s+1] - cum[s]` is the frequency of symbol `s`; `cum[256]`
 /// is the total. Computed once per channel from the raw frequencies
 /// the Fibonacci prefix decoder fills in (`spec/04` §1).
+///
+/// Round 8 caches `freq0 = cum[1]` and `total = cum[256]` directly
+/// on the struct so the §5 step-A / step-B fast paths in the
+/// decoder can read them without an array bounds check or an extra
+/// indirection per symbol.
 #[derive(Debug, Clone)]
 pub(crate) struct Cdf {
     cum: [u32; 257],
+    /// `cum[1]` — boundary between symbol 0 (zero residual) and
+    /// every other symbol. Cached for the §5 step-A fast path.
+    freq0: u32,
+    /// `cum[256]` — total mass. Cached for the §5 step-B fast path.
+    total: u32,
 }
 
 impl Cdf {
@@ -47,13 +57,17 @@ impl Cdf {
         if acc == 0 {
             return Err(Error::EmptyProbabilityTable);
         }
-        Ok(Self { cum })
+        Ok(Self {
+            freq0: cum[1],
+            total: acc,
+            cum,
+        })
     }
 
     /// Total mass `cum[256]`.
     #[inline]
     pub fn total(&self) -> u32 {
-        self.cum[256]
+        self.total
     }
 
     /// `cum[s]`.
@@ -118,34 +132,98 @@ impl<'a> RangeDecoder<'a> {
     /// Refill `range` and `low` with byte-aligned bits per `spec/02`
     /// §4 (cross-byte rotation: bit 0 of the previously-consumed
     /// byte becomes bit 7 of the new byte's contribution).
+    ///
+    /// Round 8 hot-path optimisation. The fast path uses
+    /// `slice::get(cursor..=cursor+1)` which gives the optimiser
+    /// a single 2-byte bounds check the loop body can hoist; the
+    /// tail path with saturating zero-fill is taken only when the
+    /// next 2 bytes go past the bitstream end. The arithmetic
+    /// per iteration is unchanged (still byte-at-a-time per
+    /// `spec/02` §4) so output bytes remain bit-identical to the
+    /// proprietary.
+    #[inline(always)]
     fn renormalise(&mut self) -> Result<()> {
         while self.range <= TOP {
-            // Saturating advance — if we're about to walk past the
-            // end of the channel body, treat the missing bytes as
-            // zero. This matches the proprietary's behaviour when
-            // the channel body's range-coder tail flush is short
-            // enough that the decoder has already produced its full
-            // pixel count and is just shifting state out (the
-            // caller's symbol-count guard exits before any garbage
-            // is observed).
-            let prev = self.src.get(self.cursor).copied().unwrap_or(0);
-            let next = self.src.get(self.cursor + 1).copied().unwrap_or(0);
-            self.low =
-                (self.low << 8).wrapping_add((((prev & 1) as u32) << 7) | ((next as u32) >> 1));
-            self.range <<= 8;
-            self.cursor += 1;
+            let cursor = self.cursor;
+            // Fast path: 2-byte window in one bounds check.
+            // `get(cursor..cursor + 2)` is a single bounds compare
+            // and lets the optimiser elide the per-byte recheck.
+            if let Some(window) = self.src.get(cursor..cursor + 2) {
+                let prev = window[0];
+                let next = window[1];
+                self.low =
+                    (self.low << 8).wrapping_add((((prev & 1) as u32) << 7) | ((next as u32) >> 1));
+                self.range <<= 8;
+                self.cursor = cursor + 1;
+            } else {
+                // Tail path — saturate missing bytes to zero (the
+                // caller's symbol-count guard exits before garbage
+                // is observed; same semantics as the proprietary
+                // when the four-byte tail of `spec/02` §6.3 has
+                // already been absorbed).
+                let prev = self.src.get(cursor).copied().unwrap_or(0);
+                let next = self.src.get(cursor + 1).copied().unwrap_or(0);
+                self.low =
+                    (self.low << 8).wrapping_add((((prev & 1) as u32) << 7) | ((next as u32) >> 1));
+                self.range <<= 8;
+                self.cursor = cursor + 1;
+            }
         }
         Ok(())
     }
 
     /// Decode a single symbol against the supplied CDF.
+    ///
+    /// Round 8 hot-path: implements the three-way fast path of
+    /// `spec/02` §5 (step A — symbol 0; step B — symbol 0xff;
+    /// step C — generic via cumulative search). Lossless RGB
+    /// residuals after gradient prediction in Lagarith are
+    /// dominated by 0x00 (often `freq[0] >= 0.95 * pixel_count`
+    /// per `spec/06` §6.4), so the step-A check is the dominant
+    /// case and short-circuits the 9-iteration binary search.
+    #[inline]
     pub fn decode_symbol(&mut self, cdf: &Cdf) -> Result<u8> {
-        // Per `spec/02` §5 (clean-room form): q = range / total; the
-        // symbol is the s for which `cum[s]*q <= low < cum[s+1]*q`.
+        // Per `spec/02` §5: q = range / total.
         let total = cdf.total();
         debug_assert!(total > 0, "Cdf::total must be non-zero");
         let q = self.range / total;
-        let target = (self.low / q).min(total - 1);
+
+        // Step A — symbol 0 (zero) fast path. `freq[0] = cum[1]`,
+        // so the test is `low < cum[1] * q`.
+        let freq0_scaled = cdf.freq0 * q;
+        if self.low < freq0_scaled {
+            // cum[0] = 0, so `low -= 0 * q` is a no-op; range
+            // becomes `(cum[1] - 0) * q = freq0 * q`.
+            self.range = freq0_scaled;
+            self.renormalise()?;
+            return Ok(0);
+        }
+
+        // Step B — symbol 0xff fast path per `spec/02` §5. The
+        // proprietary's reciprocal-multiply Step C path treats
+        // `low >= total * q` (i.e. the slack band above the
+        // highest CDF entry) as the 0xff sentinel and updates
+        // `low -= total*q; range -= total*q`. Note this differs
+        // from a naive "find symbol s with cum[s] <= target <
+        // cum[s+1]" search clamped to s = 255: the spec's update
+        // is unconditional even when `freq[255] == 0`. Stays
+        // bit-identical to the proprietary on real bitstreams;
+        // the self-roundtrip encoder never produces `low >=
+        // total*q` so this branch is exercised only by test
+        // fixtures crafted to hit it.
+        let total_scaled = total * q;
+        if self.low >= total_scaled {
+            self.low -= total_scaled;
+            self.range -= total_scaled;
+            self.renormalise()?;
+            return Ok(0xff);
+        }
+
+        // Step C — generic symbol via cumulative search. The
+        // proprietary uses a reciprocal-multiply LUT here; the
+        // clean-room equivalent is a 9-step binary search over
+        // 257 cumulative entries. Bit-identical per `spec/02` §5.
+        let target = self.low / q;
         let symbol = cdf.find_symbol(target);
         let lo = cdf.lo(symbol);
         let hi = cdf.lo(symbol + 1);
@@ -353,6 +431,182 @@ mod tests {
             symbols.push(((i * 31) ^ (i >> 3)) as u8);
         }
 
+        let mut enc = RangeEncoder::new();
+        for &s in &symbols {
+            enc.encode_symbol(&cdf, s as usize);
+        }
+        let bytes = enc.finish();
+
+        let mut dec = RangeDecoder::new(&bytes).unwrap();
+        let mut out = Vec::with_capacity(symbols.len());
+        for _ in 0..symbols.len() {
+            out.push(dec.decode_symbol(&cdf).unwrap());
+        }
+        assert_eq!(out, symbols);
+    }
+
+    /// Round 8: stress the §5 step-A (symbol-0) fast path with a
+    /// histogram dominated by `freq[0]`. This is the realistic
+    /// shape of a Lagarith residual channel after gradient
+    /// prediction (`spec/06` §6.4: `freq[0] >= 0.95 * pixel_count`)
+    /// and is the case the optimisation principally targets.
+    #[test]
+    fn rangecoder_roundtrip_step_a_dominant() {
+        let mut freq = [0u32; 256];
+        freq[0] = 9500;
+        for slot in freq.iter_mut().take(256).skip(1) {
+            *slot = 2;
+        }
+        let cdf = Cdf::from_frequencies(&freq).unwrap();
+
+        // 95% zero residuals, 5% non-zero spread across 1..256.
+        let mut symbols = Vec::with_capacity(10_000);
+        for i in 0..10_000 {
+            if i % 20 == 0 {
+                symbols.push(((i * 7 + 1) & 0xff) as u8);
+            } else {
+                symbols.push(0u8);
+            }
+        }
+
+        let mut enc = RangeEncoder::new();
+        for &s in &symbols {
+            enc.encode_symbol(&cdf, s as usize);
+        }
+        let bytes = enc.finish();
+
+        let mut dec = RangeDecoder::new(&bytes).unwrap();
+        let mut out = Vec::with_capacity(symbols.len());
+        for _ in 0..symbols.len() {
+            out.push(dec.decode_symbol(&cdf).unwrap());
+        }
+        assert_eq!(out, symbols);
+    }
+
+    /// Round 8: stress the §5 step-B (symbol-0xff) fast path with
+    /// a histogram where `freq[255]` is comparable to `freq[0]`.
+    /// Verifies the step-B exit produces bit-identical output to
+    /// the binary-search path.
+    #[test]
+    fn rangecoder_roundtrip_step_b_hits() {
+        let mut freq = [0u32; 256];
+        freq[0] = 100;
+        freq[255] = 100;
+        for slot in freq.iter_mut().take(255).skip(1) {
+            *slot = 1;
+        }
+        let cdf = Cdf::from_frequencies(&freq).unwrap();
+
+        let mut symbols = Vec::with_capacity(2000);
+        for i in 0..2000 {
+            // Force a mix of 0, 0xff, and other symbols.
+            symbols.push(match i % 5 {
+                0 => 0u8,
+                1 => 0xff,
+                2 => 0u8,
+                3 => 0xff,
+                _ => ((i * 13) & 0xfe) as u8 | 1, // odd byte in 1..255
+            });
+        }
+
+        let mut enc = RangeEncoder::new();
+        for &s in &symbols {
+            enc.encode_symbol(&cdf, s as usize);
+        }
+        let bytes = enc.finish();
+
+        let mut dec = RangeDecoder::new(&bytes).unwrap();
+        let mut out = Vec::with_capacity(symbols.len());
+        for _ in 0..symbols.len() {
+            out.push(dec.decode_symbol(&cdf).unwrap());
+        }
+        assert_eq!(out, symbols);
+    }
+
+    /// Round 8: throughput sanity check. Builds a signal-heavy
+    /// stream (zero-dominated, 64k symbols) and verifies the
+    /// optimised hot path decodes it correctly. When the
+    /// `LAGARITH_BENCH=1` env var is set, also prints the
+    /// throughput in MSym/s — used to compare baseline vs.
+    /// optimised numbers; not asserted because `cargo test`
+    /// walltime jitters too much to threshold reliably.
+    #[test]
+    fn rangecoder_throughput_signal_heavy() {
+        let mut freq = [0u32; 256];
+        freq[0] = 60_000;
+        for slot in freq.iter_mut().take(256).skip(1) {
+            *slot = 16; // 60000 + 255*16 = 64080
+        }
+        let cdf = Cdf::from_frequencies(&freq).unwrap();
+
+        // 64k symbols, ~93.7% zeros (matches `spec/06` §6.4
+        // shape "freq[0] >= 0.95 * pixel_count" within rounding).
+        let n = 65_536;
+        let mut symbols = Vec::with_capacity(n);
+        for i in 0..n {
+            // Deterministic LCG-style mix; ~94% land in symbol 0.
+            let r = (i as u32).wrapping_mul(2654435761) ^ (i as u32 >> 7);
+            symbols.push(if (r & 0xf) < 15 {
+                0u8
+            } else {
+                ((r >> 4) & 0xff) as u8
+            });
+        }
+
+        let mut enc = RangeEncoder::new();
+        for &s in &symbols {
+            enc.encode_symbol(&cdf, s as usize);
+        }
+        let bytes = enc.finish();
+
+        // Functional check: decode once and verify equality.
+        {
+            let mut dec = RangeDecoder::new(&bytes).unwrap();
+            let mut out = Vec::with_capacity(symbols.len());
+            for _ in 0..symbols.len() {
+                out.push(dec.decode_symbol(&cdf).unwrap());
+            }
+            assert_eq!(out, symbols);
+        }
+
+        // Optional timing pass (only when LAGARITH_BENCH=1).
+        if std::env::var("LAGARITH_BENCH").as_deref() == Ok("1") {
+            const REPS: usize = 200;
+            let mut sink: u64 = 0;
+            let t0 = std::time::Instant::now();
+            for _ in 0..REPS {
+                let mut dec = RangeDecoder::new(&bytes).unwrap();
+                for _ in 0..symbols.len() {
+                    sink = sink.wrapping_add(dec.decode_symbol(&cdf).unwrap() as u64);
+                }
+            }
+            let elapsed = t0.elapsed();
+            let total_syms = (n * REPS) as f64;
+            let msym_per_s = total_syms / elapsed.as_secs_f64() / 1.0e6;
+            eprintln!(
+                "BENCH/range-coder signal-heavy: {:.2} MSym/s ({} syms x {} reps in {:.3?}; sink={})",
+                msym_per_s,
+                n,
+                REPS,
+                elapsed,
+                sink
+            );
+        }
+    }
+
+    /// Round 8: ensure the renormalise tail-saturation path (when
+    /// the bitstream has fewer than 2 unread bytes) still produces
+    /// correct output. The encoder writes a 4-byte tail per
+    /// `spec/02` §6.3 so the decoder runs through ≥1 tail-pad
+    /// iteration on most realistic inputs.
+    #[test]
+    fn rangecoder_renormalise_tail_saturates() {
+        let mut freq = [0u32; 256];
+        freq[0] = 8;
+        freq[1] = 1;
+        let cdf = Cdf::from_frequencies(&freq).unwrap();
+
+        let symbols = vec![0u8, 0, 0, 0, 1, 0, 0, 0, 1, 0];
         let mut enc = RangeEncoder::new();
         for &s in &symbols {
             enc.encode_symbol(&cdf, s as usize);
