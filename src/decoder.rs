@@ -37,7 +37,9 @@
 use crate::channel::{decode_channel, decode_legacy_channel};
 use crate::error::{Error, Result};
 use crate::frame::{split_channels, FrameType};
-use crate::predict::{apply_plane_inverse, cross_plane_decorrelate_rgb};
+use crate::predict::{
+    apply_plane_inverse, apply_plane_inverse_with_rule, cross_plane_decorrelate_rgb, FirstColRule,
+};
 
 /// What pixel format the caller wants the decoder to produce.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -677,9 +679,29 @@ fn decode_legacy_rgb(
     let mut plane_g = decode_legacy_channel(slices[1], n_pixels)?;
     let mut plane_r = decode_legacy_channel(slices[2], n_pixels)?;
 
-    apply_plane_inverse(&mut plane_b, width as usize, height as usize);
-    apply_plane_inverse(&mut plane_g, width as usize, height as usize);
-    apply_plane_inverse(&mut plane_r, width as usize, height as usize);
+    // `spec/07` §9.1 item 7b: type 7 uses **Rule B** (`TL =
+    // plane[y-2][W-1]` for `y >= 2`) for the first-column-of-row
+    // predictor, not Rule A. Rule B matches the proprietary's
+    // SIMD predictor's linear-memory walk. For `y == 1` Rule B
+    // falls back to Rule A (no `y - 2` row exists).
+    apply_plane_inverse_with_rule(
+        &mut plane_b,
+        width as usize,
+        height as usize,
+        FirstColRule::B,
+    );
+    apply_plane_inverse_with_rule(
+        &mut plane_g,
+        width as usize,
+        height as usize,
+        FirstColRule::B,
+    );
+    apply_plane_inverse_with_rule(
+        &mut plane_r,
+        width as usize,
+        height as usize,
+        FirstColRule::B,
+    );
 
     cross_plane_decorrelate_rgb(&mut plane_b, &plane_g, &mut plane_r);
 

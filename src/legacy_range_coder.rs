@@ -142,14 +142,22 @@ fn next_pow2(n: u64) -> u64 {
 /// and `total` is a power of two.
 ///
 /// The clean-room implementation here uses the **flat 257-entry CDF**
-/// form (`spec/07` §3.4 final paragraph allowance: "A clean-room
-/// implementation may equivalently use a flat 257-entry CDF without
-/// the interleaved sentinel"). Audit/12 §5 retracts that allowance
-/// for a specific rare-symbol-cluster fixture class — but the
-/// retraction concerns the encoder's frame-type *selection*, not
-/// the CDF construction itself. For our self-roundtrip discipline
-/// (encoder + decoder share the same `build_cdf`) the flat form is
-/// bit-perfect because both sides run the identical algorithm.
+/// form (`spec/07` §3.4 retracted allowance). Audit/12 §5 retracts
+/// the "may equivalently use a flat 257-entry CDF" allowance for a
+/// rare-symbol-cluster fixture class (≥3 distinct nonzero bins each
+/// with `freq ∈ {1, 2}` within a histogram dominated by
+/// `freq[0] >= 0.95 * pixel_count`).
+///
+/// For our **self-roundtrip discipline** (encoder + decoder share
+/// the same `build_cdf` algorithm) the flat form is bit-perfect:
+/// both sides run identical CDF construction, so any input the
+/// encoder produces, the decoder accepts byte-exactly. The
+/// audit/12 retraction concerns *cross-implementation* compatibility
+/// (our encoder vs. proprietary decoder, or vice-versa), which would
+/// require a proprietary-encoded type-7 fixture in tree (audit/04
+/// §5: not yet acquired). See [`is_rare_symbol_cluster`] for the
+/// detection signature that a future round may use to route around
+/// the affected fixture class via Strategy E (audit/12 §7.1).
 pub(crate) fn build_legacy_cdf(freq: &[u32; 256]) -> Result<(Vec<u32>, u32)> {
     let sum_freq: u64 = freq.iter().map(|&f| f as u64).sum();
     if sum_freq == 0 {
@@ -245,6 +253,45 @@ pub(crate) fn build_legacy_cdf(freq: &[u32; 256]) -> Result<(Vec<u32>, u32)> {
     }
 
     Ok((cdf, total as u32))
+}
+
+/// Detect the **rare-symbol-cluster signature** of audit/12 §7.1 in
+/// a 256-entry histogram: ≥ 3 distinct nonzero bins each with
+/// `freq ∈ {1, 2}` within a histogram dominated by
+/// `freq[0] >= 0.95 * pixel_count`.
+///
+/// This is the signature audit/12 §3.6 / §5 identified as the
+/// trigger for the flat-CDF / pair-packed-CDF wire-format
+/// divergence. A future round implementing Strategy E (audit/12
+/// §7.1) — encoder-side route-around for rare-symbol-cluster
+/// fixtures — would invoke this on each plane's residual histogram
+/// and skip the type-7 emission when it returns `true`, falling
+/// back to type 1 (uncompressed) which is byte-exact on every
+/// fixture.
+///
+/// The full Strategy F refactor (pair-packed 513-entry CDF) is
+/// audit/12 §7.1's alternative; the round-7 auditor recommends
+/// Strategy E because Strategy F's regression risk on the 95/96
+/// currently-passing type-7 cells outweighs its benefit (type 7 is
+/// decode-only in the proprietary build per `spec/07` §6 / §9.2
+/// item 8 — no archival type-7 fixture exists per audit/04 §5).
+///
+/// Marked `dead_code` until the encoder wires up Strategy E in a
+/// future round; exercised by the unit tests below to keep its
+/// predicate observable.
+#[allow(dead_code)]
+pub(crate) fn is_rare_symbol_cluster(freq: &[u32; 256]) -> bool {
+    let total: u64 = freq.iter().map(|&f| f as u64).sum();
+    if total == 0 {
+        return false;
+    }
+    // Dominance check: freq[0] >= 0.95 * total. Use integer math.
+    if (freq[0] as u64) * 100 < total * 95 {
+        return false;
+    }
+    // Rare-bin count: distinct nonzero bins with freq ∈ {1, 2}.
+    let rare_count = freq[1..].iter().filter(|&&f| f == 1 || f == 2).count();
+    rare_count >= 3
 }
 
 // ──────────────────── range-coder decoder ────────────────────
@@ -614,6 +661,60 @@ mod tests {
             out.push(dec.decode_byte().unwrap());
         }
         assert_eq!(out, symbols);
+    }
+
+    #[test]
+    fn rare_symbol_cluster_detects_audit_12_canonical_fixture() {
+        // audit/12 §5 reproduction: hist[0] = 887 (= 0x3d / total =
+        // 887 / 891 ~ 99.5%), hist[0x3d] = 1, hist[0x40] = 2,
+        // hist[0xc0] = 1. 3 rare bins + dominant zero -> matches.
+        let mut freq = [0u32; 256];
+        freq[0] = 887;
+        freq[0x3d] = 1;
+        freq[0x40] = 2;
+        freq[0xc0] = 1;
+        assert!(is_rare_symbol_cluster(&freq));
+    }
+
+    #[test]
+    fn rare_symbol_cluster_rejects_solid() {
+        // Solid plane: only one bin nonzero. Not a cluster.
+        let mut freq = [0u32; 256];
+        freq[0] = 1024;
+        assert!(!is_rare_symbol_cluster(&freq));
+    }
+
+    #[test]
+    fn rare_symbol_cluster_rejects_too_few_rare_bins() {
+        // Two rare bins is below the threshold of 3.
+        let mut freq = [0u32; 256];
+        freq[0] = 1000;
+        freq[10] = 1;
+        freq[20] = 2;
+        assert!(!is_rare_symbol_cluster(&freq));
+    }
+
+    #[test]
+    fn rare_symbol_cluster_rejects_no_dominant_zero() {
+        // Dispersed nonzero distribution (random). No dominant zero.
+        let mut freq = [0u32; 256];
+        for slot in freq.iter_mut() {
+            *slot = 4;
+        }
+        assert!(!is_rare_symbol_cluster(&freq));
+    }
+
+    #[test]
+    fn rare_symbol_cluster_rejects_high_freq_neighbours() {
+        // Dominant zero but only `freq > 2` neighbours -> no rare
+        // cluster. This is the "common-case type-7 fixture" pattern
+        // (audit/12 §3.5 PASS rows).
+        let mut freq = [0u32; 256];
+        freq[0] = 970;
+        freq[1] = 10;
+        freq[2] = 10;
+        freq[3] = 10;
+        assert!(!is_rare_symbol_cluster(&freq));
     }
 
     #[test]

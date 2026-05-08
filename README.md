@@ -5,11 +5,11 @@ Pure-Rust Lagarith lossless video codec for the
 
 ## Status
 
-**Rounds 1..4 — arithmetic-coded RGB / YV12 / YUY2 + NULL-frame
-replay + reduced-resolution + legacy RGB (type 7).** This `master`
-branch is the clean-room rebuild against the strict-isolation
-cleanroom workspace
-at
+**Rounds 1..5 — arithmetic-coded RGB / YV12 / YUY2 + NULL-frame
+replay + reduced-resolution + legacy RGB (type 7) with Rule B
+first-column predictor + RLE-then-Fibonacci channel sub-path.**
+This `master` branch is the clean-room rebuild against the
+strict-isolation cleanroom workspace at
 [`docs/video/lagarith/`](https://github.com/OxideAV/docs/tree/master/video/lagarith).
 The previous implementation was retired by the OxideAV docs audit
 dated 2026-05-06 (see
@@ -27,7 +27,7 @@ but is forbidden input.
 | 4 — Arithmetic-RGB24 / RGB32 | arithmetic, `width % 4 == 0` | 1 |
 | 5 — Solid Grey | byte fill | 1 |
 | 6 — Solid RGB | three-byte fill | 1 |
-| 7 — Legacy RGB | adaptive-CDF range coder per `spec/07` | **4** |
+| 7 — Legacy RGB | adaptive-CDF + Rule B + RLE-then-Fib (`spec/07`) | **4–5** |
 | 8 — Arithmetic-RGBA | four planes incl. alpha | 1 |
 | 9 — Solid RGBA | four-byte fill | 1 |
 | 10 — Arithmetic-YV12 | three-plane Y/V/U | **2** |
@@ -52,8 +52,11 @@ but is forbidden input.
    `escape_len + LUT[supplement_byte]`-zero runs, with the LUT
    loaded from `tables/01-residual-rle-decoder-lut.csv`.
 6. **Spatial predictor** ([`spec/03` §3](https://github.com/OxideAV/docs/blob/master/video/lagarith/spec/03-channel-decorrelation-and-predictors.md)):
-   left predictor on row 0; JPEG-LS clamped median on rows ≥ 1
-   with the `TL = L = plane[y-1][W-1]` first-column rule.
+   left predictor on row 0; JPEG-LS clamped median on rows ≥ 1.
+   The first-column-of-row rule depends on frame type — modern
+   types (2/4/8/10/11) use **Rule A** (`TL = L = plane[y-1][W-1]`);
+   the legacy type-7 path uses **Rule B**
+   (`TL = plane[y-2][W-1]` for `y ≥ 2`) per `spec/07` §9.1 item 7b.
 7. **Cross-plane decorrelation** ([`spec/03` §4](https://github.com/OxideAV/docs/blob/master/video/lagarith/spec/03-channel-decorrelation-and-predictors.md)):
    RGB families only — `R += G; B += G` post-prediction; alpha is
    stored raw.
@@ -95,28 +98,34 @@ let frame_b = dec.decode(&[], width, height, PixelKind::Bgra32)?;
 
 ## Tests
 
-83 unit + integration tests cover the range coder, Fibonacci
+100 unit + integration tests cover the range coder, Fibonacci
 prefix, RLE escape, predictor + decorrelation, channel-header
 dispatcher, the channel-header `0x01..=0x03` arithmetic-with-RLE
 path and the `0x05..=0x07` raw-RLE path, an end-to-end encode →
 decode round-trip for each of types 1, 2, 3 (round 3 YUY2), 4,
-5, 6, 7 (round 4 legacy RGB), 8, 9, 10 (round 2 YV12), 11 (round
-3 reduced-resolution), the legacy adaptive-CDF range coder + its
-Fibonacci freq-table primitives (round 4), the YUY2 odd-width
-floor-chroma layout (audit/00 §9.4), and the NULL-frame ("JUMP")
-replay path through both the `Decoder` wrapper and the
-`decode_frame_with_prev` helper.
+5, 6, 7 (round 4 legacy RGB; round 5 Rule B + RLE-then-Fibonacci
+channel sub-path), 8, 9, 10 (round 2 YV12), 11 (round 3
+reduced-resolution), the legacy adaptive-CDF range coder + its
+Fibonacci freq-table primitives (round 4), the audit/12
+rare-symbol-cluster signature detector (round 5; future Strategy
+E hook), the YUY2 odd-width floor-chroma layout (audit/00 §9.4),
+and the NULL-frame ("JUMP") replay path through both the
+`Decoder` wrapper and the `decode_frame_with_prev` helper.
 
 ### SIMD-vs-scalar predictor (`spec/06` §3.5)
 
-The crate's predictor implements **Strategy A** (`TL = L =
-plane[y-1][W-1]` for every row `y >= 1`, per `spec/06` §3.6) which
-is *carry-equivalent* to the proprietary's SIMD inner-loop and
-*matches* the scalar predictor for every `(width, frame-type)`
-where the proprietary's dispatch selects either path. No separate
-SIMD code path is therefore required for byte-equivalent output;
-the scalar predictor produces the same residual stream the
-proprietary's SIMD path would for `width % 4 == 0` fixtures.
+For frame types 2 / 4 / 8 / 10 / 11 the crate's predictor
+implements **Rule A / Strategy A** (`TL = L = plane[y-1][W-1]`
+for every row `y >= 1`, per `spec/06` §3.6), which is
+*carry-equivalent* to the proprietary's SIMD inner-loop. No
+separate SIMD code path is therefore required for byte-
+equivalent output on these types.
+
+For frame type 7 (legacy RGB) the predictor uses **Rule B**
+(`TL = plane[y-2][W-1]` for `y >= 2`, falls back to Rule A for
+`y = 1`) per `spec/07` §9.1 item 7b, mirroring the proprietary's
+linear-memory walk through the SIMD predictor on the legacy
+path.
 
 ### Byte-exact encoder validation — SPECGAP
 

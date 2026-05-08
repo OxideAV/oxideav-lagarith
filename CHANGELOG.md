@@ -8,6 +8,44 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 5 — type-7 spec-coverage extensions: Rule B + RLE-then-
+  Fibonacci channel sub-path.**
+  - **First-column predictor Rule B** for type-7 frames per
+    `spec/07` §9.1 item 7b: row `y ≥ 2` first-column TL =
+    `plane[y-2][W-1]` (linear-memory rule), falling back to Rule A
+    for `y = 1` (no `y-2` row exists). The audit-resolved binary
+    walk at `lagarith.dll!0x180001b00..0x180001c5d` shows no
+    per-row state machine; Rule B matches the proprietary's SIMD
+    predictor's reverse-engineered residuals bit-for-bit. Modern
+    types 2 / 4 / 8 / 10 / 11 retain Rule A.
+  - **Channel header `0x01..=0x03` RLE-then-Fibonacci sub-path**
+    per `spec/07` §2.3 / §2.4. Wire layout: outer header byte
+    (= escape_len ∈ {1, 2, 3}); u32 LE post-RLE byte count L
+    (≤ 256); RLE-compressed input expanding to the L-byte
+    Fibonacci-coded freq-table buffer; post-Fibonacci 1-byte
+    reservation; legacy range-coder body. Fixes the prior
+    `BadChannelHeader` rejection for outer headers in {0x01..0x03}.
+  - **Audit/12 rare-symbol-cluster signature detector**
+    (`is_rare_symbol_cluster`) — predicate hook for a future
+    Strategy E encoder route-around (audit/12 §7.1: ≥ 3 distinct
+    nonzero bins each with `freq ∈ {1, 2}` within a histogram
+    dominated by `freq[0] >= 0.95 * pixel_count`). The
+    pair-packed 513-entry CDF (Strategy F) is deferred per
+    audit/12 §7.1's regression-risk recommendation; no archival
+    type-7 fixture exists per audit/04 §5 to validate the full
+    refactor.
+  - Test-only `encode_legacy_channel_rle` / `encode_legacy_rgb_rle`
+    helpers driving end-to-end self-roundtrip on the
+    RLE-then-Fibonacci wire path for escape lengths 1, 2, and 3.
+  - +17 tests: 4 Rule-B predictor unit tests (4×4, 11×7, y=1
+    fallback to Rule A, divergence vs Rule A on row ≥ 2); 6
+    type-7 RLE-then-Fib roundtrip tests (escape 1/2/3 at 4×4,
+    8×8 sweep, solid plane); 2 type-7 Rule B frame-level
+    roundtrips (5×4, 4×8); 5 rare-symbol-cluster detector unit
+    tests covering the audit/12 canonical fixture, solid plane,
+    too-few-rare-bins, no-dominant-zero, and high-freq neighbours.
+  - 100 tests total (was 83).
+
 - **Round 4 — legacy RGB (frame type 7, `spec/07` adaptive-CDF range
   coder).**
   - `FrameType::LegacyRgb` (frame-type byte `0x07`) now decodes

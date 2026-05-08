@@ -17,8 +17,8 @@ use crate::channel::decode_channel;
 use crate::decoder::{decode_frame, decode_frame_with_prev, Decoder, PixelKind};
 use crate::encoder::{
     encode_arith_reduced_res, encode_arith_rgb24, encode_arith_rgba, encode_arith_yuy2,
-    encode_arith_yv12, encode_channel_arith_rle, encode_legacy_rgb, encode_null, encode_solid_grey,
-    encode_solid_rgb, encode_solid_rgba, encode_uncompressed,
+    encode_arith_yv12, encode_channel_arith_rle, encode_legacy_rgb, encode_legacy_rgb_rle,
+    encode_null, encode_solid_grey, encode_solid_rgb, encode_solid_rgba, encode_uncompressed,
 };
 
 fn pattern_bgr24(width: u32, height: u32) -> Vec<u8> {
@@ -960,13 +960,12 @@ fn legacy_rgb_replays_via_stateful_decoder() {
 fn legacy_rgb_rejects_non_zero_inner_codec_mode_flag() {
     // Hand-build a type-7 frame whose channel data starts with the
     // outer header `0x00` but inner codec-mode flag `0x01`. The
-    // round-4 decoder ships only the bare-Fibonacci sub-path
-    // (spec/07 §6.3 / §9.2 item 9 — header-0 is sufficient for
-    // round-trip correctness). Non-bare paths should surface
-    // `BadChannelHeader`.
+    // header-0 path requires the inner flag = 0 for the bare-
+    // Fibonacci sub-path; a non-zero inner flag selects an inner
+    // RLE-then-Fibonacci sub-path under outer-header-0 that no
+    // observed encoder produces (`spec/07` §1.3 / §2.5 audit
+    // blockquote). Surface as BadChannelHeader.
     use crate::frame::pack_channels;
-    // Three minimal channels each starting with 0x00 0x01 (inner
-    // codec-mode flag = 1) — should be rejected.
     let ch = vec![0x00u8, 0x01];
     let frame = pack_channels(7, &[&ch, &ch, &ch]);
     let r = decode_frame(&frame, 4, 4, PixelKind::Bgr24);
@@ -974,4 +973,110 @@ fn legacy_rgb_rejects_non_zero_inner_codec_mode_flag() {
         matches!(r, Err(crate::Error::BadChannelHeader(_))),
         "non-zero inner codec-mode flag must surface BadChannelHeader, got {r:?}"
     );
+}
+
+#[test]
+fn legacy_rgb_rejects_unknown_outer_header() {
+    // Outer header bytes outside {0x00, 0x01, 0x02, 0x03} are not
+    // produced by any encoder path observed in the binary
+    // (`spec/07` §9.1 item 2). Surface as BadChannelHeader so
+    // callers can disambiguate.
+    use crate::frame::pack_channels;
+    let ch = vec![0x05u8; 10];
+    let frame = pack_channels(7, &[&ch, &ch, &ch]);
+    let r = decode_frame(&frame, 4, 4, PixelKind::Bgr24);
+    assert!(
+        matches!(r, Err(crate::Error::BadChannelHeader(_))),
+        "unknown outer header byte must surface BadChannelHeader, got {r:?}"
+    );
+}
+
+#[test]
+fn legacy_rgb_rule_b_first_column_rule() {
+    // Round-5 §1: type 7 uses **Rule B** for the first-column
+    // predictor (`spec/07` §9.1 item 7b). With H >= 3 (where Rule B
+    // diverges from Rule A on rows >= 2 first-col), the encoder /
+    // decoder pair must round-trip with the Rule-B residual stream.
+    let (w, h) = (5u32, 4);
+    let pixels = pattern_bgr24(w, h);
+    let frame = encode_legacy_rgb(&pixels, w, h);
+    let dec = decode_frame(&frame, w, h, PixelKind::Bgr24).unwrap();
+    assert_eq!(dec.pixels, pixels);
+}
+
+#[test]
+fn legacy_rgb_rule_b_tall_plane() {
+    // Many rows >= 2 so the divergence between Rule A and Rule B
+    // accumulates. A Rule-A-keyed decoder against a Rule-B-keyed
+    // encoder would diverge per `spec/07` §9.1 item 7b's
+    // "+3 per byte per row" arithmetic.
+    let (w, h) = (4u32, 8);
+    let pixels = pattern_bgr24(w, h);
+    let frame = encode_legacy_rgb(&pixels, w, h);
+    let dec = decode_frame(&frame, w, h, PixelKind::Bgr24).unwrap();
+    assert_eq!(dec.pixels, pixels);
+}
+
+// ───────── Round 5: type 7 RLE-then-Fibonacci sub-path ─────────
+
+#[test]
+fn legacy_rgb_rle_then_fib_roundtrip_escape_1() {
+    // Outer channel header 0x01: u32 post-RLE byte count + RLE-
+    // compressed Fibonacci freq table (`spec/07` §2.3 / §2.4).
+    let (w, h) = (4u32, 4);
+    let pixels = pattern_bgr24(w, h);
+    let frame = encode_legacy_rgb_rle(&pixels, w, h, 1);
+    assert_eq!(frame[0], 7, "type 7 (legacy RGB) expected");
+    let dec = decode_frame(&frame, w, h, PixelKind::Bgr24).unwrap();
+    assert_eq!(dec.pixels, pixels);
+}
+
+#[test]
+fn legacy_rgb_rle_then_fib_roundtrip_escape_2() {
+    let (w, h) = (4u32, 4);
+    let pixels = pattern_bgr24(w, h);
+    let frame = encode_legacy_rgb_rle(&pixels, w, h, 2);
+    let dec = decode_frame(&frame, w, h, PixelKind::Bgr24).unwrap();
+    assert_eq!(dec.pixels, pixels);
+}
+
+#[test]
+fn legacy_rgb_rle_then_fib_roundtrip_escape_3() {
+    let (w, h) = (4u32, 4);
+    let pixels = pattern_bgr24(w, h);
+    let frame = encode_legacy_rgb_rle(&pixels, w, h, 3);
+    let dec = decode_frame(&frame, w, h, PixelKind::Bgr24).unwrap();
+    assert_eq!(dec.pixels, pixels);
+}
+
+#[test]
+fn legacy_rgb_rle_then_fib_roundtrip_8x8() {
+    let (w, h) = (8u32, 8);
+    let pixels = pattern_bgr24(w, h);
+    for escape_len in 1..=3 {
+        let frame = encode_legacy_rgb_rle(&pixels, w, h, escape_len);
+        let dec = decode_frame(&frame, w, h, PixelKind::Bgr24).unwrap();
+        assert_eq!(dec.pixels, pixels, "escape_len {escape_len}");
+    }
+}
+
+#[test]
+fn legacy_rgb_rle_then_fib_solid_plane_roundtrip() {
+    // Solid plane: histogram has many zero bins -> RLE compresses
+    // the Fibonacci freq table heavily, exercising the post-RLE
+    // length field's compactness. `spec/07` §2.3 says the helper's
+    // post-RLE buffer is at most 256 bytes; sparse histograms
+    // produce short post-RLE buffers.
+    let (w, h) = (4u32, 4);
+    let mut pixels = Vec::with_capacity(48);
+    for _ in 0..16 {
+        pixels.push(0x42);
+        pixels.push(0x42);
+        pixels.push(0x42);
+    }
+    for escape_len in 1..=3 {
+        let frame = encode_legacy_rgb_rle(&pixels, w, h, escape_len);
+        let dec = decode_frame(&frame, w, h, PixelKind::Bgr24).unwrap();
+        assert_eq!(dec.pixels, pixels, "escape_len {escape_len}");
+    }
 }

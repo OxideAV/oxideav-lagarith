@@ -10,7 +10,10 @@
 use crate::fibonacci::encode_freq_table;
 use crate::frame::pack_channels;
 use crate::legacy_range_coder::{build_legacy_cdf, encode_legacy_freq_table, LegacyRangeEncoder};
-use crate::predict::{apply_plane_forward, cross_plane_decorrelate_rgb_forward};
+use crate::predict::{
+    apply_plane_forward, apply_plane_forward_with_rule, cross_plane_decorrelate_rgb_forward,
+    FirstColRule,
+};
 use crate::range_coder::{Cdf, RangeEncoder};
 use crate::rle::contract_raw;
 
@@ -308,6 +311,118 @@ pub fn encode_arith_reduced_res(pixels: &[u8], width: u32, height: u32) -> Vec<u
     frame
 }
 
+/// Encode one **type-7 (legacy RGB)** channel using the
+/// **RLE-then-Fibonacci** wire path of `spec/07` §2.3 / §6.3
+/// (outer header ∈ {0x01, 0x02, 0x03}).
+///
+/// Wire layout:
+/// ```text
+///  byte 0:        outer channel-header byte = escape_len ∈ {1, 2, 3}
+///  bytes 1..5:    u32 LE post-RLE byte count L (≤ 256)
+///  bytes 5..5+M:  RLE-compressed input expanding to the L-byte
+///                 Fibonacci-coded freq-table buffer
+///  byte 5+M:      post-Fibonacci 1-byte reservation (only when the
+///                 Fibonacci stream length is a multiple of 8 bits)
+///  remainder:     legacy range-coder body
+/// ```
+///
+/// The encoder runs `encode_legacy_channel` to compute the bare-
+/// Fibonacci freq-table bit stream + reservation byte, then RLE-
+/// contracts that byte stream into a smaller wire body using the
+/// `spec/05` zero-run-escape encoding with the supplied `escape_len`.
+///
+/// Test-only helper for round-5 self-roundtrip coverage of the
+/// header `0x01..=0x03` decode path. The cleanroom encoder ships
+/// header-0 only at the frame level (`encode_legacy_rgb` always
+/// uses `encode_legacy_channel`); this helper exists so the round-5
+/// roundtrip suite can exercise the RLE-then-Fibonacci sub-path
+/// end-to-end.
+pub fn encode_legacy_channel_rle(plane: &[u8], escape_len: usize) -> Vec<u8> {
+    debug_assert!((1..=3).contains(&escape_len));
+    debug_assert!(!plane.is_empty(), "encode_legacy_channel_rle: empty plane");
+
+    // 1. Compute the bare-Fibonacci freq + transmit_freq + CDF the
+    // same way `encode_legacy_channel` does, but emit just the
+    // Fibonacci buffer (no outer header / inner flag).
+    let mut freq = [0u32; 256];
+    for &b in plane {
+        freq[b as usize] = freq[b as usize].saturating_add(1);
+    }
+    let (cdf_initial, total) = build_legacy_cdf(&freq).unwrap();
+    let mut transmit_freq = [0u32; 256];
+    for c in 0..256 {
+        transmit_freq[c] = cdf_initial[c + 1] - cdf_initial[c];
+    }
+    for c in 0..256 {
+        if freq[c] > 0 && transmit_freq[c] == 0 {
+            let donor = (0..256)
+                .max_by_key(|&i| {
+                    if transmit_freq[i] > 1 {
+                        transmit_freq[i]
+                    } else {
+                        0
+                    }
+                })
+                .filter(|&i| transmit_freq[i] > 1);
+            if let Some(d) = donor {
+                transmit_freq[c] += 1;
+                transmit_freq[d] -= 1;
+            }
+        }
+    }
+    debug_assert_eq!(
+        transmit_freq.iter().map(|&f| f as u64).sum::<u64>(),
+        total as u64
+    );
+    let mut cdf = vec![0u32; 257];
+    let mut acc: u32 = 0;
+    for c in 0..256 {
+        cdf[c] = acc;
+        acc = acc.wrapping_add(transmit_freq[c]);
+    }
+    cdf[256] = acc;
+
+    // 2. Fibonacci-encode the freq table.
+    let (fib_bytes, fib_aligned) = encode_legacy_freq_table(&transmit_freq);
+
+    // 3. The post-RLE buffer is `fib_bytes` (the Fibonacci freq table)
+    // — the decoder of `decode_legacy_rle_then_fib` expects the
+    // post-RLE expansion output to BE the Fibonacci-coded byte stream
+    // the freq-table decoder walks. Pad to the proprietary's 256-byte
+    // canonical buffer size (the Fib decoder ignores trailing bytes
+    // beyond `fib_bytes` because it stops after 256 frequencies have
+    // been decoded). Padding is `0x00` per cleanroom convention.
+    let post_rle_len = fib_bytes.len();
+    debug_assert!(
+        post_rle_len <= 256,
+        "Fibonacci freq table must fit in 256-byte buffer"
+    );
+
+    // 4. RLE-contract the Fibonacci byte stream.
+    let rle_compressed = crate::rle::contract_raw(&fib_bytes, escape_len);
+
+    // 5. Range-encode the plane against the CDF.
+    let mut enc = LegacyRangeEncoder::new(cdf, total);
+    for &b in plane {
+        enc.encode_byte(b);
+    }
+    let body = enc.finish();
+
+    // 6. Stitch the RLE-then-Fibonacci channel layout.
+    let mut out = Vec::with_capacity(5 + rle_compressed.len() + 1 + body.len());
+    out.push(escape_len as u8); // outer channel header
+    out.extend_from_slice(&(post_rle_len as u32).to_le_bytes());
+    out.extend_from_slice(&rle_compressed);
+    if fib_aligned {
+        // Post-Fibonacci 1-byte reservation per audit/08 §3.2 — the
+        // legacy range decoder's priming-byte read at offset +1 of
+        // its first argument skips this byte.
+        out.push(0x00);
+    }
+    out.extend_from_slice(&body);
+    out
+}
+
 /// Encode one **type-7 (legacy RGB)** channel into a byte sequence
 /// using the bare-Fibonacci 2-byte channel prefix path of
 /// `spec/07` §6.3. The output layout:
@@ -432,14 +547,54 @@ pub fn encode_legacy_rgb(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
     // Cross-plane decorrelation (forward) — same as types 2 / 4.
     cross_plane_decorrelate_rgb_forward(&mut plane_b, &plane_g, &mut plane_r);
 
-    // Spatial predictor (forward) — same as types 2 / 4.
-    let res_b = apply_plane_forward(&plane_b, width as usize, height as usize);
-    let res_g = apply_plane_forward(&plane_g, width as usize, height as usize);
-    let res_r = apply_plane_forward(&plane_r, width as usize, height as usize);
+    // Spatial predictor (forward) — type 7 uses **Rule B** for the
+    // first-column-of-row predictor (`spec/07` §9.1 item 7b).
+    let res_b =
+        apply_plane_forward_with_rule(&plane_b, width as usize, height as usize, FirstColRule::B);
+    let res_g =
+        apply_plane_forward_with_rule(&plane_g, width as usize, height as usize, FirstColRule::B);
+    let res_r =
+        apply_plane_forward_with_rule(&plane_r, width as usize, height as usize, FirstColRule::B);
 
     let ch_b = encode_legacy_channel(&res_b);
     let ch_g = encode_legacy_channel(&res_g);
     let ch_r = encode_legacy_channel(&res_r);
+
+    pack_channels(7, &[&ch_b, &ch_g, &ch_r])
+}
+
+/// Encode a **type-7 (legacy RGB)** frame using the **RLE-then-
+/// Fibonacci** channel sub-path (`spec/07` §2.3 / §2.4). Same
+/// pipeline as [`encode_legacy_rgb`] except the per-channel encoder
+/// is [`encode_legacy_channel_rle`] with the supplied `escape_len`
+/// (1, 2, or 3). Test-only — drives the round-5 roundtrip suite for
+/// the channel-header `0x01..=0x03` decode path.
+pub fn encode_legacy_rgb_rle(pixels: &[u8], width: u32, height: u32, escape_len: usize) -> Vec<u8> {
+    debug_assert!((1..=3).contains(&escape_len));
+    let n = width as usize * height as usize;
+    debug_assert_eq!(pixels.len(), n * 3);
+
+    let mut plane_b = Vec::with_capacity(n);
+    let mut plane_g = Vec::with_capacity(n);
+    let mut plane_r = Vec::with_capacity(n);
+    for px in pixels.chunks_exact(3) {
+        plane_b.push(px[0]);
+        plane_g.push(px[1]);
+        plane_r.push(px[2]);
+    }
+
+    cross_plane_decorrelate_rgb_forward(&mut plane_b, &plane_g, &mut plane_r);
+
+    let res_b =
+        apply_plane_forward_with_rule(&plane_b, width as usize, height as usize, FirstColRule::B);
+    let res_g =
+        apply_plane_forward_with_rule(&plane_g, width as usize, height as usize, FirstColRule::B);
+    let res_r =
+        apply_plane_forward_with_rule(&plane_r, width as usize, height as usize, FirstColRule::B);
+
+    let ch_b = encode_legacy_channel_rle(&res_b, escape_len);
+    let ch_g = encode_legacy_channel_rle(&res_g, escape_len);
+    let ch_r = encode_legacy_channel_rle(&res_r, escape_len);
 
     pack_channels(7, &[&ch_b, &ch_g, &ch_r])
 }

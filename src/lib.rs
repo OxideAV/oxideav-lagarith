@@ -1,6 +1,6 @@
 //! Pure-Rust Lagarith lossless video decoder.
 //!
-//! **Rounds 1..4 of the clean-room rebuild.** Implements the modern
+//! **Rounds 1..5 of the clean-room rebuild.** Implements the modern
 //! arithmetic-coded RGB24 / RGB32 / RGBA decode pipeline plus the
 //! Uncompressed (type 1) and Solid (types 5 / 6 / 9) literal frames
 //! (round 1); the YV12 (type 10) multi-plane arithmetic decode path
@@ -8,9 +8,12 @@
 //! frames per `spec/01` §1.1 (round 2); the YUY2 (type 3)
 //! packed→planar pipeline + reduced-resolution (type 11) — a
 //! half-W/half-H YV12 body with a 2× nearest-neighbour upscale on
-//! decode (round 3); and the **legacy RGB** (type 7, pre-1.1.0)
-//! adaptive-CDF range coder per `spec/07` (round 4). All against
-//! the strict-isolation cleanroom workspace at
+//! decode (round 3); the **legacy RGB** (type 7, pre-1.1.0)
+//! adaptive-CDF range coder per `spec/07` (round 4); and round 5's
+//! type-7 spec-coverage extensions — **Rule B** first-column
+//! predictor (`spec/07` §9.1 item 7b) and the **RLE-then-Fibonacci**
+//! channel sub-path (header `0x01..=0x03`, `spec/07` §2.3 / §2.4).
+//! All against the strict-isolation cleanroom workspace at
 //! `docs/video/lagarith/`.
 //!
 //! ## Pipeline (arithmetic-coded RGB family)
