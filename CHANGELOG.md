@@ -8,6 +8,41 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 3 — YUY2 (frame type 3) and reduced-resolution (frame
+  type 11).**
+  - `FrameType::ArithmeticYuy2` (frame-type byte `0x03`) now decodes
+    via the same channel-header dispatcher as the YV12 path, with
+    three planes — Y at `W * H`, U and V at `(W / 2) * H` each —
+    per-plane left + median predictor, no cross-plane
+    decorrelation. The wire is **planar** Y/U/V (note: U before V,
+    unlike YV12); the output ([`PixelKind::Yuy2`]) is **packed**
+    `Y0 U Y1 V` per pair of pixels at columns `2k, 2k+1`
+    (`spec/03` §6.2).
+  - `FrameType::ReducedResYv12` (frame-type byte `0x0b`) decodes
+    the body as a half-W/half-H YV12 frame and 2× nearest-neighbour
+    upscales each plane (luma + V + U) onto the host's full-
+    resolution `PixelKind::Yv12` buffer (`spec/01` §2.4 +
+    audit/00-report.md §9.1).
+  - New `PixelKind::Yuy2` variant (16-bpp packed, 2 bytes per
+    pixel).
+  - Encoder helpers `encode_arith_yuy2` and `encode_arith_reduced_res`
+    for the self-roundtrip suite (the round-3 encoder remains
+    self-roundtrip-only — byte-exact validation against the
+    proprietary encoder is an Auditor concern; see the
+    `SPECGAP-encoder-byte-exact` test marker).
+  - **SIMD-vs-scalar predictor parity** documented per `spec/06`
+    §3.5 / §3.6: the crate's scalar predictor implements
+    Strategy A (`TL = L = plane[y-1][W-1]`), which is
+    *carry-equivalent* to the proprietary's SIMD inner-loop AND
+    matches the proprietary's scalar predictor for every
+    `(width, frame-type)` pair. No separate SIMD path is needed
+    for byte-equivalent residual streams.
+  - +11 tests covering the YUY2 path (4×4, 8×6, 16×16, pixel-
+    format mismatch, buffer-length parity), the reduced-resolution
+    path (8×8, 16×16, pixel-format mismatch, hand-rolled 2×
+    upscale parity), the SIMD-vs-scalar predictor parity, and the
+    byte-exact-encoder SPECGAP marker. 66 tests total.
+
 - **Round 2 — YV12 (frame type 10) and stateful NULL-frame replay.**
   - `FrameType::ArithmeticYv12` (frame-type byte `0x0a`) now
     decodes through the same channel-header dispatcher as the RGB
@@ -73,11 +108,12 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Deferred
 
-- Frame types 3 (YUY2), 7 (legacy RGB), and 11 (reduced-resolution)
-  — surfaced as `Error::UnsupportedFrameType` for now. (Type 10
-  YV12 landed in round 2; type 11 wire-format mirrors type 10 at
-  half-resolution + 2× upscale per `spec/01` §2.4 — straightforward
-  follow-on once an Auditor fixture exists.)
+- Frame type 7 (legacy RGB, pre-1.1.0 adaptive-CDF range coder per
+  `spec/07`) remains surfaced as `Error::UnsupportedFrameType`.
+  Round 4 candidate.
+- Byte-exact encoder validation against a proprietary-encoded AVI
+  fixture — Auditor concern; no fixture currently in tree
+  (`samples.oxideav.org` not provisioned).
 - The reciprocal-multiply LUT at RVA `0x1b9a0` is not used by the
   decoder (the cumulative-frequency search loop `spec/02` §5 invites
   is bit-equivalent and simpler).

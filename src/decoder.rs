@@ -1,4 +1,4 @@
-//! Frame-level decoder API. Round 1+2 coverage:
+//! Frame-level decoder API. Rounds 1, 2, and 3 coverage:
 //!
 //! - **Uncompressed** (frame type 1): raw pixel data verbatim.
 //! - **Solid frames** (types 5, 6, 9): byte fill.
@@ -14,6 +14,20 @@
 //!   median predictor and **no** cross-plane decorrelation
 //!   (`spec/03` §6.1, §4.4). Output layout is concatenated
 //!   Y / V / U planes (`PixelKind::Yv12`).
+//! - **Arithmetic YUY2** (type 3, round 3): three planes — Y at
+//!   `W * H`, U and V at `(W / 2) * H` each — per `spec/03` §6.2.
+//!   Predictor is identical to YV12 (per-plane, no cross-plane
+//!   decorrelation). The wire is **planar** (Y, U, V), the output
+//!   ([`PixelKind::Yuy2`]) is **packed** (`Y0 U Y1 V` per pair of
+//!   pixels at columns `2k, 2k+1`).
+//! - **Reduced-resolution YV12** (type 11, round 3): per `spec/01`
+//!   §2.4 + `spec/03` §6.1, the wire body is byte-identical to a
+//!   type-10 (YV12) frame at half-W / half-H; the decoder
+//!   reconstructs that half-resolution YV12 image and 2× nearest-
+//!   neighbour upscales each of the three planes (luma + V + U) onto
+//!   the host's full-resolution `PixelKind::Yv12` output buffer.
+//!   The 64-bit Lagarith encoder does not produce type 11; it
+//!   exists for backwards compatibility with the i386 build.
 //! - **NULL frame / JUMP** (round 2): zero-byte payload signals
 //!   "frame unchanged from predecessor" (`spec/01` §1.1). The
 //!   stateless [`decode_frame`] reports [`Error::NullFrame`]; the
@@ -36,6 +50,10 @@ pub enum PixelKind {
     /// (`(W * H) / 4` bytes) followed by U (`(W * H) / 4` bytes).
     /// `spec/03` §6.1 plane order.
     Yv12,
+    /// 16-bpp packed YUY2 — `Y0 U Y1 V` per pair of pixels at
+    /// columns `2k, 2k+1`. Buffer length is `W * H * 2`.
+    /// `spec/03` §6.2 packed-pixel layout.
+    Yuy2,
 }
 
 impl PixelKind {
@@ -49,17 +67,21 @@ impl PixelKind {
             // YV12: Y + V + U with chroma at quarter resolution.
             // Chroma is `floor((W * H) / 4)` per `spec/03` §6.1.1.
             Self::Yv12 => n + 2 * (n / 4),
+            // YUY2: packed `Y0 U Y1 V` — 2 bytes per pixel.
+            Self::Yuy2 => n * 2,
         }
     }
 
     /// `Some(bytes-per-pixel)` for packed RGB pixel formats; `None`
     /// for planar formats like YV12 where bytes-per-pixel is not a
-    /// single integer.
+    /// single integer. YUY2 is packed but at the macropixel level
+    /// — bytes-per-pixel is 2 in aggregate but unevenly divided
+    /// between luma and chroma — the unpack helper handles it.
     fn packed_bpp(self) -> Option<usize> {
         match self {
             Self::Bgr24 => Some(3),
             Self::Bgra32 => Some(4),
-            Self::Yv12 => None,
+            Self::Yv12 | Self::Yuy2 => None,
         }
     }
 }
@@ -109,6 +131,8 @@ pub fn decode_frame(
             decode_arith_rgba(payload, width, height, pixel_kind)
         }
         FrameType::ArithmeticYv12 => decode_arith_yv12(payload, width, height, pixel_kind),
+        FrameType::ArithmeticYuy2 => decode_arith_yuy2(payload, width, height, pixel_kind),
+        FrameType::ReducedResYv12 => decode_reduced_res(payload, width, height, pixel_kind),
     }
 }
 
@@ -270,7 +294,9 @@ fn decode_solid(
                 pixels.push(r);
                 pixels.push(a);
             }
-            PixelKind::Yv12 => unreachable!("guarded by packed_bpp() above"),
+            PixelKind::Yv12 | PixelKind::Yuy2 => {
+                unreachable!("guarded by packed_bpp() above")
+            }
         }
     }
     Ok(DecodedFrame {
@@ -322,7 +348,9 @@ fn decode_arith_rgb(
                 pixels.push(plane_r[i]);
                 pixels.push(0xff);
             }
-            PixelKind::Yv12 => unreachable!("guarded by packed_bpp() above"),
+            PixelKind::Yv12 | PixelKind::Yuy2 => {
+                unreachable!("guarded by packed_bpp() above")
+            }
         }
     }
     Ok(DecodedFrame {
@@ -372,7 +400,9 @@ fn decode_arith_rgba(
                 pixels.push(plane_r[i]);
                 pixels.push(plane_a[i]);
             }
-            PixelKind::Yv12 => unreachable!("guarded by packed_bpp() above"),
+            PixelKind::Yv12 | PixelKind::Yuy2 => {
+                unreachable!("guarded by packed_bpp() above")
+            }
         }
     }
     Ok(DecodedFrame {
@@ -455,4 +485,185 @@ fn decode_arith_yv12(
         pixel_kind,
         pixels,
     })
+}
+
+/// Decode an arithmetic YUY2 frame (type 3, round 3).
+///
+/// Per `spec/03` §6.2 the wire is **planar** (Y, U, V plane order —
+/// note the swap relative to YV12) where Y is `W * H` bytes and each
+/// of U / V is `(W / 2) * H` bytes. The channel-offset table maps
+/// plane[0] = Y, plane[1] = U, plane[2] = V. The predictor is
+/// per-plane left + median (no cross-plane decorrelation, like
+/// YV12 — `spec/03` §4.4). The output ([`PixelKind::Yuy2`]) is
+/// **packed**: for each pair of pixels at columns `2k, 2k+1` of row
+/// `y`,
+///
+/// ```text
+/// out[(y, 2k    ) * 2 + 0] = Y[y, 2k    ]
+/// out[(y, 2k    ) * 2 + 1] = U[y, k]
+/// out[(y, 2k + 1) * 2 + 0] = Y[y, 2k + 1]
+/// out[(y, 2k + 1) * 2 + 1] = V[y, k]
+/// ```
+fn decode_arith_yuy2(
+    payload: &[u8],
+    width: u32,
+    height: u32,
+    pixel_kind: PixelKind,
+) -> Result<DecodedFrame> {
+    if pixel_kind != PixelKind::Yuy2 {
+        return Err(Error::PixelFormatMismatch {
+            frame_type: payload[0],
+        });
+    }
+    let w = width as usize;
+    let h = height as usize;
+    let y_pixels = w * h;
+    // Per `spec/03` §6.2 chroma planes are W/2 wide and H tall (4:2:2
+    // sub-sampling). For odd widths the encoder truncates one luma
+    // column to the chroma macropixel — we mirror that.
+    let cw = w / 2;
+    let c_pixels = cw * h;
+
+    let slices = split_channels(payload, 3)?;
+    let mut plane_y = decode_channel(slices[0], y_pixels)?;
+    let mut plane_u = decode_channel(slices[1], c_pixels)?;
+    let mut plane_v = decode_channel(slices[2], c_pixels)?;
+
+    apply_plane_inverse(&mut plane_y, w, h);
+    apply_plane_inverse(&mut plane_u, cw, h);
+    apply_plane_inverse(&mut plane_v, cw, h);
+
+    // Pack Y/U/V into the YUY2 output. The output is a `W * H * 2`
+    // byte buffer; we emit one full row at a time. Odd-width tail
+    // gets a chroma neutral (0x80) byte to keep the macropixel
+    // boundary aligned (matches the reference impl).
+    let mut pixels = vec![0u8; y_pixels * 2];
+    for y in 0..h {
+        let y_row = y * w;
+        let c_row = y * cw;
+        let out_row = y * w * 2;
+        for k in 0..cw {
+            pixels[out_row + 4 * k] = plane_y[y_row + 2 * k];
+            pixels[out_row + 4 * k + 1] = plane_u[c_row + k];
+            pixels[out_row + 4 * k + 2] = plane_y[y_row + 2 * k + 1];
+            pixels[out_row + 4 * k + 3] = plane_v[c_row + k];
+        }
+        if w % 2 == 1 {
+            // Odd-width tail: last luma sample with neutral chroma.
+            let last_x = w - 1;
+            pixels[out_row + 2 * last_x] = plane_y[y_row + last_x];
+            pixels[out_row + 2 * last_x + 1] = 0x80;
+        }
+    }
+    Ok(DecodedFrame {
+        width,
+        height,
+        pixel_kind,
+        pixels,
+    })
+}
+
+/// Decode a reduced-resolution frame (type 11, round 3).
+///
+/// Per `spec/01` §2.4 (audit-resolved at `audit/00-report.md` §9.1)
+/// the wire body is **byte-identical to a type-10 (YV12) frame at
+/// half-W / half-H**. The decoder reconstructs that half-resolution
+/// YV12 image by re-interpreting byte 0 as `0x0a` and dispatching
+/// through the regular YV12 path, then 2× nearest-neighbour
+/// upscales every plane (luma, V, U) onto the full-resolution
+/// output buffer.
+///
+/// Width and height must both be at least 2 — anything smaller has
+/// no valid half-resolution YV12 representation.
+fn decode_reduced_res(
+    payload: &[u8],
+    width: u32,
+    height: u32,
+    pixel_kind: PixelKind,
+) -> Result<DecodedFrame> {
+    if pixel_kind != PixelKind::Yv12 {
+        return Err(Error::PixelFormatMismatch {
+            frame_type: payload[0],
+        });
+    }
+    let half_w = width / 2;
+    let half_h = height / 2;
+    if half_w < 1 || half_h < 1 {
+        return Err(Error::BadDimensions { width, height });
+    }
+    // Re-route byte 0 to the YV12 decoder. Build a fresh payload
+    // with byte 0 = 0x0a; the rest is unchanged.
+    let mut sub = Vec::with_capacity(payload.len());
+    sub.push(10);
+    sub.extend_from_slice(&payload[1..]);
+    let half = decode_arith_yv12(&sub, half_w, half_h, PixelKind::Yv12)?;
+
+    // 2× upscale each plane (Y, V, U) by nearest-neighbour
+    // duplication into a 2W × 2H output. (audit-resolved at
+    // §9.1: the proprietary's upscaler at
+    // `lagarith.dll!0x18000ca90` / `0x18000cd40` writes each input
+    // byte to a 2×2 output block, which is the standard nearest-
+    // neighbour 2× upsample.)
+    let small_y = half_w as usize * half_h as usize;
+    let small_cw = (half_w as usize) / 2;
+    let small_ch = (half_h as usize) / 2;
+    let small_c = small_cw * small_ch;
+    debug_assert_eq!(half.pixels.len(), small_y + 2 * small_c);
+    let big_w = width as usize;
+    let big_h = height as usize;
+    let big_y = big_w * big_h;
+    let big_cw = big_w / 2;
+    let big_ch = big_h / 2;
+    let big_c = big_cw * big_ch;
+    let mut out = vec![0u8; big_y + 2 * big_c];
+
+    upscale_plane_2x(
+        &half.pixels[..small_y],
+        half_w as usize,
+        half_h as usize,
+        &mut out[..big_y],
+        big_w,
+    );
+    upscale_plane_2x(
+        &half.pixels[small_y..small_y + small_c],
+        small_cw,
+        small_ch,
+        &mut out[big_y..big_y + big_c],
+        big_cw,
+    );
+    upscale_plane_2x(
+        &half.pixels[small_y + small_c..],
+        small_cw,
+        small_ch,
+        &mut out[big_y + big_c..],
+        big_cw,
+    );
+
+    Ok(DecodedFrame {
+        width,
+        height,
+        pixel_kind,
+        pixels: out,
+    })
+}
+
+/// 2× nearest-neighbour upsample: read `src` as a `src_w × src_h`
+/// plane, write each input byte to a 2×2 output block in `dst`
+/// (which the caller has sized at `(2 * src_w) * (2 * src_h)`).
+fn upscale_plane_2x(src: &[u8], src_w: usize, src_h: usize, dst: &mut [u8], dst_w: usize) {
+    debug_assert_eq!(src.len(), src_w * src_h);
+    debug_assert_eq!(dst.len(), dst_w * src_h * 2);
+    debug_assert_eq!(dst_w, src_w * 2);
+    for y in 0..src_h {
+        let src_row = y * src_w;
+        let dst_row_top = (2 * y) * dst_w;
+        let dst_row_bot = (2 * y + 1) * dst_w;
+        for x in 0..src_w {
+            let v = src[src_row + x];
+            dst[dst_row_top + 2 * x] = v;
+            dst[dst_row_top + 2 * x + 1] = v;
+            dst[dst_row_bot + 2 * x] = v;
+            dst[dst_row_bot + 2 * x + 1] = v;
+        }
+    }
 }

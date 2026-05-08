@@ -3,20 +3,22 @@
 
 use crate::error::{Error, Result};
 
-/// Recognised frame types this build's decoder accepts. Rounds 1+2
-/// cover every type the spec calls out except YUY2 (3), legacy RGB
-/// (7), and reduced-resolution (11) — which remain flagged as future
-/// work / out-of-scope.
+/// Recognised frame types this build's decoder accepts. Round 3 adds
+/// YUY2 (3) and reduced-resolution (11). Type 7 (legacy RGB,
+/// pre-1.1.0 adaptive-CDF range coder per `spec/07`) remains
+/// deferred.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum FrameType {
     Uncompressed,    // 1
     UnalignedRgb24,  // 2
+    ArithmeticYuy2,  // 3
     ArithmeticRgb24, // 4 (RGB24 / RGB32 distinguished by bit-depth)
     SolidGrey,       // 5
     SolidRgb,        // 6
     ArithmeticRgba,  // 8
     SolidRgba,       // 9
     ArithmeticYv12,  // 10
+    ReducedResYv12,  // 11 (= type 10 at half-W/half-H + 2× upscale)
 }
 
 impl FrameType {
@@ -24,13 +26,15 @@ impl FrameType {
         match b {
             1 => Ok(Self::Uncompressed),
             2 => Ok(Self::UnalignedRgb24),
+            3 => Ok(Self::ArithmeticYuy2),
             4 => Ok(Self::ArithmeticRgb24),
             5 => Ok(Self::SolidGrey),
             6 => Ok(Self::SolidRgb),
             8 => Ok(Self::ArithmeticRgba),
             9 => Ok(Self::SolidRgba),
             10 => Ok(Self::ArithmeticYv12),
-            3 | 7 | 11 => Err(Error::UnsupportedFrameType(b)),
+            11 => Ok(Self::ReducedResYv12),
+            7 => Err(Error::UnsupportedFrameType(b)),
             0 | 12.. => Err(Error::BadFrameType(b)),
         }
     }
@@ -40,7 +44,11 @@ impl FrameType {
     pub fn n_channels(self) -> usize {
         match self {
             Self::Uncompressed | Self::SolidGrey | Self::SolidRgb | Self::SolidRgba => 0,
-            Self::UnalignedRgb24 | Self::ArithmeticRgb24 | Self::ArithmeticYv12 => 3,
+            Self::UnalignedRgb24
+            | Self::ArithmeticYuy2
+            | Self::ArithmeticRgb24
+            | Self::ArithmeticYv12
+            | Self::ReducedResYv12 => 3,
             Self::ArithmeticRgba => 4,
         }
     }
@@ -179,24 +187,18 @@ mod tests {
             Err(Error::BadFrameType(12))
         ));
         assert!(matches!(
-            FrameType::from_byte(3),
-            Err(Error::UnsupportedFrameType(3))
-        ));
-        assert!(matches!(
             FrameType::from_byte(7),
             Err(Error::UnsupportedFrameType(7))
         ));
-        assert!(matches!(
-            FrameType::from_byte(11),
-            Err(Error::UnsupportedFrameType(11))
-        ));
-        assert_eq!(FrameType::from_byte(10).unwrap(), FrameType::ArithmeticYv12);
         assert_eq!(FrameType::from_byte(1).unwrap(), FrameType::Uncompressed);
         assert_eq!(FrameType::from_byte(2).unwrap(), FrameType::UnalignedRgb24);
+        assert_eq!(FrameType::from_byte(3).unwrap(), FrameType::ArithmeticYuy2);
         assert_eq!(FrameType::from_byte(4).unwrap(), FrameType::ArithmeticRgb24);
         assert_eq!(FrameType::from_byte(5).unwrap(), FrameType::SolidGrey);
         assert_eq!(FrameType::from_byte(6).unwrap(), FrameType::SolidRgb);
         assert_eq!(FrameType::from_byte(8).unwrap(), FrameType::ArithmeticRgba);
         assert_eq!(FrameType::from_byte(9).unwrap(), FrameType::SolidRgba);
+        assert_eq!(FrameType::from_byte(10).unwrap(), FrameType::ArithmeticYv12);
+        assert_eq!(FrameType::from_byte(11).unwrap(), FrameType::ReducedResYv12);
     }
 }

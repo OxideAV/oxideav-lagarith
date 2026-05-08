@@ -156,6 +156,19 @@ fn map_to_video_frame(frame: DecodedFrame, pts: Option<i64>) -> VideoFrame {
                 ],
             }
         }
+        PixelKind::Yuy2 => {
+            // YUY2: packed `Y0 U Y1 V` macropixels, 2 bytes per pixel
+            // — surface as a single packed plane (the most common
+            // host integration). Stride is `W * 2` bytes.
+            let stride = frame.width as usize * 2;
+            VideoFrame {
+                pts,
+                planes: vec![VideoPlane {
+                    stride,
+                    data: frame.pixels,
+                }],
+            }
+        }
     }
 }
 

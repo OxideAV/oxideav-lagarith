@@ -207,6 +207,106 @@ pub fn encode_arith_yv12(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
     pack_channels(10, &[&ch_y, &ch_v, &ch_u])
 }
 
+/// Encode an arithmetic YUY2 frame (type 3, round 3). Input is
+/// packed YUY2 (`Y0 U Y1 V` per pair of pixels at columns `2k,
+/// 2k+1`). Width must be even (the encoder mirrors the proprietary's
+/// macropixel constraint).
+pub fn encode_arith_yuy2(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let w = width as usize;
+    let h = height as usize;
+    debug_assert_eq!(pixels.len(), w * h * 2);
+    debug_assert_eq!(w % 2, 0, "encoder requires even width for YUY2");
+    let cw = w / 2;
+    let y_pixels = w * h;
+    let c_pixels = cw * h;
+
+    // Unpack the packed YUY2 buffer into three planes (Y, U, V).
+    let mut plane_y = Vec::with_capacity(y_pixels);
+    let mut plane_u = Vec::with_capacity(c_pixels);
+    let mut plane_v = Vec::with_capacity(c_pixels);
+    for y in 0..h {
+        let in_row = y * w * 2;
+        for k in 0..cw {
+            plane_y.push(pixels[in_row + 4 * k]);
+            plane_u.push(pixels[in_row + 4 * k + 1]);
+            plane_y.push(pixels[in_row + 4 * k + 2]);
+            plane_v.push(pixels[in_row + 4 * k + 3]);
+        }
+    }
+
+    let res_y = apply_plane_forward(&plane_y, w, h);
+    let res_u = apply_plane_forward(&plane_u, cw, h);
+    let res_v = apply_plane_forward(&plane_v, cw, h);
+
+    let ch_y = encode_channel_simple(&res_y);
+    let ch_u = encode_channel_simple(&res_u);
+    let ch_v = encode_channel_simple(&res_v);
+
+    pack_channels(3, &[&ch_y, &ch_u, &ch_v])
+}
+
+/// Encode a reduced-resolution YV12 frame (type 11, round 3).
+///
+/// Per `spec/01` §2.4 the wire body is the same as a type-10 frame
+/// at half-W/half-H. The 64-bit Lagarith encoder does **not**
+/// produce type 11 in the wild — this helper exists only to drive
+/// the round-3 self-roundtrip suite. Width and height must both be
+/// at least 2.
+///
+/// Input layout: full-resolution `Y || V || U` planes (the same
+/// layout the YV12 decoder produces). The encoder downsamples each
+/// plane by 2× via skip-by-2 (every other row, every other column —
+/// the inverse of the decoder's nearest-neighbour upscaler) and
+/// re-routes through [`encode_arith_yv12`], rewriting byte 0 to
+/// `0x0b`.
+pub fn encode_arith_reduced_res(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let w = width as usize;
+    let h = height as usize;
+    let half_w = w / 2;
+    let half_h = h / 2;
+    debug_assert!(half_w >= 1 && half_h >= 1);
+    debug_assert_eq!(w % 2, 0);
+    debug_assert_eq!(h % 2, 0);
+    let big_y = w * h;
+    let big_cw = w / 2;
+    let big_ch = h / 2;
+    let big_c = big_cw * big_ch;
+    debug_assert_eq!(pixels.len(), big_y + 2 * big_c);
+
+    // Skip-by-2 downsample of each plane.
+    let small_cw = half_w / 2;
+    let small_ch = half_h / 2;
+    let small_y = half_w * half_h;
+    let small_c = small_cw * small_ch;
+    let mut buf = Vec::with_capacity(small_y + 2 * small_c);
+    // Y
+    for y in 0..half_h {
+        let row = (2 * y) * w;
+        for x in 0..half_w {
+            buf.push(pixels[row + 2 * x]);
+        }
+    }
+    // V
+    for y in 0..small_ch {
+        let row = big_y + (2 * y) * big_cw;
+        for x in 0..small_cw {
+            buf.push(pixels[row + 2 * x]);
+        }
+    }
+    // U
+    for y in 0..small_ch {
+        let row = big_y + big_c + (2 * y) * big_cw;
+        for x in 0..small_cw {
+            buf.push(pixels[row + 2 * x]);
+        }
+    }
+
+    let mut frame = encode_arith_yv12(&buf, half_w as u32, half_h as u32);
+    // Rewrite byte 0 from 0x0a (type 10) to 0x0b (type 11).
+    frame[0] = 11;
+    frame
+}
+
 /// Encode an arithmetic RGBA frame (type 8). Input is packed BGRA.
 pub fn encode_arith_rgba(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
     let n = width as usize * height as usize;

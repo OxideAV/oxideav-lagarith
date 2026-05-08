@@ -5,9 +5,10 @@ Pure-Rust Lagarith lossless video codec for the
 
 ## Status
 
-**Rounds 1+2 — arithmetic-coded RGB+YV12 + NULL-frame replay.** This
-`master` branch is the clean-room rebuild against the strict-
-isolation cleanroom workspace at
+**Rounds 1+2+3 — arithmetic-coded RGB / YV12 / YUY2 + NULL-frame
+replay + reduced-resolution.** This `master` branch is the
+clean-room rebuild against the strict-isolation cleanroom workspace
+at
 [`docs/video/lagarith/`](https://github.com/OxideAV/docs/tree/master/video/lagarith).
 The previous implementation was retired by the OxideAV docs audit
 dated 2026-05-06 (see
@@ -21,7 +22,7 @@ but is forbidden input.
 | ---------- | --------- | ----- |
 | 1 — Uncompressed | raw pixel data | 1 |
 | 2 — Unaligned-RGB24 | arithmetic, `width % 4 != 0` | 1 |
-| 3 — Arithmetic-YUY2 | packed→planar | deferred |
+| 3 — Arithmetic-YUY2 | packed→planar (Y/U/V planes) | **3** |
 | 4 — Arithmetic-RGB24 / RGB32 | arithmetic, `width % 4 == 0` | 1 |
 | 5 — Solid Grey | byte fill | 1 |
 | 6 — Solid RGB | three-byte fill | 1 |
@@ -29,7 +30,7 @@ but is forbidden input.
 | 8 — Arithmetic-RGBA | four planes incl. alpha | 1 |
 | 9 — Solid RGBA | four-byte fill | 1 |
 | 10 — Arithmetic-YV12 | three-plane Y/V/U | **2** |
-| 11 — Reduced-resolution | type 10 + 2× upscale | deferred |
+| 11 — Reduced-resolution | type 10 at half-W/H + 2× upscale | **3** |
 | NULL ("JUMP") | zero-byte payload, replay previous | **2** |
 
 ## Pipeline
@@ -93,10 +94,32 @@ let frame_b = dec.decode(&[], width, height, PixelKind::Bgra32)?;
 
 ## Tests
 
-55 unit + integration tests cover the range coder, Fibonacci
+66 unit + integration tests cover the range coder, Fibonacci
 prefix, RLE escape, predictor + decorrelation, channel-header
 dispatcher, the channel-header `0x01..=0x03` arithmetic-with-RLE
 path and the `0x05..=0x07` raw-RLE path, an end-to-end encode →
-decode round-trip for each of types 1, 2, 4, 5, 6, 8, 9, 10
-(round 2 YV12), and the NULL-frame ("JUMP") replay path through
-both the `Decoder` wrapper and the `decode_frame_with_prev` helper.
+decode round-trip for each of types 1, 2, 3 (round 3 YUY2), 4,
+5, 6, 8, 9, 10 (round 2 YV12), 11 (round 3 reduced-resolution),
+and the NULL-frame ("JUMP") replay path through both the
+`Decoder` wrapper and the `decode_frame_with_prev` helper.
+
+### SIMD-vs-scalar predictor (`spec/06` §3.5)
+
+The crate's predictor implements **Strategy A** (`TL = L =
+plane[y-1][W-1]` for every row `y >= 1`, per `spec/06` §3.6) which
+is *carry-equivalent* to the proprietary's SIMD inner-loop and
+*matches* the scalar predictor for every `(width, frame-type)`
+where the proprietary's dispatch selects either path. No separate
+SIMD code path is therefore required for byte-equivalent output;
+the scalar predictor produces the same residual stream the
+proprietary's SIMD path would for `width % 4 == 0` fixtures.
+
+### Byte-exact encoder validation — SPECGAP
+
+Round 3 continues the round-2 self-roundtrip-only contract.
+Byte-exact validation against the proprietary encoder requires
+either a proprietary-encoded AVI fixture (we don't carry one in
+tree — `docs/video/lagarith/reference/binaries/` only holds the
+DLL black-box, not encoded video) or an AVI sample from
+`samples.oxideav.org` (not currently provisioned). This is an
+Auditor concern for a future round.
