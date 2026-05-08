@@ -6,6 +6,22 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.1](https://github.com/OxideAV/oxideav-lagarith/releases/tag/v0.0.1) - 2026-05-08
+
+### Other
+
+- round 8 — spec/02 §5 three-way fast path + 2-byte refill window
+- round-7 test count + decoder-side defensive harness mention
+- Round 7: type-7 decoder defensive harness (audit/12 §7.1)
+- Round 6: Strategy E encoder integration (audit/12 §7.1)
+- Round 5: type 7 Rule B predictor + RLE-then-Fibonacci channel sub-path
+- Round 4: type 7 (legacy RGB / spec/07 adaptive-CDF range coder)
+- Round 3: YUY2 (type 3), reduced-resolution (type 11), SIMD parity
+- Round 2: YV12 (frame type 10) + stateful NULL-frame replay
+- bundle RLE LUT CSVs into crate to fix CI build
+- Round 1: clean-room rebuild — modern arithmetic-coded RGB family decoder
+- Round 0 — clean-room rebuild scaffold (orphan master)
+
 ### Added
 
 - **Round 8 — modern range-coder hot-path optimisation (`spec/02` §5).**
