@@ -13,9 +13,11 @@ pub enum Error {
     /// (`spec/01` §1.2).
     BadFrameType(u8),
     /// Pixel format / frame-type combination is unsupported by this
-    /// build (e.g. type 7 legacy RGB, or YUY2 / YV12 — round 1 ships
-    /// arithmetic RGB24/RGB32/RGBA + literal Solid + Uncompressed
-    /// only).
+    /// build. Reserved variant — every wire-recognised frame-type
+    /// byte (1..=11 except 0) is implemented as of round 4; this
+    /// variant remains in the enum for forward-compat use by future
+    /// decoder paths that opt to bail out at dispatch.
+    #[allow(dead_code)]
     UnsupportedFrameType(u8),
     /// Channel-header byte was outside the legal set
     /// `{0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0xff}`.

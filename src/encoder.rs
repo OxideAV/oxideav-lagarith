@@ -9,6 +9,7 @@
 
 use crate::fibonacci::encode_freq_table;
 use crate::frame::pack_channels;
+use crate::legacy_range_coder::{build_legacy_cdf, encode_legacy_freq_table, LegacyRangeEncoder};
 use crate::predict::{apply_plane_forward, cross_plane_decorrelate_rgb_forward};
 use crate::range_coder::{Cdf, RangeEncoder};
 use crate::rle::contract_raw;
@@ -305,6 +306,142 @@ pub fn encode_arith_reduced_res(pixels: &[u8], width: u32, height: u32) -> Vec<u
     // Rewrite byte 0 from 0x0a (type 10) to 0x0b (type 11).
     frame[0] = 11;
     frame
+}
+
+/// Encode one **type-7 (legacy RGB)** channel into a byte sequence
+/// using the bare-Fibonacci 2-byte channel prefix path of
+/// `spec/07` §6.3. The output layout:
+///
+/// ```text
+///  byte 0:        outer channel-header byte = 0x00
+///  byte 1:        inner codec-mode flag     = 0x00 (bare Fib)
+///  bytes 2..2+N:  Fibonacci-coded 256-entry freq table
+///  byte 2+N:      post-Fibonacci 1-byte reservation (only when
+///                 the encoded bit stream length is a multiple of 8)
+///  remainder:     legacy range-coder body
+/// ```
+///
+/// Per `spec/07` §6.2, the cleanroom encoder may transmit any
+/// frequency table whose post-§3 rescale produces the CDF the
+/// encoder uses for arithmetic coding. The simplest legal choice —
+/// what we do here — is to transmit the histogram counts directly;
+/// the decoder's `build_legacy_cdf` re-runs the same algorithm and
+/// produces the same CDF.
+pub fn encode_legacy_channel(plane: &[u8]) -> Vec<u8> {
+    debug_assert!(!plane.is_empty(), "encode_legacy_channel: empty plane");
+
+    // 1. Histogram.
+    let mut freq = [0u32; 256];
+    for &b in plane {
+        freq[b as usize] = freq[b as usize].saturating_add(1);
+    }
+
+    // 2. Run build_legacy_cdf on the histogram so encoder + decoder
+    // land on the same CDF. The transmitted frequency table is the
+    // post-rescale per-symbol delta of that CDF (`cdf[c+1] - cdf[c]`).
+    let (cdf_initial, total) = build_legacy_cdf(&freq).unwrap();
+    let mut transmit_freq = [0u32; 256];
+    for c in 0..256 {
+        transmit_freq[c] = cdf_initial[c + 1] - cdf_initial[c];
+    }
+
+    // 3. Patch any symbol with hist[c] > 0 whose rescale collapsed
+    // it to 0 (would prevent the range encoder from selecting that
+    // symbol). Steal one count from the largest non-zero bin.
+    for c in 0..256 {
+        if freq[c] > 0 && transmit_freq[c] == 0 {
+            // Find the largest donor with > 1 count to give up.
+            let donor = (0..256)
+                .max_by_key(|&i| {
+                    if transmit_freq[i] > 1 {
+                        transmit_freq[i]
+                    } else {
+                        0
+                    }
+                })
+                .filter(|&i| transmit_freq[i] > 1);
+            if let Some(d) = donor {
+                transmit_freq[c] += 1;
+                transmit_freq[d] -= 1;
+            }
+        }
+    }
+
+    // 4. Build the final CDF from the patched frequencies (no
+    // rescale: sum is already `total`).
+    debug_assert_eq!(
+        transmit_freq.iter().map(|&f| f as u64).sum::<u64>(),
+        total as u64
+    );
+    let mut cdf = vec![0u32; 257];
+    let mut acc: u32 = 0;
+    for c in 0..256 {
+        cdf[c] = acc;
+        acc = acc.wrapping_add(transmit_freq[c]);
+    }
+    cdf[256] = acc;
+
+    // 5. Fibonacci-encode the patched frequencies.
+    let (fib_bytes, fib_aligned) = encode_legacy_freq_table(&transmit_freq);
+
+    // 6. Range-encode the plane against the CDF.
+    let mut enc = LegacyRangeEncoder::new(cdf, total);
+    for &b in plane {
+        enc.encode_byte(b);
+    }
+    let body = enc.finish();
+
+    // 7. Stitch the channel layout together.
+    let mut out = Vec::with_capacity(2 + fib_bytes.len() + 1 + body.len());
+    out.push(0x00); // outer channel header (header == 0 path)
+    out.push(0x00); // inner codec-mode flag (bare Fibonacci)
+    out.extend_from_slice(&fib_bytes);
+    if fib_aligned {
+        // Post-Fibonacci 1-byte reservation per audit/08 §3.2 / spec/07
+        // §9.1 item 7c. Only emitted when the encoded bit stream ends
+        // on a byte boundary; the decoder's matching skip lives in
+        // `channel::decode_legacy_channel`.
+        out.push(0x00);
+    }
+    out.extend_from_slice(&body);
+    out
+}
+
+/// Encode a **type-7 (legacy RGB)** frame from a packed BGR24 input.
+/// Same plane-decorrelation pipeline as `encode_arith_rgb24` — only
+/// the per-channel entropy stage differs (legacy adaptive-CDF range
+/// coder per `spec/07`, not the modern range coder + RLE dispatcher
+/// of `spec/02` + `spec/06`).
+///
+/// Test-only — the proprietary build does not produce type 7
+/// (`spec/07` §6 + §9.2 item 8); cleanroom encoder ships only the
+/// bare-Fibonacci `header == 0` path.
+pub fn encode_legacy_rgb(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let n = width as usize * height as usize;
+    debug_assert_eq!(pixels.len(), n * 3);
+
+    let mut plane_b = Vec::with_capacity(n);
+    let mut plane_g = Vec::with_capacity(n);
+    let mut plane_r = Vec::with_capacity(n);
+    for px in pixels.chunks_exact(3) {
+        plane_b.push(px[0]);
+        plane_g.push(px[1]);
+        plane_r.push(px[2]);
+    }
+
+    // Cross-plane decorrelation (forward) — same as types 2 / 4.
+    cross_plane_decorrelate_rgb_forward(&mut plane_b, &plane_g, &mut plane_r);
+
+    // Spatial predictor (forward) — same as types 2 / 4.
+    let res_b = apply_plane_forward(&plane_b, width as usize, height as usize);
+    let res_g = apply_plane_forward(&plane_g, width as usize, height as usize);
+    let res_r = apply_plane_forward(&plane_r, width as usize, height as usize);
+
+    let ch_b = encode_legacy_channel(&res_b);
+    let ch_g = encode_legacy_channel(&res_g);
+    let ch_r = encode_legacy_channel(&res_r);
+
+    pack_channels(7, &[&ch_b, &ch_g, &ch_r])
 }
 
 /// Encode an arithmetic RGBA frame (type 8). Input is packed BGRA.

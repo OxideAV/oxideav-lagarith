@@ -53,6 +53,14 @@ impl<'a> BitReader<'a> {
         }
     }
 
+    /// True iff the read cursor sits exactly on a byte boundary (no
+    /// partial byte in flight). Used by the legacy type-7 channel
+    /// decoder to detect whether the post-Fibonacci 1-byte
+    /// reservation is present per audit/08 §3.2.
+    pub fn is_byte_aligned(&self) -> bool {
+        self.mask == 0x80
+    }
+
     pub fn read_bit(&mut self) -> Result<u8> {
         if self.byte >= self.src.len() {
             return Err(Error::Truncated {
@@ -158,8 +166,11 @@ pub fn decode_freq_table(src: &[u8]) -> Result<([u32; 256], usize)> {
     Ok((freq, br.bytes_consumed()))
 }
 
-// ─────────────────────── encoder (test-only) ───────────────────────
+// ─────────────────────── MSB-first bit writer (test-only) ───────────────────────
 
+/// MSB-first bit writer used by the legacy type-7 Fibonacci freq-
+/// table encoder (round 4, test-only) and the modern coder's
+/// test-only roundtrip suite.
 #[cfg(test)]
 pub(crate) struct BitWriter {
     buf: Vec<u8>,
@@ -187,6 +198,12 @@ impl BitWriter {
             self.cur = 0;
             self.mask = 0x80;
         }
+    }
+
+    /// True iff the next bit to be written would land at the start of
+    /// a fresh byte (i.e. no partial byte is in flight).
+    pub fn is_byte_aligned(&self) -> bool {
+        self.mask == 0x80
     }
 
     pub fn finish(mut self) -> Vec<u8> {

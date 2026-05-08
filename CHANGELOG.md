@@ -8,6 +8,54 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 4 — legacy RGB (frame type 7, `spec/07` adaptive-CDF range
+  coder).**
+  - `FrameType::LegacyRgb` (frame-type byte `0x07`) now decodes
+    pre-1.1.0 "Obsolete arithmetic coded RGB keyframe" frames per
+    `spec/07`. The wire pipeline differs from the modern range
+    coder of `spec/02` in two load-bearing ways: the probability
+    distribution is **transmitted per-channel** as a 256-entry
+    Fibonacci-coded frequency table (no zero-run sub-prefix —
+    audit/03 §3.1 confirms the legacy decoder body has a clean
+    one-int-per-symbol shape, distinct from the modern coder's
+    spec/04 §3.3 path), and the decoder builds a **257-entry CDF
+    on the fly** from the transmitted frequencies via the §3
+    "pair-pack + rescale-to-pow2 + zigzag-residue + prefix-sum"
+    pipeline.
+  - New `legacy_range_coder` module: `decode_legacy_freq_table`,
+    `build_legacy_cdf` (with zigzag residue distribution per
+    `spec/07` §3.3), and `LegacyRangeDecoder` (binary-search
+    descent over the 257-entry CDF — algebraically equivalent to
+    the proprietary's eight-level binary-tree descent per
+    `spec/07` §5.2 final paragraph). The init seed uses the
+    audit-corrected 4-byte priming form per `spec/07` §9.1
+    item 3.
+  - 2-byte channel prefix (outer header `0x00` + inner codec-mode
+    flag `0x00`) per `spec/07` §2.5; post-Fibonacci 1-byte
+    reservation per audit/08 §3.2 / `spec/07` §9.1 item 7c —
+    emitted by the encoder + skipped by the decoder **only when**
+    the encoded bit stream length is a multiple of 8.
+  - Test-only `LegacyRangeEncoder` + `encode_legacy_freq_table`
+    for the round-4 self-roundtrip suite (the proprietary build
+    is decode-only for type 7; the cleanroom honours
+    `CLEANROOM-MANUAL §8` "Both directions, always" by shipping
+    both halves). Round-4 encoder ships only the bare-Fibonacci
+    `header == 0` path — `spec/07` §6.3 / §9.2 item 9 confirm
+    header-0 is sufficient for round-trip correctness; the
+    `header ∈ {0x01, 0x02, 0x03}` RLE-then-Fibonacci sub-path is
+    decoder-undefined per §9.1 item 2.
+  - +17 tests covering type-7 (4×4, 8×8, 16×12, unaligned width
+    7×5, BGRA32 widening, solid-plane edge case, NULL replay,
+    inner-codec-mode-flag rejection), the YUY2 odd-width
+    floor-chroma layout (audit/00 §9.4 partial resolution + a
+    raw-channel roundtrip exercising the 5×4 odd-width tail), and
+    the legacy range-coder + Fibonacci freq-table self-roundtrip
+    primitives. 83 tests total.
+  - Spec gap noted: `samples.oxideav.org/lagarith/` returns HTTP
+    404 at the time of round 4 — byte-exact validation against a
+    proprietary-encoded AVI fixture remains an Auditor concern
+    for a future round.
+
 - **Round 3 — YUY2 (frame type 3) and reduced-resolution (frame
   type 11).**
   - `FrameType::ArithmeticYuy2` (frame-type byte `0x03`) now decodes
@@ -108,12 +156,21 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Deferred
 
-- Frame type 7 (legacy RGB, pre-1.1.0 adaptive-CDF range coder per
-  `spec/07`) remains surfaced as `Error::UnsupportedFrameType`.
-  Round 4 candidate.
+- Type-7 RLE-then-Fibonacci channel sub-path (`header ∈ {0x01,
+  0x02, 0x03}` — surfaces `BadChannelHeader` in the round-4
+  decoder). `spec/07` §9.2 item 9 explicitly notes header-0 is
+  sufficient for round-trip correctness; the RLE-pre-decompressed
+  freq-table path is decoder-undefined per §9.1 item 2.
 - Byte-exact encoder validation against a proprietary-encoded AVI
-  fixture — Auditor concern; no fixture currently in tree
-  (`samples.oxideav.org` not provisioned).
+  fixture — Auditor concern; `samples.oxideav.org/lagarith/`
+  returned HTTP 404 at the time of round 4.
 - The reciprocal-multiply LUT at RVA `0x1b9a0` is not used by the
   decoder (the cumulative-frequency search loop `spec/02` §5 invites
   is bit-equivalent and simpler).
+- Type-7 byte-exact match against the proprietary's RuleB
+  first-column predictor (`TL = plane[y-2][W-1]` for `y >= 2` per
+  `spec/07` §9.1 item 7b). The round-4 decoder uses Rule A
+  (`TL = L = plane[y-1][W-1]`) — the same rule types 2 / 4 use.
+  Self-roundtrip is bit-perfect; the discrepancy only matters for
+  byte-exact match against a proprietary-encoded type-7 fixture
+  (none in tree).

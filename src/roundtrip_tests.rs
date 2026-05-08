@@ -17,8 +17,8 @@ use crate::channel::decode_channel;
 use crate::decoder::{decode_frame, decode_frame_with_prev, Decoder, PixelKind};
 use crate::encoder::{
     encode_arith_reduced_res, encode_arith_rgb24, encode_arith_rgba, encode_arith_yuy2,
-    encode_arith_yv12, encode_channel_arith_rle, encode_null, encode_solid_grey, encode_solid_rgb,
-    encode_solid_rgba, encode_uncompressed,
+    encode_arith_yv12, encode_channel_arith_rle, encode_legacy_rgb, encode_null, encode_solid_grey,
+    encode_solid_rgb, encode_solid_rgba, encode_uncompressed,
 };
 
 fn pattern_bgr24(width: u32, height: u32) -> Vec<u8> {
@@ -201,12 +201,20 @@ fn invalid_frame_type_byte() {
 }
 
 #[test]
-fn unsupported_frame_types_surface_distinct_error() {
-    // Type 7 (legacy RGB; pre-1.1.0 adaptive-CDF range coder per
-    // `spec/07`) is the only remaining deferred type. YUY2 (3) and
-    // reduced-resolution (11) are round-3 supported.
-    let r = decode_frame(&[7], 4, 4, PixelKind::Bgr24);
-    assert!(matches!(r, Err(crate::Error::UnsupportedFrameType(7))));
+fn all_known_frame_types_dispatch_without_unsupported_error() {
+    // Round 4 closed the type-7 deferred slot — every frame type in
+    // `1..=11 \ {0}` now dispatches into a real decode path. A
+    // truncated frame may surface a `Truncated` / `Bad*` error, but
+    // none should surface `UnsupportedFrameType` any more (the
+    // variant remains in the enum for forward-compat use by
+    // future decoder paths that opt to bail out at dispatch).
+    for byte in [1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11] {
+        let r = decode_frame(&[byte], 4, 4, PixelKind::Bgr24);
+        assert!(
+            !matches!(r, Err(crate::Error::UnsupportedFrameType(_))),
+            "type {byte} surfaced UnsupportedFrameType"
+        );
+    }
 }
 
 /// Exercise the channel-header `0x01..=0x03` arithmetic-with-RLE
@@ -720,12 +728,250 @@ fn simd_predictor_strategy_a_parity_matches_scalar() {
 /// requires either a proprietary-encoded AVI fixture (we don't carry
 /// one in tree — `docs/video/lagarith/reference/binaries/` only
 /// holds the DLL black-box, not encoded video) or an AVI test sample
-/// from `samples.oxideav.org` (not currently provisioned). Round 3
-/// therefore continues the round-2 self-roundtrip-only contract.
-/// Carrying a proprietary-encoded fixture here would be an Auditor
-/// concern for a future round.
+/// from `samples.oxideav.org` (not currently provisioned at the time
+/// of round 4 — `curl https://samples.oxideav.org/lagarith/` returns
+/// HTTP 404). Rounds 1..4 therefore continue the self-roundtrip-only
+/// contract. Carrying a proprietary-encoded fixture here would be an
+/// Auditor concern for a future round.
 #[test]
 fn specgap_byte_exact_encoder_validation_deferred() {
     // Pure documentation marker; no functional assertion. The
-    // round-3 encoder remains self-roundtrip-only.
+    // round-4 encoder remains self-roundtrip-only.
+}
+
+// ───────── Round 3: YUY2 odd-width edge case (audit/01 §9.4) ─────────
+
+/// Per audit/00 §9.4, a complete characterisation of the YUY2
+/// odd-width edge case ("the last column of luma pixels has no
+/// matching chroma sample on the wire") was held forward to a future
+/// validator round. The round-3 decoder uses `cw = w / 2` (= floor)
+/// for chroma and writes a neutral 0x80 chroma byte at the odd-width
+/// tail; the round-3 encoder requires even width.
+///
+/// Round 4 adds an explicit decode-side test covering that path: a
+/// hand-built type-3 YUY2 frame with width 5 (odd), three planes
+/// of `5×4` luma + `2×4` chroma, all-zero residuals (uniform planes
+/// of the inverse-predictor's seed value 0). The decoder must produce
+/// exactly the documented packed layout — Y at columns 0..4, U at
+/// macropixels (0,1) and (2,3), V at the same macropixel positions,
+/// 0x80 at column 4's chroma slot.
+#[test]
+fn yuy2_odd_width_decode_matches_floor_chroma_layout() {
+    use crate::frame::pack_channels;
+    // Build a hand-rolled YUY2 type-3 frame at 5×4. Each channel uses
+    // header 0xff (solid-fill) with value 0 so the residual planes
+    // are all-zero — under the spec/03 §3.3 predictor, an all-zero
+    // residual stream reconstructs to an all-zero plane.
+    let w: u32 = 5;
+    let h: u32 = 4;
+    let cw = (w / 2) as usize; // = 2
+                               // Each channel = [0xff, 0x00] solid-fill encoding -> all-zero
+                               // residuals -> all-zero reconstructed plane.
+    let ch_y = vec![0xff, 0x00];
+    let ch_u = vec![0xff, 0x00];
+    let ch_v = vec![0xff, 0x00];
+    let frame = pack_channels(3, &[&ch_y, &ch_u, &ch_v]);
+    let dec = decode_frame(&frame, w, h, PixelKind::Yuy2).unwrap();
+    // Buffer length: 5 * 4 * 2 = 40 bytes.
+    assert_eq!(dec.pixels.len(), 40);
+    // Per-row check: every macropixel byte is 0 (luma + chroma = 0
+    // because reconstructed planes are all zero), and the odd-tail
+    // chroma slot is 0x80 (the decoder's neutral fill).
+    for y in 0..h as usize {
+        let row = y * (w as usize) * 2;
+        for k in 0..cw {
+            assert_eq!(dec.pixels[row + 4 * k], 0, "Y at row {y} col {}", 2 * k);
+            assert_eq!(dec.pixels[row + 4 * k + 1], 0, "U at row {y} pair {k}");
+            assert_eq!(
+                dec.pixels[row + 4 * k + 2],
+                0,
+                "Y at row {y} col {}",
+                2 * k + 1
+            );
+            assert_eq!(dec.pixels[row + 4 * k + 3], 0, "V at row {y} pair {k}");
+        }
+        // Tail: column 4 (last odd-width luma, = 0) + 0x80 chroma.
+        assert_eq!(dec.pixels[row + 8], 0, "Y at row {y} col 4 (odd tail)");
+        assert_eq!(
+            dec.pixels[row + 9],
+            0x80,
+            "chroma neutral at row {y} odd-width tail"
+        );
+    }
+}
+
+/// Round-trip test for odd-width YUY2: hand-build a YUY2 packed
+/// pixel buffer at 5×4 with arbitrary luma/chroma; encode each plane
+/// individually via the channel-header 0x04 raw-memcpy path (so
+/// no predictor / RLE / range coder noise interferes); decode;
+/// verify the floor-chroma layout matches the original macropixels
+/// + 0x80 fill at the odd-width tail.
+#[test]
+fn yuy2_odd_width_raw_channel_floor_layout_roundtrip() {
+    use crate::frame::pack_channels;
+    let w: u32 = 5;
+    let h: u32 = 4;
+    let cw = (w / 2) as usize; // = 2 macropixels per row
+    let n_y = (w * h) as usize; // 20 luma bytes
+    let n_c = cw * h as usize; // 8 chroma bytes per plane
+
+    // Hand-build per-plane RESIDUAL byte sequences by inverting the
+    // forward predictor on a full plane of arbitrary values. Reuse
+    // `apply_plane_forward` from the predict module.
+    use crate::predict::apply_plane_forward;
+    let plane_y_full: Vec<u8> = (0..n_y).map(|i| ((i * 7) ^ 0x55) as u8).collect();
+    let plane_u_full: Vec<u8> = (0..n_c).map(|i| (0x40 + i as u8) ^ 0x10).collect();
+    let plane_v_full: Vec<u8> = (0..n_c).map(|i| (0xa0 + i as u8) ^ 0x20).collect();
+
+    let res_y = apply_plane_forward(&plane_y_full, w as usize, h as usize);
+    let res_u = apply_plane_forward(&plane_u_full, cw, h as usize);
+    let res_v = apply_plane_forward(&plane_v_full, cw, h as usize);
+
+    // Channel-header 0x04 raw-memcpy: byte 0 = 0x04, then the
+    // residual stream verbatim.
+    let mut ch_y = vec![0x04u8];
+    ch_y.extend_from_slice(&res_y);
+    let mut ch_u = vec![0x04u8];
+    ch_u.extend_from_slice(&res_u);
+    let mut ch_v = vec![0x04u8];
+    ch_v.extend_from_slice(&res_v);
+    let frame = pack_channels(3, &[&ch_y, &ch_u, &ch_v]);
+    let dec = decode_frame(&frame, w, h, PixelKind::Yuy2).unwrap();
+    assert_eq!(dec.pixels.len(), 40);
+    // Verify the packed YUY2 layout matches the floor-chroma plane
+    // arrangement.
+    for y in 0..h as usize {
+        let row = y * (w as usize) * 2;
+        for k in 0..cw {
+            assert_eq!(
+                dec.pixels[row + 4 * k],
+                plane_y_full[y * w as usize + 2 * k]
+            );
+            assert_eq!(dec.pixels[row + 4 * k + 1], plane_u_full[y * cw + k]);
+            assert_eq!(
+                dec.pixels[row + 4 * k + 2],
+                plane_y_full[y * w as usize + 2 * k + 1]
+            );
+            assert_eq!(dec.pixels[row + 4 * k + 3], plane_v_full[y * cw + k]);
+        }
+        // Odd-width tail: column 4 of luma + 0x80 chroma.
+        assert_eq!(
+            dec.pixels[row + 8],
+            plane_y_full[y * w as usize + 4],
+            "Y at odd-width tail row {y}"
+        );
+        assert_eq!(dec.pixels[row + 9], 0x80, "chroma neutral fill row {y}");
+    }
+}
+
+// ───────── Round 4: type 7 (legacy RGB / spec/07) ─────────
+
+#[test]
+fn legacy_rgb_roundtrip_4x4() {
+    let (w, h) = (4u32, 4);
+    let pixels = pattern_bgr24(w, h);
+    let frame = encode_legacy_rgb(&pixels, w, h);
+    assert_eq!(frame[0], 7, "type 7 (legacy RGB) expected");
+    let dec = decode_frame(&frame, w, h, PixelKind::Bgr24).unwrap();
+    assert_eq!(dec.pixels, pixels);
+    assert_eq!(dec.pixel_kind, PixelKind::Bgr24);
+}
+
+#[test]
+fn legacy_rgb_roundtrip_8x8() {
+    let (w, h) = (8u32, 8);
+    let pixels = pattern_bgr24(w, h);
+    let frame = encode_legacy_rgb(&pixels, w, h);
+    assert_eq!(frame[0], 7);
+    let dec = decode_frame(&frame, w, h, PixelKind::Bgr24).unwrap();
+    assert_eq!(dec.pixels, pixels);
+}
+
+#[test]
+fn legacy_rgb_roundtrip_16x12() {
+    let (w, h) = (16u32, 12);
+    let pixels = pattern_bgr24(w, h);
+    let frame = encode_legacy_rgb(&pixels, w, h);
+    let dec = decode_frame(&frame, w, h, PixelKind::Bgr24).unwrap();
+    assert_eq!(dec.pixels, pixels);
+}
+
+#[test]
+fn legacy_rgb_roundtrip_unaligned_width() {
+    // width=7 (% 4 != 0) — the spec/07 §7.2 dispatch uses width % 4
+    // to choose SIMD vs scalar predictor; type-7 inherits the same
+    // pipeline. Self-roundtrip should still work bit-exactly.
+    let (w, h) = (7u32, 5);
+    let pixels = pattern_bgr24(w, h);
+    let frame = encode_legacy_rgb(&pixels, w, h);
+    let dec = decode_frame(&frame, w, h, PixelKind::Bgr24).unwrap();
+    assert_eq!(dec.pixels, pixels);
+}
+
+#[test]
+fn legacy_rgb_roundtrip_to_bgra32_widens_with_opaque_alpha() {
+    let (w, h) = (4u32, 4);
+    let pixels = pattern_bgr24(w, h);
+    let frame = encode_legacy_rgb(&pixels, w, h);
+    let dec = decode_frame(&frame, w, h, PixelKind::Bgra32).unwrap();
+    // Widen pixels into BGRA32 with alpha=0xff for comparison.
+    let mut expected = Vec::with_capacity(pixels.len() * 4 / 3);
+    for px in pixels.chunks_exact(3) {
+        expected.push(px[0]);
+        expected.push(px[1]);
+        expected.push(px[2]);
+        expected.push(0xff);
+    }
+    assert_eq!(dec.pixels, expected);
+}
+
+#[test]
+fn legacy_rgb_solid_plane_roundtrip() {
+    // Each plane is a single value -> the histogram has one non-zero
+    // bin, exercising the encoder's "all-one-symbol" edge of the
+    // CDF construction.
+    let (w, h) = (4u32, 4);
+    let mut pixels = Vec::with_capacity(48);
+    for _ in 0..16 {
+        pixels.push(0x42);
+        pixels.push(0x42);
+        pixels.push(0x42);
+    }
+    let frame = encode_legacy_rgb(&pixels, w, h);
+    let dec = decode_frame(&frame, w, h, PixelKind::Bgr24).unwrap();
+    assert_eq!(dec.pixels, pixels);
+}
+
+#[test]
+fn legacy_rgb_replays_via_stateful_decoder() {
+    // Type-7 frames participate in the NULL-frame ("JUMP") replay
+    // path of `spec/01` §1.1 just like every other non-NULL frame.
+    let (w, h) = (4u32, 4);
+    let pixels = pattern_bgr24(w, h);
+    let frame = encode_legacy_rgb(&pixels, w, h);
+    let mut dec = Decoder::new();
+    let f0 = dec.decode(&frame, w, h, PixelKind::Bgr24).unwrap();
+    assert_eq!(f0.pixels, pixels);
+    let f1 = dec.decode(&[], w, h, PixelKind::Bgr24).unwrap();
+    assert_eq!(f1.pixels, pixels);
+}
+
+#[test]
+fn legacy_rgb_rejects_non_zero_inner_codec_mode_flag() {
+    // Hand-build a type-7 frame whose channel data starts with the
+    // outer header `0x00` but inner codec-mode flag `0x01`. The
+    // round-4 decoder ships only the bare-Fibonacci sub-path
+    // (spec/07 §6.3 / §9.2 item 9 — header-0 is sufficient for
+    // round-trip correctness). Non-bare paths should surface
+    // `BadChannelHeader`.
+    use crate::frame::pack_channels;
+    // Three minimal channels each starting with 0x00 0x01 (inner
+    // codec-mode flag = 1) — should be rejected.
+    let ch = vec![0x00u8, 0x01];
+    let frame = pack_channels(7, &[&ch, &ch, &ch]);
+    let r = decode_frame(&frame, 4, 4, PixelKind::Bgr24);
+    assert!(
+        matches!(r, Err(crate::Error::BadChannelHeader(_))),
+        "non-zero inner codec-mode flag must surface BadChannelHeader, got {r:?}"
+    );
 }

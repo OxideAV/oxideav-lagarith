@@ -14,6 +14,7 @@
 
 use crate::error::{Error, Result};
 use crate::fibonacci;
+use crate::legacy_range_coder::{build_legacy_cdf, decode_legacy_freq_table, LegacyRangeDecoder};
 use crate::range_coder::{Cdf, RangeDecoder};
 use crate::rle;
 
@@ -104,6 +105,60 @@ fn decode_arith_no_rle(channel: &[u8], prefix_offset: usize, n_pixels: usize) ->
         symbols.push(dec.decode_symbol(&cdf)?);
     }
     Ok(symbols)
+}
+
+/// Decode one **type-7 (legacy RGB)** channel into a `Vec<u8>` of
+/// `n_pixels` residuals per `spec/07` §1.3 / §2.5. Wire layout
+/// (header == 0x00 path, the canonical clean-room encoder choice
+/// per `spec/07` §6.3):
+///
+/// | offset | bytes | meaning |
+/// | ------ | ----- | ------- |
+/// | 0      | 1     | outer channel-header byte (= 0x00) |
+/// | 1      | 1     | inner codec-mode flag (= 0x00 for bare Fibonacci) |
+/// | 2..    | N     | Fibonacci-coded 256-entry freq table |
+/// | 2 + N  | 0..1  | post-Fibonacci 1-byte reservation (audit/08 §3.2) |
+/// | 2+N+R  | …     | legacy range-coder body |
+///
+/// where `N = byte_advance_count` of the Fibonacci helper and
+/// `R = 1` iff the bit stream ended on a byte boundary (the
+/// reservation byte is *only* present in the byte-aligned case).
+pub(crate) fn decode_legacy_channel(channel: &[u8], n_pixels: usize) -> Result<Vec<u8>> {
+    if channel.len() < 2 {
+        return Err(Error::Truncated {
+            context: "legacy type-7 channel prefix",
+        });
+    }
+    let header = channel[0];
+    let inner = channel[1];
+    if header != 0x00 {
+        // Header != 0 selects the RLE-then-Fibonacci sub-path. The
+        // round-4 cleanroom encoder ships only header-0 (the Python
+        // reference impl notes that header-0 is sufficient for
+        // round-trip correctness per `spec/07` §6.3 / §9.2 item 9).
+        // We surface the unsupported sub-path as an error rather
+        // than silently mis-decoding.
+        return Err(Error::BadChannelHeader(header));
+    }
+    if inner != 0x00 {
+        return Err(Error::BadChannelHeader(inner));
+    }
+    let fib_src = &channel[2..];
+    let (freq, fib_bytes, fib_aligned) = decode_legacy_freq_table(fib_src)?;
+    let body_offset = 2 + fib_bytes + if fib_aligned { 1 } else { 0 };
+    if channel.len() < body_offset {
+        return Err(Error::Truncated {
+            context: "legacy type-7 channel body offset past end",
+        });
+    }
+    let body = &channel[body_offset..];
+    let (cdf, total) = build_legacy_cdf(&freq)?;
+    let mut dec = LegacyRangeDecoder::new(body, cdf, total)?;
+    let mut out = Vec::with_capacity(n_pixels);
+    for _ in 0..n_pixels {
+        out.push(dec.decode_byte()?);
+    }
+    Ok(out)
 }
 
 /// Decode an arithmetic-coded channel with inline RLE: produce

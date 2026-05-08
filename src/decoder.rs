@@ -34,7 +34,7 @@
 //!   stateful [`Decoder`] wrapper (or [`decode_frame_with_prev`])
 //!   replays the predecessor frame as required.
 
-use crate::channel::decode_channel;
+use crate::channel::{decode_channel, decode_legacy_channel};
 use crate::error::{Error, Result};
 use crate::frame::{split_channels, FrameType};
 use crate::predict::{apply_plane_inverse, cross_plane_decorrelate_rgb};
@@ -125,6 +125,7 @@ pub fn decode_frame(
         FrameType::ArithmeticRgb24 | FrameType::UnalignedRgb24 => {
             decode_arith_rgb(payload, width, height, pixel_kind)
         }
+        FrameType::LegacyRgb => decode_legacy_rgb(payload, width, height, pixel_kind),
         FrameType::ArithmeticRgba => {
             // RGBA frames produce 4 planes; if the host asked for
             // BGR24 we drop alpha after the decode.
@@ -644,6 +645,71 @@ fn decode_reduced_res(
         height,
         pixel_kind,
         pixels: out,
+    })
+}
+
+/// Decode a **legacy RGB** frame (type 7, round 4) per `spec/07`.
+///
+/// Per `spec/07` §1.1 type 7 is dispatched by the same RGB
+/// coordinator as types 2 / 4 — three planes (R, G, B) at 24 bpp.
+/// The 2 × u32 channel-offset header is identical to spec/01 §2.3.
+/// What differs is the per-channel entropy decode: each channel's
+/// payload is a Fibonacci-coded freq table + 1-byte reservation +
+/// legacy range-coder body (`spec/07` §2..§5), not the modern
+/// channel-header dispatcher of `spec/06` §1.
+///
+/// After decoding the three plane residuals the predictor +
+/// cross-plane decorrelation pipeline runs **identically** to types
+/// 2 / 4 (`spec/07` §7.2: "type 7 reuses the same predictor and the
+/// same RGB cross-plane decorrelation as types 2 / 4"). The output
+/// is packed BGR(A) into the host's pixel buffer.
+fn decode_legacy_rgb(
+    payload: &[u8],
+    width: u32,
+    height: u32,
+    pixel_kind: PixelKind,
+) -> Result<DecodedFrame> {
+    let n_pixels = width as usize * height as usize;
+    let slices = split_channels(payload, 3)?;
+    // Same plane-order convention as types 2 / 4: wire R -> output
+    // +0 (B), wire G -> output +1, wire B -> output +2 (R).
+    let mut plane_b = decode_legacy_channel(slices[0], n_pixels)?;
+    let mut plane_g = decode_legacy_channel(slices[1], n_pixels)?;
+    let mut plane_r = decode_legacy_channel(slices[2], n_pixels)?;
+
+    apply_plane_inverse(&mut plane_b, width as usize, height as usize);
+    apply_plane_inverse(&mut plane_g, width as usize, height as usize);
+    apply_plane_inverse(&mut plane_r, width as usize, height as usize);
+
+    cross_plane_decorrelate_rgb(&mut plane_b, &plane_g, &mut plane_r);
+
+    let bpp = pixel_kind.packed_bpp().ok_or(Error::PixelFormatMismatch {
+        frame_type: payload[0],
+    })?;
+    let mut pixels = Vec::with_capacity(n_pixels * bpp);
+    for i in 0..n_pixels {
+        match pixel_kind {
+            PixelKind::Bgr24 => {
+                pixels.push(plane_b[i]);
+                pixels.push(plane_g[i]);
+                pixels.push(plane_r[i]);
+            }
+            PixelKind::Bgra32 => {
+                pixels.push(plane_b[i]);
+                pixels.push(plane_g[i]);
+                pixels.push(plane_r[i]);
+                pixels.push(0xff);
+            }
+            PixelKind::Yv12 | PixelKind::Yuy2 => {
+                unreachable!("guarded by packed_bpp() above")
+            }
+        }
+    }
+    Ok(DecodedFrame {
+        width,
+        height,
+        pixel_kind,
+        pixels,
     })
 }
 

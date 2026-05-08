@@ -1,17 +1,17 @@
 //! Pure-Rust Lagarith lossless video decoder.
 //!
-//! **Rounds 1+2+3 of the clean-room rebuild.** Implements the modern
+//! **Rounds 1..4 of the clean-room rebuild.** Implements the modern
 //! arithmetic-coded RGB24 / RGB32 / RGBA decode pipeline plus the
 //! Uncompressed (type 1) and Solid (types 5 / 6 / 9) literal frames
 //! (round 1); the YV12 (type 10) multi-plane arithmetic decode path
 //! and a stateful [`Decoder`] wrapper that replays NULL ("JUMP")
-//! frames per `spec/01` §1.1 (round 2); and the YUY2 (type 3)
+//! frames per `spec/01` §1.1 (round 2); the YUY2 (type 3)
 //! packed→planar pipeline + reduced-resolution (type 11) — a
 //! half-W/half-H YV12 body with a 2× nearest-neighbour upscale on
-//! decode (round 3). All against the strict-isolation cleanroom
-//! workspace at `docs/video/lagarith/`. Frame type 7 (legacy RGB,
-//! pre-1.1.0 adaptive-CDF range coder per `spec/07`) remains
-//! deferred to a future round.
+//! decode (round 3); and the **legacy RGB** (type 7, pre-1.1.0)
+//! adaptive-CDF range coder per `spec/07` (round 4). All against
+//! the strict-isolation cleanroom workspace at
+//! `docs/video/lagarith/`.
 //!
 //! ## Pipeline (arithmetic-coded RGB family)
 //!
@@ -66,6 +66,7 @@ mod encoder;
 mod error;
 mod fibonacci;
 mod frame;
+mod legacy_range_coder;
 mod predict;
 mod range_coder;
 #[cfg(feature = "registry")]
