@@ -58,6 +58,33 @@ pub enum Error {
         /// Frame-type byte from the wire (informative).
         frame_type: u8,
     },
+    /// **Legacy type-7 only.** A type-7 channel's transmitted 256-
+    /// entry frequency table matches the *rare-symbol-cluster*
+    /// signature of `audit/12 §3.6` / §7.1 — `freq[0] >= 0.95 * Σfreq`
+    /// **and** ≥ 3 distinct nonzero bins each with `freq ∈ {1, 2}`.
+    /// Audit/12 §5..§6 retracts spec/07 §3.4's "may equivalently use
+    /// a flat 257-entry CDF" allowance for this fixture class: the
+    /// proprietary's pair-packed 513-entry CDF and the cleanroom's
+    /// flat 257-entry CDF *are not* bit-equivalent here, so the
+    /// cleanroom range coder running against this freq table would
+    /// produce a different decoded byte stream from the proprietary's.
+    ///
+    /// Our own encoder applies *Strategy E* (`audit/12 §7.1`) and
+    /// re-routes such fixtures to type 1, so a stream that hits this
+    /// error was produced by some *other* encoder — most plausibly
+    /// the proprietary's hypothetical type-7 writer (the shipped
+    /// proprietary build is decode-only per `spec/07 §6` / §9.2 item
+    /// 8) or a third-party encoder. Surfacing the error explicitly
+    /// avoids the silent miscoding pre-Strategy E-on-decoder rounds
+    /// would have produced.
+    ///
+    /// To accept these streams, a future round should land
+    /// `Strategy F` (the full pair-packed 513-entry CDF + 3-refill
+    /// init refactor of `audit/12 §7.1` Strategy F). That work is
+    /// blocked on a proprietary-encoded type-7 fixture appearing at
+    /// `samples.oxideav.org/lagarith/` — without one, Strategy F
+    /// has no validation oracle (`audit/04 §5`).
+    LegacyRareSymbolClusterUnsupported,
 }
 
 impl core::fmt::Display for Error {
@@ -95,6 +122,13 @@ impl core::fmt::Display for Error {
             Error::PixelFormatMismatch { frame_type } => write!(
                 f,
                 "Lagarith: caller-requested pixel format does not match frame-type byte {frame_type}"
+            ),
+            Error::LegacyRareSymbolClusterUnsupported => f.write_str(
+                "Lagarith: type-7 channel's freq table matches the rare-symbol-cluster signature \
+                 of audit/12 §7.1 (the cleanroom's flat 257-entry CDF and the proprietary's \
+                 pair-packed 513-entry CDF are NOT bit-equivalent on this fixture class — \
+                 decoding would silently miscode); this stream needs Strategy F (audit/12 §7.1) \
+                 which is blocked on a proprietary-encoded type-7 fixture",
             ),
         }
     }

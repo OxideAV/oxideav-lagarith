@@ -276,16 +276,28 @@ pub(crate) fn build_legacy_cdf(freq: &[u32; 256]) -> Result<(Vec<u32>, u32)> {
 /// decode-only in the proprietary build per `spec/07` §6 / §9.2
 /// item 8 — no archival type-7 fixture exists per audit/04 §5).
 ///
-/// Wired into [`crate::encoder::encode_legacy_rgb`] /
-/// [`crate::encoder::encode_legacy_rgb_rle`] (round 6) — when any
-/// of the three residual planes (B', G, R') matches this signature,
-/// the encoder skips the type-7 emission and falls through to a
-/// type-1 (uncompressed) frame, which is byte-exact on every
-/// fixture per `audit/12 §7.1` Strategy E + `audit/13 §3` cross-
-/// validation. The encoder module is `#[cfg(test)]`-gated so the
-/// `dead_code` lint fires under non-test builds; suppress it here
-/// rather than leak the gate into the predicate's call sites.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Wired into two consumers:
+///
+/// * [`crate::encoder::encode_legacy_rgb`] /
+///   [`crate::encoder::encode_legacy_rgb_rle`] (round 6, encode side):
+///   when any of the three residual planes (B', G, R') matches this
+///   signature, the encoder skips the type-7 emission and falls
+///   through to a type-1 (uncompressed) frame, which is byte-exact
+///   on every fixture per `audit/12 §7.1` Strategy E + `audit/13
+///   §3` cross-validation.
+///
+/// * [`crate::channel::decode_legacy_channel`] (round 7, decode side
+///   defensive harness): when the transmitted freq table matches
+///   this signature, the decoder returns
+///   [`Error::LegacyRareSymbolClusterUnsupported`] rather than
+///   silently mis-decoding the body. Audit/12 §5..§6 confirms the
+///   proprietary's pair-packed 513-entry CDF and the cleanroom's
+///   flat 257-entry CDF are *not* bit-equivalent for this signature,
+///   so a foreign encoder's stream with this freq table would feed
+///   a different residual sequence to our predictor than to the
+///   proprietary's. Surfacing the mismatch explicitly is preferable
+///   to silent miscoding for any downstream caller that ingests
+///   wild type-7 streams.
 pub(crate) fn is_rare_symbol_cluster(freq: &[u32; 256]) -> bool {
     let total: u64 = freq.iter().map(|&f| f as u64).sum();
     if total == 0 {

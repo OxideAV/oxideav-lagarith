@@ -8,6 +8,42 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 7 — type-7 decoder defensive harness (`audit/12 §7.1`).**
+  - `decode_legacy_channel` now runs the rare-symbol-cluster
+    predicate (`is_rare_symbol_cluster`) over the transmitted 256-
+    entry frequency table before building the CDF. When the
+    signature matches (`freq[0] >= 0.95 * Σfreq` *and* ≥ 3 distinct
+    nonzero bins each with `freq ∈ {1, 2}`), the decoder returns
+    the new `Error::LegacyRareSymbolClusterUnsupported` variant
+    rather than silently miscoding the body. Audit/12 §5..§6
+    retracts spec/07 §3.4's flat-CDF allowance for this fixture
+    class — the cleanroom's flat 257-entry CDF and the
+    proprietary's pair-packed 513-entry CDF are *not*
+    bit-equivalent here, so a *foreign* encoder's stream with this
+    freq table would silently decode to the wrong residual sequence
+    under our flat CDF.
+  - The cleanroom's own encoder still applies *Strategy E* (round
+    6) and re-routes such fixtures to type 1 *before* reaching the
+    legacy range coder, so the guard is never invoked on
+    self-roundtrip and the existing 104-test suite is unchanged.
+    The guard exists for the case where downstream callers feed
+    *foreign* type-7 streams into `decode_frame` — a hypothetical
+    proprietary type-7 writer (the shipped proprietary build is
+    decode-only per `spec/07 §6` / §9.2 item 8) or any third-party
+    encoder.
+  - Strategy F (full pair-packed 513-entry CDF refactor of
+    `audit/12 §7.1`) remains parked: blocked on a proprietary-
+    encoded type-7 fixture appearing at
+    `samples.oxideav.org/lagarith/` (`audit/04 §5`; re-checked
+    round 7 — still 404). Without an oracle a 150-200-LOC refactor
+    risks regressing the 95/96 currently-passing type-7 cells.
+  - +6 tests: rare-cluster freq table at `decode_legacy_channel`;
+    3-vs-2 rare-bin boundary (must trigger / must not); freq[0]
+    dominance below 95% (must not trigger); rare-cluster type-7
+    frame at the public `decode_frame` surface; error-display
+    mentions audit/12 + Strategy F; self-roundtrip smoke check.
+    110 tests total (was 104).
+
 - **Round 6 — Strategy E encoder integration (audit/12 §7.1).**
   - `encode_legacy_rgb` and `encode_legacy_rgb_rle` now run the
     `is_rare_symbol_cluster` predicate over the three residual

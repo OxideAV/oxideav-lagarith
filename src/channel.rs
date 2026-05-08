@@ -14,7 +14,9 @@
 
 use crate::error::{Error, Result};
 use crate::fibonacci;
-use crate::legacy_range_coder::{build_legacy_cdf, decode_legacy_freq_table, LegacyRangeDecoder};
+use crate::legacy_range_coder::{
+    build_legacy_cdf, decode_legacy_freq_table, is_rare_symbol_cluster, LegacyRangeDecoder,
+};
 use crate::range_coder::{Cdf, RangeDecoder};
 use crate::rle;
 
@@ -215,6 +217,20 @@ fn decode_legacy_rle_then_fib(
 
 /// Common tail: build the CDF, run the legacy range-coder body to
 /// produce `n_pixels` residual bytes.
+///
+/// **Defensive harness (round 7, audit/12 §7.1).** Before building
+/// the CDF, run [`is_rare_symbol_cluster`] over the transmitted
+/// freq table. If it matches the rare-symbol-cluster signature,
+/// return [`Error::LegacyRareSymbolClusterUnsupported`] rather than
+/// silently miscoding. Audit/12 §5..§6 retracts spec/07 §3.4's
+/// flat-CDF allowance for this fixture class — the cleanroom's
+/// flat 257-entry CDF and the proprietary's pair-packed 513-entry
+/// CDF differ at coarse granularity here, so any *foreign* encoder's
+/// stream with such a freq table would decode to wrong residuals
+/// under our flat CDF. Our own encoder's *Strategy E* (`encoder.rs`)
+/// re-routes such fixtures to type 1 before reaching the legacy
+/// range coder, so the cleanroom's self-roundtrip suite never
+/// invokes this guard.
 fn legacy_decode_body(
     channel: &[u8],
     body_offset: usize,
@@ -225,6 +241,9 @@ fn legacy_decode_body(
         return Err(Error::Truncated {
             context: "legacy type-7 channel body offset past end",
         });
+    }
+    if is_rare_symbol_cluster(freq) {
+        return Err(Error::LegacyRareSymbolClusterUnsupported);
     }
     let body = &channel[body_offset..];
     let (cdf, total) = build_legacy_cdf(freq)?;
