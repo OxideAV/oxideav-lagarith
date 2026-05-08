@@ -276,10 +276,16 @@ pub(crate) fn build_legacy_cdf(freq: &[u32; 256]) -> Result<(Vec<u32>, u32)> {
 /// decode-only in the proprietary build per `spec/07` §6 / §9.2
 /// item 8 — no archival type-7 fixture exists per audit/04 §5).
 ///
-/// Marked `dead_code` until the encoder wires up Strategy E in a
-/// future round; exercised by the unit tests below to keep its
-/// predicate observable.
-#[allow(dead_code)]
+/// Wired into [`crate::encoder::encode_legacy_rgb`] /
+/// [`crate::encoder::encode_legacy_rgb_rle`] (round 6) — when any
+/// of the three residual planes (B', G, R') matches this signature,
+/// the encoder skips the type-7 emission and falls through to a
+/// type-1 (uncompressed) frame, which is byte-exact on every
+/// fixture per `audit/12 §7.1` Strategy E + `audit/13 §3` cross-
+/// validation. The encoder module is `#[cfg(test)]`-gated so the
+/// `dead_code` lint fires under non-test builds; suppress it here
+/// rather than leak the gate into the predicate's call sites.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn is_rare_symbol_cluster(freq: &[u32; 256]) -> bool {
     let total: u64 = freq.iter().map(|&f| f as u64).sum();
     if total == 0 {

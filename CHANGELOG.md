@@ -8,6 +8,30 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 6 — Strategy E encoder integration (audit/12 §7.1).**
+  - `encode_legacy_rgb` and `encode_legacy_rgb_rle` now run the
+    `is_rare_symbol_cluster` predicate over the three residual
+    planes (B', G, R') after predict + decorrelate. When any plane
+    matches the rare-symbol-cluster signature (≥ 3 distinct rare
+    bins `freq ∈ {1, 2}` within a histogram dominated by
+    `freq[0] >= 0.95 * pixel_count`), the encoder skips type-7
+    emission and falls through to a type-1 (uncompressed) frame.
+    Type-1's roundtrip is byte-exact on every fixture per
+    `spec/01 §2.1` / `audit/11 §4.5`, sidestepping the
+    flat-CDF / pair-packed-CDF wire-format divergence that
+    `audit/12 §5..§6` localised to this fixture class.
+  - Strategy F (full pair-packed 513-entry CDF refactor) deferred
+    — `audit/12 §7.1` recommends Strategy E because Strategy F's
+    regression risk on the 95/96 currently-passing type-7 cells
+    outweighs its benefit (type 7 is decode-only in the
+    proprietary build per `spec/07 §6` / §9.2 item 8; no archival
+    type-7 fixture exists per `audit/04 §5`).
+  - +4 tests: rare-symbol-cluster routes near_flat 33×27 to
+    type 1; same propagates through the RLE-then-Fibonacci
+    sub-path for escape_len ∈ {1, 2, 3}; pattern-pixels and
+    pure-solid plane fixtures stay on type 7 (negative cases).
+  - 104 tests total (was 100).
+
 - **Round 5 — type-7 spec-coverage extensions: Rule B + RLE-then-
   Fibonacci channel sub-path.**
   - **First-column predictor Rule B** for type-7 frames per

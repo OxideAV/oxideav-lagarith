@@ -9,7 +9,9 @@
 
 use crate::fibonacci::encode_freq_table;
 use crate::frame::pack_channels;
-use crate::legacy_range_coder::{build_legacy_cdf, encode_legacy_freq_table, LegacyRangeEncoder};
+use crate::legacy_range_coder::{
+    build_legacy_cdf, encode_legacy_freq_table, is_rare_symbol_cluster, LegacyRangeEncoder,
+};
 use crate::predict::{
     apply_plane_forward, apply_plane_forward_with_rule, cross_plane_decorrelate_rgb_forward,
     FirstColRule,
@@ -522,11 +524,50 @@ pub fn encode_legacy_channel(plane: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Compute a 256-entry histogram from a residual plane.
+fn histogram_from_plane(plane: &[u8]) -> [u32; 256] {
+    let mut freq = [0u32; 256];
+    for &b in plane {
+        freq[b as usize] = freq[b as usize].saturating_add(1);
+    }
+    freq
+}
+
+/// Strategy E predicate (`audit/12 §7.1`): given the three residual
+/// planes that would feed the type-7 entropy stage, return `true`
+/// iff any plane's histogram matches the rare-symbol-cluster
+/// signature. When `true`, the encoder must route around type 7 and
+/// emit a type-1 (uncompressed) frame instead — type 1's roundtrip
+/// is byte-exact on every fixture, sidestepping the
+/// flat-CDF / pair-packed-CDF wire-format divergence that
+/// `audit/12 §5..§6` localised to this fixture class.
+fn type7_residuals_need_strategy_e(res_b: &[u8], res_g: &[u8], res_r: &[u8]) -> bool {
+    let fb = histogram_from_plane(res_b);
+    let fg = histogram_from_plane(res_g);
+    let fr = histogram_from_plane(res_r);
+    is_rare_symbol_cluster(&fb) || is_rare_symbol_cluster(&fg) || is_rare_symbol_cluster(&fr)
+}
+
 /// Encode a **type-7 (legacy RGB)** frame from a packed BGR24 input.
 /// Same plane-decorrelation pipeline as `encode_arith_rgb24` — only
 /// the per-channel entropy stage differs (legacy adaptive-CDF range
 /// coder per `spec/07`, not the modern range coder + RLE dispatcher
 /// of `spec/02` + `spec/06`).
+///
+/// Strategy E (`audit/12 §7.1`, wired round 6): when any of the
+/// three residual planes (B', G, R') matches the rare-symbol-cluster
+/// signature (`is_rare_symbol_cluster`), the encoder routes around
+/// the type-7 emission and emits a type-1 (uncompressed) frame
+/// instead. Type-1's roundtrip is byte-exact on every fixture
+/// (`spec/01 §2.1`, `audit/11 §4.5`), so the resulting wire bytes
+/// are always decode-correct against any conformant decoder. The
+/// reason for this fallback is that on rare-symbol-cluster
+/// histograms the cleanroom's flat-257-entry CDF and the
+/// proprietary's pair-packed-513-entry CDF diverge at coarse
+/// granularity (`audit/12 §5..§6`); the divergence is invisible
+/// against our self-roundtrip suite (encoder + decoder share the
+/// same CDF) but would surface against a hypothetical proprietary
+/// decoder.
 ///
 /// Test-only — the proprietary build does not produce type 7
 /// (`spec/07` §6 + §9.2 item 8); cleanroom encoder ships only the
@@ -556,6 +597,14 @@ pub fn encode_legacy_rgb(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
     let res_r =
         apply_plane_forward_with_rule(&plane_r, width as usize, height as usize, FirstColRule::B);
 
+    // Strategy E (`audit/12 §7.1`): route rare-symbol-cluster
+    // residual histograms to type 1 to sidestep the flat / pair-
+    // packed CDF divergence on the fixture class identified in
+    // `audit/12 §3.6 / §5`.
+    if type7_residuals_need_strategy_e(&res_b, &res_g, &res_r) {
+        return encode_uncompressed(pixels);
+    }
+
     let ch_b = encode_legacy_channel(&res_b);
     let ch_g = encode_legacy_channel(&res_g);
     let ch_r = encode_legacy_channel(&res_r);
@@ -567,8 +616,11 @@ pub fn encode_legacy_rgb(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
 /// Fibonacci** channel sub-path (`spec/07` §2.3 / §2.4). Same
 /// pipeline as [`encode_legacy_rgb`] except the per-channel encoder
 /// is [`encode_legacy_channel_rle`] with the supplied `escape_len`
-/// (1, 2, or 3). Test-only — drives the round-5 roundtrip suite for
-/// the channel-header `0x01..=0x03` decode path.
+/// (1, 2, or 3). Strategy E (`audit/12 §7.1`) propagates: a rare-
+/// symbol-cluster residual histogram on any plane causes the
+/// encoder to emit a type-1 (uncompressed) frame instead.
+/// Test-only — drives the round-5 roundtrip suite for the
+/// channel-header `0x01..=0x03` decode path.
 pub fn encode_legacy_rgb_rle(pixels: &[u8], width: u32, height: u32, escape_len: usize) -> Vec<u8> {
     debug_assert!((1..=3).contains(&escape_len));
     let n = width as usize * height as usize;
@@ -591,6 +643,13 @@ pub fn encode_legacy_rgb_rle(pixels: &[u8], width: u32, height: u32, escape_len:
         apply_plane_forward_with_rule(&plane_g, width as usize, height as usize, FirstColRule::B);
     let res_r =
         apply_plane_forward_with_rule(&plane_r, width as usize, height as usize, FirstColRule::B);
+
+    // Strategy E propagates through the RLE-then-Fibonacci sub-path
+    // — both sub-paths share the same flat-CDF range coder, so the
+    // same fixture class triggers the same divergence.
+    if type7_residuals_need_strategy_e(&res_b, &res_g, &res_r) {
+        return encode_uncompressed(pixels);
+    }
 
     let ch_b = encode_legacy_channel_rle(&res_b, escape_len);
     let ch_g = encode_legacy_channel_rle(&res_g, escape_len);

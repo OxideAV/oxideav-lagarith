@@ -1080,3 +1080,114 @@ fn legacy_rgb_rle_then_fib_solid_plane_roundtrip() {
         assert_eq!(dec.pixels, pixels, "escape_len {escape_len}");
     }
 }
+
+// ───────── Round 6: Strategy E (rare-symbol-cluster -> type 1) ─────────
+
+/// Build a `near_flat` BGR24 fixture: a solid colour plane with a
+/// single byte at the centre flipped by `+0x40`. This is the
+/// canonical recipe behind `audit/12 §3.6`'s rare-symbol-cluster
+/// trigger (`docs/video/lagarith/validator/test_inputs.py:204`
+/// `gen_near_flat`). After predict + decorrelate the residual
+/// histograms have `freq[0]` dominant plus a small number of rare
+/// nonzero bins (`freq ∈ {1, 2}`), matching the Strategy E
+/// predicate. The exact-byte recipe matters less than the
+/// signature: any "solid plane with a tiny number of off-pixels"
+/// produces enough rare bins on the residual to trip the guard.
+fn near_flat_bgr24(width: u32, height: u32, b: u8, g: u8, r: u8) -> Vec<u8> {
+    let n = width as usize * height as usize;
+    let mut pixels = Vec::with_capacity(n * 3);
+    for _ in 0..n {
+        pixels.push(b);
+        pixels.push(g);
+        pixels.push(r);
+    }
+    // Flip a colour byte at the centre by +0x40 — the same bit-twist
+    // `gen_near_flat` applies. A single perturbation at the centre
+    // pixel propagates a small handful of rare nonzero residuals
+    // through the predict + decorrelate stages.
+    let centre = (n / 2) * 3 + 1; // green byte of centre pixel
+    pixels[centre] = pixels[centre].wrapping_add(0x40);
+    pixels
+}
+
+#[test]
+fn legacy_rgb_strategy_e_routes_near_flat_to_type_1() {
+    // 33×27 matches the audit/12 §3 canonical fixture size. A near-
+    // flat plane has `freq[0] >= 0.95 * pixel_count` after predict
+    // + decorrelate plus >= 3 distinct rare bins, so
+    // `is_rare_symbol_cluster` returns true on at least one plane,
+    // and Strategy E re-routes to type 1.
+    let (w, h) = (33u32, 27);
+    let pixels = near_flat_bgr24(w, h, 0xa0, 0xd7, 0x40);
+    let frame = encode_legacy_rgb(&pixels, w, h);
+    assert_eq!(
+        frame[0], 1,
+        "Strategy E must re-route rare-symbol-cluster residuals to \
+         type 1 (audit/12 §7.1); got frame_type {}",
+        frame[0]
+    );
+    let dec = decode_frame(&frame, w, h, PixelKind::Bgr24).unwrap();
+    assert_eq!(dec.pixels, pixels);
+}
+
+#[test]
+fn legacy_rgb_rle_strategy_e_propagates_to_rle_path() {
+    // Strategy E is path-agnostic — both `encode_legacy_channel`
+    // (header 0x00) and `encode_legacy_channel_rle` (headers
+    // 0x01..=0x03) feed the same flat-CDF range coder, so the same
+    // fixture class triggers the same divergence. The RLE-path
+    // wrapper must apply the guard symmetrically.
+    let (w, h) = (33u32, 27);
+    let pixels = near_flat_bgr24(w, h, 0xa0, 0xd7, 0x40);
+    for escape_len in 1..=3 {
+        let frame = encode_legacy_rgb_rle(&pixels, w, h, escape_len);
+        assert_eq!(
+            frame[0], 1,
+            "Strategy E must propagate through encode_legacy_rgb_rle \
+             (escape_len {escape_len}); got frame_type {}",
+            frame[0]
+        );
+        let dec = decode_frame(&frame, w, h, PixelKind::Bgr24).unwrap();
+        assert_eq!(dec.pixels, pixels, "escape_len {escape_len}");
+    }
+}
+
+#[test]
+fn legacy_rgb_strategy_e_does_not_fire_on_pattern_bgr24() {
+    // The pattern_bgr24 fixture has dispersed residuals — no plane's
+    // histogram should match the rare-symbol-cluster signature. The
+    // existing 95/96-cell pass rate from audit/12 depends on this
+    // guard NOT firing on the pre-existing roundtrip suite.
+    let (w, h) = (16u32, 12);
+    let pixels = pattern_bgr24(w, h);
+    let frame = encode_legacy_rgb(&pixels, w, h);
+    assert_eq!(
+        frame[0], 7,
+        "non-rare-symbol-cluster fixtures must still emit type 7"
+    );
+    let dec = decode_frame(&frame, w, h, PixelKind::Bgr24).unwrap();
+    assert_eq!(dec.pixels, pixels);
+}
+
+#[test]
+fn legacy_rgb_strategy_e_does_not_fire_on_pure_solid() {
+    // A pure-solid plane produces all-zero residuals after predict.
+    // freq[0] == pixel_count, no nonzero bins -> not a rare-symbol
+    // cluster. Strategy E must NOT trigger here; type 7 still emits
+    // (the existing "all-one-symbol" CDF edge stays exercised).
+    let (w, h) = (4u32, 4);
+    let mut pixels = Vec::with_capacity(48);
+    for _ in 0..16 {
+        pixels.push(0x42);
+        pixels.push(0x42);
+        pixels.push(0x42);
+    }
+    let frame = encode_legacy_rgb(&pixels, w, h);
+    assert_eq!(
+        frame[0], 7,
+        "pure-solid plane has no rare bins; Strategy E must not \
+         fire (pre-existing audit/12 §3.5 gradient/solid/ramp pass)"
+    );
+    let dec = decode_frame(&frame, w, h, PixelKind::Bgr24).unwrap();
+    assert_eq!(dec.pixels, pixels);
+}
