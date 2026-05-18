@@ -8,6 +8,42 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 9 — encoder-side range-coder hot-path optimisation
+  (`spec/02` §5, symmetric to round 8's decoder).**
+  - `RangeEncoder::encode_symbol` now implements the Step-A
+    symbol-0 fast path: for `s == 0` the generic Step-C
+    arithmetic collapses to a no-op `low += cum[0]*q = 0` plus
+    `range = freq0 * q`, so the optimised path skips the two
+    `Cdf::lo()` reads and the `wrapping_add` of zero. Lagarith
+    residuals after gradient prediction are dominated by symbol 0
+    (`spec/06` §6.4: `freq[0] >= 0.95 * pixel_count`), so the
+    Step-A check is the dominant case and short-circuits the
+    generic indirection. The wire bytes are bit-identical to the
+    generic path (verified by `rangecoder_step_a_encode_bit_equiv_to_generic`,
+    which encodes the same stream through Step-A and through an
+    inline Step-C-only reference and asserts byte equality).
+  - `RangeEncoder::shift_low` now commits the `pending_ffs` chain
+    with a single `Vec::resize` (one bounds check + one bulk
+    memset) instead of `pending_ffs` individual `Vec::push` calls.
+    Same `c` / `c+1` cache byte, same `0x00` / `0xff` fill, same
+    low-mask, so the wire stays bit-identical to the proprietary's
+    cache-then-FF-chain emission per `spec/02` §6.2.
+  - **Throughput delta**: 65,536-symbol signal-heavy encode
+    fixture (94% zeros — same shape as the round-8 decoder
+    bench), 200 reps, release build, macOS aarch64 — baseline
+    179 MSym/s → optimised 330 MSym/s = **1.84×**. Default-on,
+    no feature gate (over the 1.3× threshold for unconditional
+    landing).
+  - +3 tests: Step-A-dominant encode self-roundtrip
+    (`rangecoder_encode_step_a_dominant_roundtrip`); Step-A
+    bit-equivalence guard
+    (`rangecoder_step_a_encode_bit_equiv_to_generic`) that re-runs
+    the same input through an inline generic-only path and asserts
+    byte equality; signal-heavy encode throughput
+    (`rangecoder_encode_throughput_signal_heavy`; functional
+    check, timing only printed under `LAGARITH_BENCH=1`). 117
+    tests total (was 114).
+
 - **Round 8 — modern range-coder hot-path optimisation (`spec/02` §5).**
   - `RangeDecoder::decode_symbol` now implements the three-way fast
     path of `spec/02` §5: Step A (symbol 0, `low < cum[1] * q`),

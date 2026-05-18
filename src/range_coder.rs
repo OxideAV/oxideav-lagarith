@@ -270,6 +270,15 @@ impl RangeEncoder {
     /// (kept as-is because we know the carry-out has not happened
     /// for them), then store `byte` as the new cache (it may still
     /// be incremented by a future carry).
+    ///
+    /// Round 9 hot-path: the per-FF `Vec::push` loops are replaced
+    /// with a single `Vec::resize` so the `pending_ffs` chain is
+    /// committed with one bounds check + one bulk memset instead of
+    /// `pending_ffs` individual push calls. The arithmetic is
+    /// unchanged (same `c` / `c+1` cache byte, same `0x00` / `0xff`
+    /// fill, same low-mask) so the wire is bit-identical to the
+    /// proprietary's cache-then-FF-chain emission per `spec/02` §6.2.
+    #[inline]
     fn shift_low(&mut self) {
         // Carry-out detection: bit 31 of low + the implicit carry
         // from low + range computations. `spec/02` §6.2: when bit
@@ -282,10 +291,11 @@ impl RangeEncoder {
             if let Some(c) = self.cache.take() {
                 self.buf.push(c.wrapping_add(1));
             }
-            for _ in 0..self.pending_ffs {
-                self.buf.push(0x00);
+            if self.pending_ffs != 0 {
+                let new_len = self.buf.len() + self.pending_ffs as usize;
+                self.buf.resize(new_len, 0x00);
+                self.pending_ffs = 0;
             }
-            self.pending_ffs = 0;
             self.cache = Some(byte);
         } else if byte == 0xff {
             // Defer: the next non-0xff byte that comes through here
@@ -298,10 +308,11 @@ impl RangeEncoder {
             if let Some(c) = self.cache.take() {
                 self.buf.push(c);
             }
-            for _ in 0..self.pending_ffs {
-                self.buf.push(0xff);
+            if self.pending_ffs != 0 {
+                let new_len = self.buf.len() + self.pending_ffs as usize;
+                self.buf.resize(new_len, 0xff);
+                self.pending_ffs = 0;
             }
-            self.pending_ffs = 0;
             self.cache = Some(byte);
         }
         // Mask to bits 0..22 then shift up by 8 — clears the
@@ -309,6 +320,7 @@ impl RangeEncoder {
         self.low = (self.low & 0x007f_ffff) << 8;
     }
 
+    #[inline(always)]
     fn renormalise(&mut self) {
         while self.range <= TOP {
             self.shift_low();
@@ -317,9 +329,39 @@ impl RangeEncoder {
     }
 
     /// Encode symbol `s` against the supplied CDF.
+    ///
+    /// Round 9 hot-path: symmetric to the decoder's `spec/02` §5
+    /// Step-A fast path landed in round 8. Symbol 0 (zero residual)
+    /// dominates the Lagarith encoder workload (`spec/06` §6.4 puts
+    /// `freq[0] >= 0.95 * pixel_count`), and for `s == 0` the
+    /// generic arithmetic collapses to a no-op `low += lo*q`
+    /// (because `lo = cum[0] = 0`) plus a single multiply
+    /// `range = freq0 * q`. Skipping the `cdf.lo(0)` / `cdf.lo(1)`
+    /// indirections and the redundant `low += 0` shaves two
+    /// `cum[]` reads + one wrapping_add per dominant symbol; the
+    /// emitted bytes are bit-identical to the generic path (and
+    /// therefore bit-identical to the proprietary, modulo the
+    /// existing self-roundtrip-only contract). The wide-distribution
+    /// `rangecoder_roundtrip_wide` test verifies the generic path
+    /// stays bit-equal.
+    #[inline]
     pub fn encode_symbol(&mut self, cdf: &Cdf, s: usize) {
         let total = cdf.total();
+        debug_assert!(total > 0, "Cdf::total must be non-zero");
         let q = self.range / total;
+
+        // Step A — symbol 0 fast path (`spec/02` §5; symmetric to
+        // the decoder hot path landed in round 8).
+        if s == 0 {
+            // cum[0] = 0 -> `low += 0` is a no-op; range becomes
+            // `(cum[1] - 0) * q = freq0 * q`.
+            self.range = cdf.freq0 * q;
+            self.renormalise();
+            return;
+        }
+
+        // Step C — generic symbol. The proprietary's `spec/02` §5
+        // path is `low += cum[s]*q; range = (cum[s+1]-cum[s]) * q`.
         let lo = cdf.lo(s);
         let hi = cdf.lo(s + 1);
         let added = lo * q;
@@ -619,5 +661,165 @@ mod tests {
             out.push(dec.decode_symbol(&cdf).unwrap());
         }
         assert_eq!(out, symbols);
+    }
+
+    /// Round 9: encoder-side spec/02 §5 Step-A fast path correctness
+    /// check. Stresses a histogram dominated by `freq[0]` (the
+    /// `spec/06` §6.4 "freq[0] >= 0.95 * pixel_count" residual
+    /// shape) and verifies the round-trip is bit-equal to the
+    /// decoder. This is the symmetric encoder pair of round 8's
+    /// decoder-side `rangecoder_roundtrip_step_a_dominant`.
+    #[test]
+    fn rangecoder_encode_step_a_dominant_roundtrip() {
+        let mut freq = [0u32; 256];
+        freq[0] = 9500;
+        for slot in freq.iter_mut().take(256).skip(1) {
+            *slot = 2;
+        }
+        let cdf = Cdf::from_frequencies(&freq).unwrap();
+
+        // 95% zero residuals, 5% non-zero spread across 1..256 —
+        // exercises the encoder Step-A path on the dominant case +
+        // the generic Step-C path on the tail.
+        let mut symbols = Vec::with_capacity(10_000);
+        for i in 0..10_000 {
+            if i % 20 == 0 {
+                symbols.push(((i * 7 + 1) & 0xff) as u8);
+            } else {
+                symbols.push(0u8);
+            }
+        }
+
+        let mut enc = RangeEncoder::new();
+        for &s in &symbols {
+            enc.encode_symbol(&cdf, s as usize);
+        }
+        let bytes = enc.finish();
+
+        let mut dec = RangeDecoder::new(&bytes).unwrap();
+        let mut out = Vec::with_capacity(symbols.len());
+        for _ in 0..symbols.len() {
+            out.push(dec.decode_symbol(&cdf).unwrap());
+        }
+        assert_eq!(out, symbols);
+    }
+
+    /// Round 9: encoder-side bit-equivalence guard. Encode the same
+    /// dominant-zero stream through the Step-A fast path AND through
+    /// a reference "no fast path" encoder built inline that always
+    /// uses the generic Step-C update for every symbol (including
+    /// symbol 0). The two outputs MUST be byte-identical — the
+    /// Step-A path is algebraically a no-op `low += 0`, so any
+    /// divergence here would mean the optimisation altered the wire
+    /// format.
+    #[test]
+    fn rangecoder_step_a_encode_bit_equiv_to_generic() {
+        let mut freq = [0u32; 256];
+        freq[0] = 9500;
+        for slot in freq.iter_mut().take(256).skip(1) {
+            *slot = 2;
+        }
+        let cdf = Cdf::from_frequencies(&freq).unwrap();
+
+        let mut symbols = Vec::with_capacity(4_000);
+        for i in 0..4_000 {
+            if i % 17 == 0 {
+                symbols.push(((i * 13 + 1) & 0xff) as u8);
+            } else {
+                symbols.push(0u8);
+            }
+        }
+
+        // Fast-path encoder (production path).
+        let mut enc_fast = RangeEncoder::new();
+        for &s in &symbols {
+            enc_fast.encode_symbol(&cdf, s as usize);
+        }
+        let bytes_fast = enc_fast.finish();
+
+        // Generic-only encoder: re-implements the §5 generic update
+        // inline so symbol 0 takes the same code path as every
+        // other symbol. Must produce the same wire bytes.
+        let mut enc_generic = RangeEncoder::new();
+        for &s in &symbols {
+            let total = cdf.total();
+            let q = enc_generic.range / total;
+            let lo = cdf.lo(s as usize);
+            let hi = cdf.lo(s as usize + 1);
+            enc_generic.low = enc_generic.low.wrapping_add(lo * q);
+            enc_generic.range = (hi - lo) * q;
+            enc_generic.renormalise();
+        }
+        let bytes_generic = enc_generic.finish();
+
+        assert_eq!(
+            bytes_fast, bytes_generic,
+            "Step-A fast path diverged from generic Step-C update"
+        );
+    }
+
+    /// Round 9: throughput sanity check for the encoder hot path.
+    /// Mirrors the decoder-side `rangecoder_throughput_signal_heavy`
+    /// (round 8) — functional check always runs; timing only
+    /// printed under `LAGARITH_BENCH=1` since `cargo test` walltime
+    /// jitters too much to threshold.
+    #[test]
+    fn rangecoder_encode_throughput_signal_heavy() {
+        let mut freq = [0u32; 256];
+        freq[0] = 60_000;
+        for slot in freq.iter_mut().take(256).skip(1) {
+            *slot = 16; // 60000 + 255*16 = 64080
+        }
+        let cdf = Cdf::from_frequencies(&freq).unwrap();
+
+        let n = 65_536;
+        let mut symbols = Vec::with_capacity(n);
+        for i in 0..n {
+            let r = (i as u32).wrapping_mul(2654435761) ^ (i as u32 >> 7);
+            symbols.push(if (r & 0xf) < 15 {
+                0u8
+            } else {
+                ((r >> 4) & 0xff) as u8
+            });
+        }
+
+        // Functional check: one encode → decode round-trip.
+        let mut enc = RangeEncoder::new();
+        for &s in &symbols {
+            enc.encode_symbol(&cdf, s as usize);
+        }
+        let bytes = enc.finish();
+        let mut dec = RangeDecoder::new(&bytes).unwrap();
+        let mut out = Vec::with_capacity(symbols.len());
+        for _ in 0..symbols.len() {
+            out.push(dec.decode_symbol(&cdf).unwrap());
+        }
+        assert_eq!(out, symbols);
+
+        // Optional timing pass (only when LAGARITH_BENCH=1).
+        if std::env::var("LAGARITH_BENCH").as_deref() == Ok("1") {
+            const REPS: usize = 200;
+            let mut sink: u64 = 0;
+            let t0 = std::time::Instant::now();
+            for _ in 0..REPS {
+                let mut enc = RangeEncoder::new();
+                for &s in &symbols {
+                    enc.encode_symbol(&cdf, s as usize);
+                }
+                let bytes = enc.finish();
+                sink = sink.wrapping_add(bytes.len() as u64);
+            }
+            let elapsed = t0.elapsed();
+            let total_syms = (n * REPS) as f64;
+            let msym_per_s = total_syms / elapsed.as_secs_f64() / 1.0e6;
+            eprintln!(
+                "BENCH/range-coder ENCODE signal-heavy: {:.2} MSym/s ({} syms x {} reps in {:.3?}; sink={})",
+                msym_per_s,
+                n,
+                REPS,
+                elapsed,
+                sink
+            );
+        }
     }
 }

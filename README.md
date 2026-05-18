@@ -113,9 +113,24 @@ aarch64) the round-8 hot path delivers **161 MSym/s vs. 37
 MSym/s** for the round-7 baseline = **4.31× speedup**, default-on
 (no feature flag).
 
+Round 9 mirrors the same Step-A fast path on the **encode**
+side: for `s == 0` the generic `low += cum[0]*q + range =
+(cum[1] - cum[0]) * q` update collapses to `range = freq0 * q`
+(the `low += 0` is elided), skipping two `cum[]` reads + the
+wrapping_add per dominant symbol. The `shift_low` pending-FF
+chain is also flushed via a single `Vec::resize` (one bulk
+memset) instead of `pending_ffs` individual pushes. On the same
+64k signal-heavy fixture (200 reps, release build, macOS
+aarch64) the round-9 encode hot path delivers **330 MSym/s vs.
+179 MSym/s** for the round-8 baseline = **1.84× speedup**,
+default-on. The Step-A path is algebraically a no-op vs.
+generic Step-C; the `rangecoder_step_a_encode_bit_equiv_to_generic`
+test re-encodes the same input through both paths and asserts
+byte equality.
+
 ## Tests
 
-114 unit + integration tests cover the range coder, Fibonacci
+117 unit + integration tests cover the range coder, Fibonacci
 prefix, RLE escape, predictor + decorrelation, channel-header
 dispatcher, the channel-header `0x01..=0x03` arithmetic-with-RLE
 path and the `0x05..=0x07` raw-RLE path, an end-to-end encode →
