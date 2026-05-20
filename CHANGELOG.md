@@ -8,6 +8,50 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 10 — encoder-side range-coder Step-B fast path
+  + cache-slot Option→bool refactor (`spec/02` §5/§6.2).**
+  - `RangeEncoder::encode_symbol` now implements the symmetric
+    **Step-B** fast path for `s == 255` (the high-sentinel symbol
+    the decoder already short-circuits per `spec/02` §5 Step B).
+    For `s == 255` the generic update reads `lo = cum[255]` and
+    `hi = cum[256] = total`, so the cached `Cdf::cum_top`
+    (= `cum[255]`) and `Cdf::total` directly drive the update
+    without indexing the 257-entry cumulative array:
+    `low += cum_top * q; range = (total - cum_top) * q`.
+    Bit-identical to the round-9 Step-C path on 0xff (verified by
+    `rangecoder_step_b_encode_bit_equiv_to_generic`, which encodes
+    the same 0xff-dominant stream through Step-B and through an
+    inline Step-C-only reference and asserts byte equality).
+  - `RangeEncoder::shift_low` swaps `cache: Option<u8>` for
+    `cache: u8 + started: bool`. The hot inner body now issues one
+    `bool` check instead of the `Option::take()` discharge the
+    optimiser couldn't elide across the carry / defer /
+    steady-state branch arms. The arithmetic is unchanged (same
+    `c` / `c+1` cache byte, same `0x00` / `0xff` fill, same
+    low-mask) so the wire stays bit-identical to the proprietary's
+    cache-then-FF-chain emission per `spec/02` §6.2 — verified by
+    the new `rangecoder_shift_low_started_byte_equiv_to_option`
+    self-roundtrip and the long-standing `rangecoder_roundtrip_wide`
+    decoder test.
+  - **Throughput delta**: 65,536-symbol Step-B-heavy encode
+    fixture (94% 0xff symbols, same total mass + same residual
+    shape as the Step-A bench), 200 reps, release build,
+    macOS aarch64 — round-9 baseline ~305 MSym/s → round-10
+    ~327 MSym/s = **1.07×** on Step-B-dominant workloads. The
+    Step-A-dominant bench is within run-to-run noise of the
+    round-9 number (~333 vs. ~336 MSym/s) — Step-B does not
+    regress Step-A. Default-on, no feature gate.
+  - +4 tests: Step-B-dominant encode self-roundtrip
+    (`rangecoder_encode_step_b_dominant_roundtrip`); Step-B
+    bit-equivalence guard
+    (`rangecoder_step_b_encode_bit_equiv_to_generic`); Step-B
+    encode throughput bench
+    (`rangecoder_encode_throughput_step_b_heavy`; functional
+    check, timing only printed under `LAGARITH_BENCH=1`); cache
+    Option→bool roundtrip regression
+    (`rangecoder_shift_low_started_byte_equiv_to_option`).
+    121 tests total (was 117).
+
 - **Round 9 — encoder-side range-coder hot-path optimisation
   (`spec/02` §5, symmetric to round 8's decoder).**
   - `RangeEncoder::encode_symbol` now implements the Step-A

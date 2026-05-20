@@ -128,9 +128,29 @@ generic Step-C; the `rangecoder_step_a_encode_bit_equiv_to_generic`
 test re-encodes the same input through both paths and asserts
 byte equality.
 
+Round 10 adds the symmetric encoder **Step-B** fast path for
+`s == 255` (the high-sentinel that the decoder already
+short-circuits per `spec/02` §5 Step B). The 257-entry `cum[]`
+array reads collapse to a `cum_top` cached field
+(`Cdf::cum_top = cum[255]`) + the existing `total`; the update
+becomes `low += cum_top * q; range = (total - cum_top) * q`.
+The `shift_low` cache slot is also refactored from
+`Option<u8>` to `u8 + started: bool` so the hot inner branch is
+a single bool check instead of `Option::take()`. On a 65,536-
+symbol Step-B-heavy fixture (94% 0xff, same total mass as
+round 9, 200 reps, release build, macOS aarch64) the round-10
+encoder delivers **~327 MSym/s vs. ~305 MSym/s** for the
+round-9 baseline = **1.07× speedup** on Step-B-dominant
+workloads. The Step-A bench stays at ~333 MSym/s (within noise
+of round 9's ~336 MSym/s) — Step-B does not regress Step-A.
+Bit-identity vs. the generic Step-C path is verified by
+`rangecoder_step_b_encode_bit_equiv_to_generic`; the Option→
+bool cache refactor is regression-guarded by
+`rangecoder_shift_low_started_byte_equiv_to_option`.
+
 ## Tests
 
-117 unit + integration tests cover the range coder, Fibonacci
+121 unit + integration tests cover the range coder, Fibonacci
 prefix, RLE escape, predictor + decorrelation, channel-header
 dispatcher, the channel-header `0x01..=0x03` arithmetic-with-RLE
 path and the `0x05..=0x07` raw-RLE path, an end-to-end encode →
