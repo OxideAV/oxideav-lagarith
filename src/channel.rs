@@ -15,7 +15,8 @@
 use crate::error::{Error, Result};
 use crate::fibonacci;
 use crate::legacy_range_coder::{
-    build_legacy_cdf, decode_legacy_freq_table, is_rare_symbol_cluster, LegacyRangeDecoder,
+    build_legacy_cdf, build_legacy_pair_packed_cdf, decode_legacy_freq_table,
+    is_rare_symbol_cluster, LegacyRangeDecoder,
 };
 use crate::range_coder::{Cdf, RangeDecoder};
 use crate::rle;
@@ -218,19 +219,29 @@ fn decode_legacy_rle_then_fib(
 /// Common tail: build the CDF, run the legacy range-coder body to
 /// produce `n_pixels` residual bytes.
 ///
-/// **Defensive harness (round 7, audit/12 §7.1).** Before building
-/// the CDF, run [`is_rare_symbol_cluster`] over the transmitted
-/// freq table. If it matches the rare-symbol-cluster signature,
-/// return [`Error::LegacyRareSymbolClusterUnsupported`] rather than
-/// silently miscoding. Audit/12 §5..§6 retracts spec/07 §3.4's
-/// flat-CDF allowance for this fixture class — the cleanroom's
-/// flat 257-entry CDF and the proprietary's pair-packed 513-entry
-/// CDF differ at coarse granularity here, so any *foreign* encoder's
-/// stream with such a freq table would decode to wrong residuals
-/// under our flat CDF. Our own encoder's *Strategy E* (`encoder.rs`)
-/// re-routes such fixtures to type 1 before reaching the legacy
-/// range coder, so the cleanroom's self-roundtrip suite never
-/// invokes this guard.
+/// **CDF-layout selection (round 96, audit/12 §7.1 Strategy F).**
+/// Two CDF construction schemes coexist (`spec/07` §3.4):
+///
+/// * The **flat 257-entry CDF** ([`build_legacy_cdf`]) is the
+///   cleanroom's self-roundtrip form — our own encoder
+///   (`encoder.rs`) builds the same flat CDF, so its streams decode
+///   byte-exactly through this path.
+/// * The **pair-packed 513-entry CDF** ([`build_legacy_pair_packed_cdf`])
+///   is the proprietary's form, with sentinel-`1` inter-symbol gaps.
+///   Audit/12 §5..§6 proved the two are *not* bit-equivalent for the
+///   rare-symbol-cluster fixture class (`freq[0] >= 0.95 * Σfreq` and
+///   ≥ 3 distinct nonzero bins with `freq ∈ {1, 2}`): the sentinel
+///   gaps shift rare symbols' boundaries past `total`, so the
+///   proprietary decoder mis-decodes them (audit/12 §3.6).
+///
+/// [`is_rare_symbol_cluster`] selects the layout. A stream that hits
+/// the signature was **not** produced by our encoder (Strategy E
+/// re-routes such fixtures to type 1 before they reach the legacy
+/// range coder), so it is a foreign / proprietary-encoded type-7
+/// stream — we decode it through the pair-packed path to match the
+/// proprietary decoder bit-for-bit. Common-case streams use the flat
+/// path. Both share the same `spec/07` §4..§5 range-coder state
+/// machine; only the CDF addressing differs.
 fn legacy_decode_body(
     channel: &[u8],
     body_offset: usize,
@@ -242,12 +253,17 @@ fn legacy_decode_body(
             context: "legacy type-7 channel body offset past end",
         });
     }
-    if is_rare_symbol_cluster(freq) {
-        return Err(Error::LegacyRareSymbolClusterUnsupported);
-    }
     let body = &channel[body_offset..];
-    let (cdf, total) = build_legacy_cdf(freq)?;
-    let mut dec = LegacyRangeDecoder::new(body, cdf, total)?;
+    let mut dec = if is_rare_symbol_cluster(freq) {
+        // Proprietary-encoded rare-symbol-cluster stream: decode
+        // against the pair-packed 513-entry CDF (audit/12 §7.1
+        // Strategy F) to reproduce the proprietary decode bit-for-bit.
+        let (pair_cdf, total) = build_legacy_pair_packed_cdf(freq)?;
+        LegacyRangeDecoder::new_pair_packed(body, pair_cdf, total)?
+    } else {
+        let (cdf, total) = build_legacy_cdf(freq)?;
+        LegacyRangeDecoder::new(body, cdf, total)?
+    };
     let mut out = Vec::with_capacity(n_pixels);
     for _ in 0..n_pixels {
         out.push(dec.decode_byte()?);

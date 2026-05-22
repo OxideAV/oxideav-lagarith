@@ -8,6 +8,44 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 96 — pair-packed 513-entry CDF decode path (legacy
+  type 7, `spec/07` §3.1 + §3.4 audit-corrected; audit/12 §7.1
+  "Strategy F").**
+  - `build_legacy_pair_packed_cdf` constructs the proprietary's
+    pair-packed 513-entry CDF: the rescaled frequencies are
+    interleaved with sentinel-`1` inter-symbol gaps as
+    `(freq'[c], 1)` and prefix-summed, so symbol `c`'s bounds sit
+    at `cdf[2c]` / `cdf[2c+1]` and the full span is `total + 256`.
+    The shared `spec/07` §3.2..§3.3 rescale + zigzag-residue front
+    end is factored into `rescale_freq`, used by both the flat and
+    pair-packed builders.
+  - `LegacyRangeDecoder::new_pair_packed` + a `CdfLayout` dispatch
+    decode against the pair-packed CDF via the `spec/07` §5.2
+    even-index binary descent, with the same
+    `total = next_pow2(Σfreq)` divisor. Because the pair-packed
+    lower bounds span `[0, total + 256)` while the §5.1
+    `symbol_index` is capped at `total - 1`, high-index rare
+    symbols are unreachable — reproducing the proprietary's
+    documented rare-symbol mis-decode (audit/12 §3.6 — `0xc0`
+    decodes as `0xff`).
+  - `channel::decode_legacy_channel` now routes streams matching
+    the rare-symbol-cluster signature
+    (`is_rare_symbol_cluster`) through the pair-packed path
+    instead of returning `Error::LegacyRareSymbolClusterUnsupported`.
+    Our own encoder never produces such streams (Strategy E routes
+    them to type 1), so this path serves foreign / proprietary-
+    encoded type-7 streams. The error variant is retained for API
+    stability and genuinely-undecodable edge cases.
+  - +4 tests: the audit/12 §5 worked-example boundary shifts
+    (`1081 / 1085 / 1215`), pair-packed CDF layout vs. the flat
+    form, length-correct pair-packed decode that avoids the
+    unreachable symbols, and a public-API `decode_frame` decode of
+    a rare-cluster type-7 frame. The five round-7 "defensive
+    harness" refusal tests are rewritten to assert the new decode
+    behaviour. Full byte-exact proprietary parity still awaits a
+    fixture oracle (`samples.oxideav.org/lagarith/`, 404 per
+    audit/04 §5).
+
 - **Round 11 — encoder-side range-coder Step-C `freqs[]` cache
   (`spec/02` §5).**
   - `Cdf` now caches `freqs: [u32; 256]` where `freqs[s] = cum[s+1]

@@ -137,39 +137,27 @@ fn next_pow2(n: u64) -> u64 {
     1u64 << (64 - lz)
 }
 
-/// Build the 257-entry CDF from a 256-entry raw-frequency table per
-/// `spec/07` §3. Returns `(cdf, total)` where `cdf[256] == total`
-/// and `total` is a power of two.
+/// Run the shared `spec/07` §3.2..§3.3 rescale + residue-distribution
+/// pipeline, returning `(rescaled_freq, total)` where
+/// `Σ rescaled_freq == total` and `total` is the smallest power of
+/// two `>= Σ freq`.
 ///
-/// The clean-room implementation here uses the **flat 257-entry CDF**
-/// form (`spec/07` §3.4 retracted allowance). Audit/12 §5 retracts
-/// the "may equivalently use a flat 257-entry CDF" allowance for a
-/// rare-symbol-cluster fixture class (≥3 distinct nonzero bins each
-/// with `freq ∈ {1, 2}` within a histogram dominated by
-/// `freq[0] >= 0.95 * pixel_count`).
-///
-/// For our **self-roundtrip discipline** (encoder + decoder share
-/// the same `build_cdf` algorithm) the flat form is bit-perfect:
-/// both sides run identical CDF construction, so any input the
-/// encoder produces, the decoder accepts byte-exactly. The
-/// audit/12 retraction concerns *cross-implementation* compatibility
-/// (our encoder vs. proprietary decoder, or vice-versa), which would
-/// require a proprietary-encoded type-7 fixture in tree (audit/04
-/// §5: not yet acquired). See [`is_rare_symbol_cluster`] for the
-/// detection signature that a future round may use to route around
-/// the affected fixture class via Strategy E (audit/12 §7.1).
-pub(crate) fn build_legacy_cdf(freq: &[u32; 256]) -> Result<(Vec<u32>, u32)> {
+/// This is the common front-end of both CDF forms — the flat
+/// 257-entry CDF of [`build_legacy_cdf`] and the pair-packed
+/// 513-entry CDF of [`build_legacy_pair_packed_cdf`] differ only in
+/// the §3.4 prefix-sum *layout*, not in the rescale that precedes it.
+fn rescale_freq(freq: &[u32; 256]) -> Result<([u32; 256], u32)> {
     let sum_freq: u64 = freq.iter().map(|&f| f as u64).sum();
     if sum_freq == 0 {
         return Err(Error::EmptyProbabilityTable);
     }
-    // Step 2: target total = next_pow2(sum_freq).
+    // Step 2 (`spec/07` §3.2): target total = next_pow2(sum_freq).
     let total = next_pow2(sum_freq);
     if total > u32::MAX as u64 {
         return Err(Error::EmptyProbabilityTable);
     }
 
-    // Step 3: rescale via floor(freq[c] * total / sum_freq).
+    // Step 3 (`spec/07` §3.2): rescale via floor(freq[c] * total / sum).
     let mut new_freq = [0u32; 256];
     if sum_freq == total {
         new_freq.copy_from_slice(freq);
@@ -180,14 +168,13 @@ pub(crate) fn build_legacy_cdf(freq: &[u32; 256]) -> Result<(Vec<u32>, u32)> {
         }
     }
 
-    // Step 4: residue distribution via zigzag walk over slots
-    // 0, -1, 1, -2, 2, ... (negative indices interpreted mod 256).
+    // Step 4 (`spec/07` §3.3): residue distribution via zigzag walk
+    // over slots 0, -1, 1, -2, 2, ... (negative indices mod 256).
     let new_sum: u64 = new_freq.iter().map(|&f| f as u64).sum();
     if (new_sum as i64) > total as i64 {
         // Over-shoot: subtract from the largest non-zero slots until
         // the difference is absorbed (the proprietary's "subtract
-        // from slot-1 of pair-pack" simplification under the flat-
-        // CDF model `spec/07` §3.3 final paragraph; held-forward item
+        // from slot-1 of pair-pack" simplification; held-forward item
         // 11 covers the edge case where slot 1 alone can't absorb).
         let mut deficit = (new_sum - total) as u32;
         for slot in new_freq.iter_mut() {
@@ -219,7 +206,44 @@ pub(crate) fn build_legacy_cdf(freq: &[u32; 256]) -> Result<(Vec<u32>, u32)> {
         }
     }
 
-    // Step 5: prefix-sum into a flat 257-entry CDF.
+    // Defensive: residue handling should land Σ new_freq on total.
+    let landed: u64 = new_freq.iter().map(|&f| f as u64).sum();
+    if landed != total {
+        let diff: i64 = total as i64 - landed as i64;
+        if diff > 0 {
+            let donor = new_freq.iter().position(|&f| f > 0).unwrap_or(0);
+            new_freq[donor] = new_freq[donor].saturating_add(diff as u32);
+        } else if diff < 0 {
+            let take = (-diff) as u32;
+            let donor = new_freq.iter().position(|&f| f >= take).unwrap_or(0);
+            new_freq[donor] -= take;
+        }
+    }
+
+    Ok((new_freq, total as u32))
+}
+
+/// Build the 257-entry **flat** CDF from a 256-entry raw-frequency
+/// table per `spec/07` §3. Returns `(cdf, total)` where
+/// `cdf[256] == total` and `total` is a power of two.
+///
+/// This is the **self-roundtrip** form (`spec/07` §3.4's flat
+/// allowance). Audit/12 §5 retracts the "may equivalently use a flat
+/// 257-entry CDF" allowance *for cross-implementation parity* on a
+/// rare-symbol-cluster fixture class (≥3 distinct nonzero bins each
+/// with `freq ∈ {1, 2}` within a histogram dominated by
+/// `freq[0] >= 0.95 * pixel_count`).
+///
+/// For our self-roundtrip discipline (encoder + decoder share the
+/// same `build_cdf` algorithm) the flat form is bit-perfect: both
+/// sides run identical CDF construction, so any input the encoder
+/// produces, the decoder accepts byte-exactly. To match the
+/// *proprietary* decoder on its own (rare-symbol-cluster) streams,
+/// use [`build_legacy_pair_packed_cdf`] instead.
+pub(crate) fn build_legacy_cdf(freq: &[u32; 256]) -> Result<(Vec<u32>, u32)> {
+    let (new_freq, total) = rescale_freq(freq)?;
+
+    // Step 5 (`spec/07` §3.4): prefix-sum into a flat 257-entry CDF.
     let mut cdf = vec![0u32; 257];
     let mut acc: u32 = 0;
     for c in 0..256 {
@@ -228,31 +252,64 @@ pub(crate) fn build_legacy_cdf(freq: &[u32; 256]) -> Result<(Vec<u32>, u32)> {
     }
     cdf[256] = acc;
 
-    // Defensive: residue handling should land cdf[256] on total.
-    if cdf[256] as u64 != total {
-        // Final patch: bump the largest non-zero slot up/down to land
-        // on total. This only fires for over-shoot edge cases that
-        // the per-slot zero-clamp leaves unresolved.
-        let diff: i64 = total as i64 - cdf[256] as i64;
-        if diff > 0 {
-            // Bump slot 0 (or any non-zero slot we can find).
-            let donor = new_freq.iter().position(|&f| f > 0).unwrap_or(0);
-            new_freq[donor] = new_freq[donor].saturating_add(diff as u32);
-        } else if diff < 0 {
-            let take = (-diff) as u32;
-            let donor = new_freq.iter().position(|&f| f >= take).unwrap_or(0);
-            new_freq[donor] -= take;
-        }
-        // Re-prefix-sum.
-        acc = 0;
-        for c in 0..256 {
-            cdf[c] = acc;
-            acc = acc.wrapping_add(new_freq[c]);
-        }
-        cdf[256] = acc;
-    }
+    Ok((cdf, total))
+}
 
-    Ok((cdf, total as u32))
+/// Build the proprietary's **pair-packed 513-entry** CDF from a
+/// 256-entry raw-frequency table per `spec/07` §3.1 + §3.4
+/// (audit-corrected) + audit/12 §7.1 "Strategy F". Returns
+/// `(pair_cdf, total)` where `total` is the same power-of-two divisor
+/// as the flat form and `pair_cdf` has 513 entries.
+///
+/// ## Layout (`spec/07` §3.1)
+///
+/// The proprietary builder copies the rescaled frequencies into a
+/// 512-cell buffer with a per-symbol `(freq'[c], 1)` interleave — the
+/// frequency followed by a sentinel `1` — then prefix-sums it. The
+/// 513-entry result has, for symbol `c`:
+///
+/// * `pair_cdf[2c]`     = lower bound of symbol `c`'s interval
+/// * `pair_cdf[2c + 1]` = `pair_cdf[2c] + freq'[c]` (upper bound)
+///
+/// with the sentinel-`1` between `pair_cdf[2c+1]` and `pair_cdf[2c+2]`
+/// being the inter-symbol gap. `pair_cdf[512] == total + 256` (the
+/// 256 sentinels contribute 256 units beyond the freq sum).
+///
+/// ## Why it differs from the flat form (audit/12 §5..§6)
+///
+/// The range coder of `spec/07` §4..§5 divides `low` by
+/// `q = range >> log2(total)`, so the `symbol_index` it computes lies
+/// in `[0, total)` — **not** in `[0, total + 256)`. The sentinel-`1`
+/// gaps therefore push high-index rare symbols' lower bounds past
+/// `total`, making them **unreachable** by the binary descent. This
+/// is exactly the proprietary's documented (mis-)decode behaviour:
+/// audit/12 §3.6 shows the proprietary decoding the cleanroom-encoded
+/// `0xc0` residual as `0xff` because `0xc0`'s pair-packed lower bound
+/// (`spec/07` §3.1 worked through audit/12 §5: 1215 for the near_flat
+/// fixture) exceeds `total` (1024).
+///
+/// A self-roundtrip encoder **cannot** use this form (the encoder
+/// would place symbols at indices the decoder can never address);
+/// the pair-packed CDF exists solely to **decode foreign /
+/// proprietary-encoded type-7 streams bit-faithfully**. The
+/// cleanroom's own encoder uses the flat form + Strategy E
+/// route-around (`encoder.rs`).
+pub(crate) fn build_legacy_pair_packed_cdf(freq: &[u32; 256]) -> Result<(Vec<u32>, u32)> {
+    let (new_freq, total) = rescale_freq(freq)?;
+
+    // Step 5 (`spec/07` §3.1 + §3.4): pair-pack `(freq'[c], 1)` and
+    // prefix-sum into a 513-entry CDF.
+    let mut pair = vec![0u32; 513];
+    let mut acc: u32 = 0;
+    for c in 0..256 {
+        pair[2 * c] = acc; // symbol c lower bound
+        acc = acc.wrapping_add(new_freq[c]);
+        pair[2 * c + 1] = acc; // symbol c upper bound
+        acc = acc.wrapping_add(1); // sentinel-1 inter-symbol gap
+    }
+    pair[512] = acc; // == total + 256
+
+    Ok((pair, total))
 }
 
 /// Detect the **rare-symbol-cluster signature** of audit/12 §7.1 in
@@ -332,6 +389,48 @@ fn cdf_find_symbol(cdf: &[u32], target: u32) -> usize {
     lo
 }
 
+/// Find the symbol `c` whose **pair-packed** lower bound
+/// `pair_cdf[2c] <= target` is the greatest such, via binary search
+/// over the even indices of the 513-entry CDF (`spec/07` §5.2's
+/// even-index probes / audit/12 §7.1 Strategy F step 2).
+///
+/// The descent compares `target` against `pair_cdf[2·mid]` only — the
+/// odd entries (`pair_cdf[2c+1]`, the per-symbol upper bounds) are
+/// read by the caller for the §5.3 state update, not by the search.
+/// Because the pair-packed lower bounds span `[0, total + 256)` while
+/// `target` is capped at `total - 1` (`spec/07` §5.1), high-index
+/// symbols whose lower bound `>= total` are unreachable — matching
+/// the proprietary's documented rare-symbol mis-decode (audit/12 §5).
+fn pair_cdf_find_symbol(pair_cdf: &[u32], target: u32) -> usize {
+    debug_assert_eq!(pair_cdf.len(), 513);
+    let mut lo = 0usize;
+    let mut hi = 256usize;
+    while lo + 1 < hi {
+        let mid = (lo + hi) >> 1;
+        if pair_cdf[2 * mid] <= target {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+/// CDF layout the [`LegacyRangeDecoder`] addresses.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CdfLayout {
+    /// Flat 257-entry CDF: symbol `c`'s bounds are `cdf[c]` /
+    /// `cdf[c+1]`. The self-roundtrip form (`spec/07` §3.4 flat
+    /// allowance).
+    Flat,
+    /// Pair-packed 513-entry CDF: symbol `c`'s bounds are
+    /// `cdf[2c]` / `cdf[2c+1]`, with sentinel-`1` inter-symbol gaps
+    /// (`spec/07` §3.1 + §3.4 audit-corrected). The form that
+    /// bit-faithfully reproduces the proprietary decode (audit/12
+    /// §7.1 Strategy F).
+    PairPacked,
+}
+
 /// Legacy range-coder decoder (`spec/07` §4..§5).
 pub(crate) struct LegacyRangeDecoder<'a> {
     src: &'a [u8],
@@ -341,6 +440,7 @@ pub(crate) struct LegacyRangeDecoder<'a> {
     cdf: Vec<u32>,
     total: u32,
     shift: u32,
+    layout: CdfLayout,
 }
 
 impl<'a> LegacyRangeDecoder<'a> {
@@ -349,7 +449,36 @@ impl<'a> LegacyRangeDecoder<'a> {
     /// is equivalent to a 4-byte priming
     /// `low = (b1<<23) | (b2<<15) | (b3<<7) | (b4>>1)` followed by
     /// `range = 0x80000000`).
+    ///
+    /// Uses the **flat 257-entry CDF** (self-roundtrip form). For the
+    /// proprietary's pair-packed 513-entry CDF use
+    /// [`LegacyRangeDecoder::new_pair_packed`].
     pub fn new(body: &'a [u8], cdf: Vec<u32>, total: u32) -> Result<Self> {
+        Self::new_with_layout(body, cdf, total, CdfLayout::Flat)
+    }
+
+    /// Init a decoder that addresses the proprietary's **pair-packed
+    /// 513-entry CDF** (`spec/07` §3.1 + §5.2 even-index probes;
+    /// audit/12 §7.1 Strategy F). `cdf` must come from
+    /// [`build_legacy_pair_packed_cdf`]; `total` is the same
+    /// power-of-two divisor.
+    ///
+    /// This path bit-faithfully reproduces the proprietary decoder's
+    /// behaviour on foreign / proprietary-encoded type-7 streams,
+    /// **including** its rare-symbol mis-decode (audit/12 §3.6): a
+    /// symbol whose pair-packed lower bound exceeds `total` is
+    /// unreachable, so the binary descent lands on the nearest
+    /// reachable symbol instead.
+    pub fn new_pair_packed(body: &'a [u8], pair_cdf: Vec<u32>, total: u32) -> Result<Self> {
+        Self::new_with_layout(body, pair_cdf, total, CdfLayout::PairPacked)
+    }
+
+    fn new_with_layout(
+        body: &'a [u8],
+        cdf: Vec<u32>,
+        total: u32,
+        layout: CdfLayout,
+    ) -> Result<Self> {
         if body.len() < 4 {
             return Err(Error::Truncated {
                 context: "legacy range-coder priming bytes",
@@ -357,6 +486,10 @@ impl<'a> LegacyRangeDecoder<'a> {
         }
         if total == 0 || (total & (total - 1)) != 0 {
             return Err(Error::EmptyProbabilityTable);
+        }
+        match layout {
+            CdfLayout::Flat => debug_assert_eq!(cdf.len(), 257),
+            CdfLayout::PairPacked => debug_assert_eq!(cdf.len(), 513),
         }
         let b1 = body[0] as u32;
         let b2 = body[1] as u32;
@@ -372,6 +505,7 @@ impl<'a> LegacyRangeDecoder<'a> {
             cdf,
             total,
             shift,
+            layout,
         })
     }
 
@@ -386,7 +520,8 @@ impl<'a> LegacyRangeDecoder<'a> {
         }
     }
 
-    /// Decode one byte symbol per `spec/07` §5.
+    /// Decode one byte symbol per `spec/07` §5. Dispatches on the
+    /// CDF layout chosen at construction.
     pub fn decode_byte(&mut self) -> Result<u8> {
         let q = self.range >> self.shift;
         if q == 0 {
@@ -396,15 +531,25 @@ impl<'a> LegacyRangeDecoder<'a> {
         if symbol_index >= self.total {
             symbol_index = self.total - 1;
         }
-        let c = cdf_find_symbol(&self.cdf, symbol_index);
-        let cdf_low = self.cdf[c];
-        let cdf_high = self.cdf[c + 1];
+        // §5.2 binary descent + §5.3 bound lookup; the only layout-
+        // dependent piece is which entries hold the chosen symbol's
+        // lower / upper bounds.
+        let (c, cdf_low, cdf_high) = match self.layout {
+            CdfLayout::Flat => {
+                let c = cdf_find_symbol(&self.cdf, symbol_index);
+                (c, self.cdf[c], self.cdf[c + 1])
+            }
+            CdfLayout::PairPacked => {
+                let c = pair_cdf_find_symbol(&self.cdf, symbol_index);
+                (c, self.cdf[2 * c], self.cdf[2 * c + 1])
+            }
+        };
         self.low = self.low.wrapping_sub(cdf_low.wrapping_mul(q));
         self.range = if cdf_high == self.total {
             // Last-symbol fast path per `spec/07` §5.3.
             self.range.wrapping_sub(cdf_low.wrapping_mul(q))
         } else {
-            (cdf_high - cdf_low).wrapping_mul(q)
+            (cdf_high.wrapping_sub(cdf_low)).wrapping_mul(q)
         };
         self.renormalise();
         Ok(c as u8)
@@ -760,5 +905,86 @@ mod tests {
             out.push(dec.decode_byte().unwrap());
         }
         assert_eq!(out, symbols);
+    }
+
+    // ──────────── pair-packed 513-entry CDF (Strategy F) ────────────
+
+    #[test]
+    fn pair_packed_cdf_layout_and_total() {
+        // Pair-pack interleaves (freq'[c], 1); the prefix sum produces
+        // even-index lower bounds and odd-index upper bounds, with the
+        // full span equal to total + 256 sentinels.
+        let mut freq = [0u32; 256];
+        freq[0] = 100;
+        freq[1] = 50;
+        freq[2] = 25;
+        freq[10] = 10;
+        let (flat, total) = build_legacy_cdf(&freq).unwrap();
+        let (pair, ptotal) = build_legacy_pair_packed_cdf(&freq).unwrap();
+        assert_eq!(pair.len(), 513);
+        assert_eq!(ptotal, total, "divisor total identical to flat form");
+        // Even-index lower bound of symbol c = flat[c] + c sentinels.
+        for c in 0..256 {
+            assert_eq!(
+                pair[2 * c],
+                flat[c] + c as u32,
+                "pair lower bound of symbol {c} = flat[{c}] + {c} sentinels",
+            );
+            // Upper bound = lower + freq'[c].
+            let freq_c = flat[c + 1] - flat[c];
+            assert_eq!(pair[2 * c + 1], pair[2 * c] + freq_c);
+        }
+        assert_eq!(pair[512], total + 256);
+    }
+
+    #[test]
+    fn pair_packed_decode_is_length_correct_and_avoids_unreachable() {
+        // Decode the audit/12 §5 near_flat freq table against the
+        // pair-packed CDF. The high rare symbols (0x40 at pair-lower
+        // 1085, 0xc0 at 1215) exceed total=1024 and so are unreachable
+        // by the §5.1 capped symbol_index — the decoder must never
+        // emit them, matching the proprietary's mis-decode (audit/12
+        // §3.6 — 0xc0 → 0xff).
+        let mut freq = [0u32; 256];
+        freq[0] = 887;
+        freq[0x3d] = 1;
+        freq[0x40] = 2;
+        freq[0xc0] = 1;
+        let (pair, total) = build_legacy_pair_packed_cdf(&freq).unwrap();
+        assert_eq!(total, 1024);
+        assert!(pair[2 * 0x40] >= total);
+        assert!(pair[2 * 0xc0] >= total);
+
+        // A dummy body; the range coder reads bytes via its cursor and
+        // pads with zero past the end (no truncation).
+        let body: Vec<u8> = (0..64u8).map(|i| i.wrapping_mul(37) ^ 0x5a).collect();
+        let mut dec = LegacyRangeDecoder::new_pair_packed(&body, pair, total).unwrap();
+        let mut out = Vec::with_capacity(50);
+        for _ in 0..50 {
+            out.push(dec.decode_byte().unwrap());
+        }
+        assert_eq!(out.len(), 50);
+        assert!(
+            !out.contains(&0x40) && !out.contains(&0xc0),
+            "unreachable pair-packed symbols decoded: {out:?}",
+        );
+    }
+
+    #[test]
+    fn pair_packed_decode_deterministic() {
+        // Two decodes of the same body + CDF must agree (the pair-
+        // packed path has no hidden state).
+        let mut freq = [0u32; 256];
+        freq[0] = 900;
+        freq[5] = 2;
+        freq[9] = 1;
+        freq[200] = 1;
+        let (pair, total) = build_legacy_pair_packed_cdf(&freq).unwrap();
+        let body: Vec<u8> = (0..80u8).map(|i| i.wrapping_mul(91)).collect();
+        let mut a = LegacyRangeDecoder::new_pair_packed(&body, pair.clone(), total).unwrap();
+        let mut b = LegacyRangeDecoder::new_pair_packed(&body, pair, total).unwrap();
+        for _ in 0..40 {
+            assert_eq!(a.decode_byte().unwrap(), b.decode_byte().unwrap());
+        }
     }
 }

@@ -1192,28 +1192,38 @@ fn legacy_rgb_strategy_e_does_not_fire_on_pure_solid() {
     assert_eq!(dec.pixels, pixels);
 }
 
-// ───────── Round 7: type-7 decoder defensive harness (audit/12 §7.1) ─────────
+// ───────── Round 96: type-7 pair-packed CDF decode (audit/12 §7.1 Strategy F) ─────────
 //
 // The cleanroom decoder runs `is_rare_symbol_cluster` on every type-7
 // channel's transmitted freq table before building the CDF. When the
-// signature matches, the decoder returns
-// `Error::LegacyRareSymbolClusterUnsupported` rather than silently
-// miscoding the body — `audit/12 §5..§6` confirms the cleanroom's
-// flat 257-entry CDF and the proprietary's pair-packed 513-entry CDF
-// are *not* bit-equivalent for this fixture class.
+// signature matches, the decoder builds the proprietary's **pair-packed
+// 513-entry CDF** (`spec/07` §3.1 + §3.4 audit-corrected) and decodes
+// against it via the §5.2 even-index binary descent — bit-faithfully
+// reproducing the proprietary decoder, **including** its rare-symbol
+// mis-decode (audit/12 §3.6). Common-case streams use the flat
+// 257-entry CDF.
+//
+// Round 7 returned `Error::LegacyRareSymbolClusterUnsupported` here
+// (the "defensive harness"); round 96 lands Strategy F so the streams
+// now decode. The error variant is retained for genuinely-undecodable
+// edge cases.
 //
 // Our own encoder applies Strategy E and re-routes such fixtures to
-// type 1, so the self-roundtrip suite never invokes this guard. The
-// tests below exercise the guard against hand-crafted channel bytes
-// that simulate a *foreign* encoder's output.
+// type 1, so the self-roundtrip suite never builds the pair-packed
+// path — these tests exercise it against hand-crafted channel bytes
+// that simulate a *foreign* (proprietary) encoder's output. Without
+// an in-tree proprietary-encoded type-7 fixture (audit/04 §5) the
+// tests assert the *structural* contract (decodes, right length, no
+// panic) plus the documented pair-packed CDF boundary shifts; full
+// byte-exact proprietary parity awaits a fixture oracle.
 
 /// Build a synthetic type-7 channel (header `0x00`, bare-Fibonacci
-/// path) carrying the supplied 256-entry frequency table. Appends 4
-/// dummy zero bytes for the legacy range-coder priming.
-fn synth_legacy_channel_header_zero(freq: &[u32; 256]) -> Vec<u8> {
+/// path) carrying the supplied 256-entry frequency table, followed by
+/// `body` bytes for the legacy range-coder.
+fn synth_legacy_channel_header_zero_body(freq: &[u32; 256], body: &[u8]) -> Vec<u8> {
     use crate::legacy_range_coder::encode_legacy_freq_table;
     let (fib_bytes, aligned) = encode_legacy_freq_table(freq);
-    let mut ch = Vec::with_capacity(2 + fib_bytes.len() + 1 + 4);
+    let mut ch = Vec::with_capacity(2 + fib_bytes.len() + 1 + body.len());
     ch.push(0x00); // outer channel-header byte
     ch.push(0x00); // inner codec-mode flag (bare Fibonacci sub-path)
     ch.extend_from_slice(&fib_bytes);
@@ -1221,11 +1231,19 @@ fn synth_legacy_channel_header_zero(freq: &[u32; 256]) -> Vec<u8> {
         // post-Fibonacci 1-byte reservation (audit/08 §3.2)
         ch.push(0x00);
     }
-    // 4 dummy priming bytes for the range-coder body. The defensive
-    // harness fires *before* the CDF build, so the body bytes never
-    // get consumed in the rare-symbol-cluster case.
-    ch.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+    ch.extend_from_slice(body);
     ch
+}
+
+/// Build a synthetic type-7 channel with a small dummy range-coder
+/// body (enough priming bytes for the decoder to run).
+fn synth_legacy_channel_header_zero(freq: &[u32; 256]) -> Vec<u8> {
+    // A short body of varied bytes drives the range coder through a
+    // few symbols + refills without truncating.
+    let body = [
+        0x12u8, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x11, 0x22, 0x33, 0x44,
+    ];
+    synth_legacy_channel_header_zero_body(freq, &body)
 }
 
 /// The canonical rare-symbol-cluster freq table from audit/12 §3.6's
@@ -1242,129 +1260,135 @@ fn rare_cluster_freq_table() -> [u32; 256] {
 }
 
 #[test]
-fn legacy_channel_decode_rejects_rare_symbol_cluster() {
+fn legacy_pair_packed_cdf_matches_audit_12_worked_example() {
+    // audit/12 §5: the near_flat R' histogram rescales to the flat
+    // boundaries {0, 1020, 1021, 1023, 1024} for symbols 0, 0x3d,
+    // 0x40, 0xc0. The pair-packed 513-entry CDF shifts each rare
+    // symbol's lower bound by the count of preceding sentinel-1s
+    // (= the symbol's index): 0x3d → 1020 + 61 = 1081, 0x40 →
+    // 1021 + 64 = 1085, 0xc0 → 1023 + 192 = 1215. The author
+    // verified these values clean-room from spec/07 §3.1 (a freq[c],
+    // sentinel-1 interleave prefix-sum), independent of the binary.
+    use crate::legacy_range_coder::{build_legacy_cdf, build_legacy_pair_packed_cdf};
+    let freq = rare_cluster_freq_table();
+
+    let (flat, total) = build_legacy_cdf(&freq).unwrap();
+    assert_eq!(total, 1024, "next_pow2(891) = 1024");
+    // Flat boundaries per audit/12 §5.
+    assert_eq!(flat[0x00], 0);
+    assert_eq!(flat[0x3d], 1020);
+    assert_eq!(flat[0x40], 1021);
+    assert_eq!(flat[0xc0], 1023);
+    assert_eq!(flat[256], 1024);
+
+    let (pair, ptotal) = build_legacy_pair_packed_cdf(&freq).unwrap();
+    assert_eq!(pair.len(), 513);
+    assert_eq!(ptotal, 1024, "divisor total is unchanged by pair-pack");
+    // Pair-packed lower bounds = even indices. Symbol 0 starts at 0.
+    assert_eq!(pair[0], 0);
+    assert_eq!(pair[2 * 0x3d], 1081, "0x3d: 1020 + 61 sentinels");
+    assert_eq!(pair[2 * 0x40], 1085, "0x40: 1021 + 64 sentinels");
+    assert_eq!(pair[2 * 0xc0], 1215, "0xc0: 1023 + 192 sentinels");
+    // Upper bounds = lower + freq'[c] (freq' = 1, 2, 1 respectively).
+    assert_eq!(pair[2 * 0x3d + 1], 1082);
+    assert_eq!(pair[2 * 0x40 + 1], 1087);
+    assert_eq!(pair[2 * 0xc0 + 1], 1216);
+    // Full pair span = total + 256 sentinels.
+    assert_eq!(pair[512], 1024 + 256);
+    // High-index rare symbols are unreachable: their lower bound
+    // exceeds the divisor total, so the §5.1 symbol_index (capped at
+    // total - 1) can never land there. This is the proprietary's
+    // documented mis-decode (audit/12 §3.6 — 0xc0 decodes as 0xff).
+    assert!(pair[2 * 0x40] >= total, "0x40 unreachable under pair-pack");
+    assert!(pair[2 * 0xc0] >= total, "0xc0 unreachable under pair-pack");
+}
+
+#[test]
+fn legacy_channel_decode_rare_cluster_uses_pair_packed_path() {
+    // Round 96: the rare-symbol-cluster signature now decodes via the
+    // pair-packed path rather than returning
+    // LegacyRareSymbolClusterUnsupported. Assert the structural
+    // contract: it decodes successfully and emits exactly n_pixels
+    // residuals (byte-exact proprietary parity awaits a fixture).
     use crate::channel::decode_legacy_channel;
-    use crate::error::Error;
     let freq = rare_cluster_freq_table();
     let ch = synth_legacy_channel_header_zero(&freq);
-    let n_pixels: usize = freq.iter().map(|&f| f as usize).sum();
+    let n_pixels: usize = 64;
     let res = decode_legacy_channel(&ch, n_pixels);
+    let out = res.expect("rare-cluster stream must decode via pair-packed path");
+    assert_eq!(out.len(), n_pixels);
+    // Every emitted symbol must be a reachable symbol (one whose
+    // pair-packed lower bound is below total); the unreachable high
+    // rare symbols (0x40, 0xc0) must NEVER appear in the output.
     assert!(
-        matches!(res, Err(Error::LegacyRareSymbolClusterUnsupported)),
-        "rare-symbol-cluster freq table must surface as \
-         LegacyRareSymbolClusterUnsupported (audit/12 §7.1); got {:?}",
-        res
+        !out.contains(&0x40) && !out.contains(&0xc0),
+        "unreachable pair-packed symbols must not be decoded; got {:?}",
+        out
     );
 }
 
 #[test]
-fn legacy_channel_decode_rejects_rare_symbol_cluster_minimum_three_bins() {
-    // The audit/12 §7.1 predicate requires *exactly* `>= 3` distinct
-    // rare bins. Verify the boundary: 3 bins triggers; 2 bins does
-    // not (the latter is still valid for the cleanroom flat CDF).
+fn legacy_channel_decode_three_rare_bins_decodes() {
+    // The audit/12 §7.1 predicate requires `>= 3` distinct rare bins.
+    // With 3 rare bins the pair-packed path is selected and the stream
+    // decodes; with 2 rare bins the flat path is selected and also
+    // decodes. Both succeed — round 96 no longer refuses either.
     use crate::channel::decode_legacy_channel;
-    use crate::error::Error;
     let mut freq = [0u32; 256];
     freq[0x00] = 1000;
     freq[0x10] = 1;
     freq[0x20] = 1;
-    freq[0x30] = 2; // 3 rare bins → trigger
+    freq[0x30] = 2; // 3 rare bins → pair-packed path
     let ch = synth_legacy_channel_header_zero(&freq);
-    let n_pixels: usize = freq.iter().map(|&f| f as usize).sum();
-    let res = decode_legacy_channel(&ch, n_pixels);
-    assert!(
-        matches!(res, Err(Error::LegacyRareSymbolClusterUnsupported)),
-        "3-rare-bin signature must trigger; got {:?}",
-        res
-    );
+    let out = decode_legacy_channel(&ch, 48).expect("3-rare-bin stream decodes");
+    assert_eq!(out.len(), 48);
 
-    // Now drop to 2 rare bins (still freq[0]-dominated). The guard
-    // must NOT fire — this is an ordinary type-7 channel that the
-    // cleanroom flat CDF handles correctly per audit/13 §3 (95/96
-    // pre-Strategy E pass rate, which the residue cluster did not
-    // include).
     let mut freq2 = [0u32; 256];
     freq2[0x00] = 1000;
     freq2[0x10] = 1;
-    freq2[0x20] = 1; // 2 rare bins, not enough
+    freq2[0x20] = 1; // 2 rare bins → flat path
     let ch2 = synth_legacy_channel_header_zero(&freq2);
-    let n_pixels2: usize = freq2.iter().map(|&f| f as usize).sum();
-    let res2 = decode_legacy_channel(&ch2, n_pixels2);
-    assert!(
-        !matches!(res2, Err(Error::LegacyRareSymbolClusterUnsupported)),
-        "2 rare bins must NOT trigger the guard; got {:?}",
-        res2
-    );
+    let out2 = decode_legacy_channel(&ch2, 48).expect("2-rare-bin stream decodes");
+    assert_eq!(out2.len(), 48);
 }
 
 #[test]
-fn legacy_channel_decode_rejects_rare_cluster_dominance_threshold() {
+fn legacy_channel_decode_dominance_below_threshold_uses_flat() {
     // The audit/12 §7.1 predicate requires `freq[0] >= 0.95 * Σfreq`.
-    // Verify the boundary: a histogram with the requisite 3 rare bins
-    // but freq[0] only at 90% of total must NOT trigger (the cleanroom
-    // flat CDF is correct against the proprietary on these histograms
-    // — audit/12 §3.5 distinguishes the dominant-zero requirement
-    // from mere rare-bin presence).
+    // A histogram with 3 rare bins but freq[0] only at 90% of total
+    // is NOT a rare-symbol cluster, so the flat path is selected.
     use crate::channel::decode_legacy_channel;
-    use crate::error::Error;
     let mut freq = [0u32; 256];
     freq[0x00] = 90;
     freq[0x80] = 7; // dispersed mass — drops dominance below 95%
     freq[0x10] = 1;
     freq[0x20] = 1;
     freq[0x30] = 1;
-    // freq[0] / Σfreq = 90 / 100 = 0.9 — below threshold.
     let ch = synth_legacy_channel_header_zero(&freq);
-    let n_pixels: usize = freq.iter().map(|&f| f as usize).sum();
-    let res = decode_legacy_channel(&ch, n_pixels);
-    assert!(
-        !matches!(res, Err(Error::LegacyRareSymbolClusterUnsupported)),
-        "freq[0] dominance below 95% must NOT trigger the guard; got \
-         {:?}",
-        res
-    );
+    let out = decode_legacy_channel(&ch, 50).expect("non-cluster stream decodes via flat path");
+    assert_eq!(out.len(), 50);
 }
 
 #[test]
-fn legacy_decode_frame_rejects_rare_cluster_at_public_api() {
-    // The defensive harness must surface through `decode_frame`'s
-    // public surface — assemble a type-7 frame with three rare-
-    // cluster channels and verify the public API returns the
-    // structured error rather than a silent (and wrong) decode.
-    use crate::error::Error;
+fn legacy_decode_frame_rare_cluster_decodes_at_public_api() {
+    // The pair-packed path must reach through `decode_frame`'s public
+    // surface — assemble a type-7 frame with three rare-cluster
+    // channels and verify the public API decodes (length-correct)
+    // rather than erroring.
     use crate::frame::pack_channels;
     let freq = rare_cluster_freq_table();
     let n_pixels: u32 = freq.iter().sum();
     // Pick (W, H) with W * H == n_pixels. 891 == 33 * 27.
     let (w, h) = (33u32, 27u32);
     assert_eq!(w * h, n_pixels);
-    let ch = synth_legacy_channel_header_zero(&freq);
+    // The body must be long enough to drive 891 symbols through the
+    // range coder without truncating; use a pseudo-random fill.
+    let body: Vec<u8> = (0..2048u32).map(|i| ((i * 73) ^ (i >> 2)) as u8).collect();
+    let ch = synth_legacy_channel_header_zero_body(&freq, &body);
     let frame = pack_channels(7, &[&ch, &ch, &ch]);
-    let res = decode_frame(&frame, w, h, PixelKind::Bgr24);
-    assert!(
-        matches!(res, Err(Error::LegacyRareSymbolClusterUnsupported)),
-        "decode_frame must surface LegacyRareSymbolClusterUnsupported \
-         on rare-cluster type-7 streams; got {:?}",
-        res
-    );
-}
-
-#[test]
-fn legacy_decode_error_display_mentions_audit_and_strategy_f() {
-    // The error's `Display` message is the user-facing handhold for
-    // why the stream isn't decoded — verify it points at the audit
-    // ref and Strategy F so callers reading the error trail land on
-    // the right context.
-    use crate::error::Error;
-    let msg = format!("{}", Error::LegacyRareSymbolClusterUnsupported);
-    assert!(
-        msg.contains("audit/12"),
-        "error display must reference audit/12; got: {msg}"
-    );
-    assert!(
-        msg.contains("Strategy F"),
-        "error display must reference Strategy F; got: {msg}"
-    );
+    let dec = decode_frame(&frame, w, h, PixelKind::Bgr24)
+        .expect("rare-cluster type-7 frame decodes via pair-packed path");
+    assert_eq!(dec.pixels.len(), (w as usize) * (h as usize) * 3);
 }
 
 #[test]

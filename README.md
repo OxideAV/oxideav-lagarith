@@ -178,9 +178,40 @@ secondary symbols (the post-gradient Laplacian residual is
 sharp enough that symbols `±1` are an order of magnitude
 rarer than symbol `0`).
 
+## Pair-packed 513-entry CDF (legacy type 7)
+
+The type-7 legacy range coder builds its probability model two ways
+(`spec/07` §3.4):
+
+* The **flat 257-entry CDF** is the cleanroom's self-roundtrip form —
+  the encoder (`encode_legacy_rgb`) builds the same flat CDF, so its
+  streams decode byte-exactly.
+* The **pair-packed 513-entry CDF** is the proprietary's form
+  (`spec/07` §3.1 + §3.4 audit-corrected): the rescaled frequencies
+  are interleaved with sentinel-`1` inter-symbol gaps as
+  `(freq'[c], 1)` and prefix-summed, so symbol `c`'s bounds sit at
+  `cdf[2c]` / `cdf[2c+1]` and the full span is `total + 256`. The
+  decoder addresses it via the `spec/07` §5.2 even-index binary
+  descent with the same `total = next_pow2(Σfreq)` divisor.
+
+Audit/12 §5..§6 proved the two are **not** bit-equivalent for the
+rare-symbol-cluster fixture class (`freq[0] >= 0.95 * Σfreq` plus ≥ 3
+distinct nonzero bins with `freq ∈ {1, 2}`): the sentinel gaps push
+high-index rare symbols' lower bounds past `total`, so they become
+unreachable and the proprietary mis-decodes them (audit/12 §3.6 —
+`0xc0` decodes as `0xff`). The decoder selects the pair-packed path
+for streams matching this signature (which our own encoder never
+produces — Strategy E routes them to type 1), reproducing the
+proprietary decode bit-faithfully. The pair-packed construction +
+addressing are implemented clean-room from the spec and unit-tested
+against the audit/12 §5 worked example (boundaries `1081 / 1085 /
+1215`); full *byte-exact* parity against a real proprietary-encoded
+type-7 stream still awaits a fixture oracle
+(`samples.oxideav.org/lagarith/`, 404 per audit/04 §5).
+
 ## Tests
 
-126 unit + integration tests cover the range coder, Fibonacci
+129 unit + integration tests cover the range coder, Fibonacci
 prefix, RLE escape, predictor + decorrelation, channel-header
 dispatcher, the channel-header `0x01..=0x03` arithmetic-with-RLE
 path and the `0x05..=0x07` raw-RLE path, an end-to-end encode →
@@ -190,8 +221,10 @@ channel sub-path), 8, 9, 10 (round 2 YV12), 11 (round 3
 reduced-resolution), the legacy adaptive-CDF range coder + its
 Fibonacci freq-table primitives (round 4), the audit/12
 rare-symbol-cluster signature detector (round 5; round-6 encoder
-Strategy E + round-7 decoder defensive harness via the new
-`Error::LegacyRareSymbolClusterUnsupported` variant), the YUY2
+Strategy E), the round-96 **pair-packed 513-entry CDF** decode
+path (Strategy F) — its layout vs. the flat form, the audit/12 §5
+worked-example boundary shifts, and length-correct decode through
+both the channel decoder and `decode_frame` — the YUY2
 odd-width floor-chroma layout (audit/00 §9.4), and the NULL-frame
 ("JUMP") replay path through both the `Decoder` wrapper and the
 `decode_frame_with_prev` helper.
