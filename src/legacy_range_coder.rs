@@ -319,42 +319,31 @@ pub(crate) fn build_legacy_pair_packed_cdf(freq: &[u32; 256]) -> Result<(Vec<u32
 ///
 /// This is the signature audit/12 §3.6 / §5 identified as the
 /// trigger for the flat-CDF / pair-packed-CDF wire-format
-/// divergence. A future round implementing Strategy E (audit/12
-/// §7.1) — encoder-side route-around for rare-symbol-cluster
-/// fixtures — would invoke this on each plane's residual histogram
-/// and skip the type-7 emission when it returns `true`, falling
-/// back to type 1 (uncompressed) which is byte-exact on every
-/// fixture.
-///
-/// The full Strategy F refactor (pair-packed 513-entry CDF) is
-/// audit/12 §7.1's alternative; the round-7 auditor recommends
-/// Strategy E because Strategy F's regression risk on the 95/96
-/// currently-passing type-7 cells outweighs its benefit (type 7 is
-/// decode-only in the proprietary build per `spec/07` §6 / §9.2
-/// item 8 — no archival type-7 fixture exists per audit/04 §5).
-///
-/// Wired into two consumers:
+/// divergence: the proprietary's pair-packed 513-entry CDF and the
+/// cleanroom's flat 257-entry CDF are *not* bit-equivalent for this
+/// fixture class (the sentinel-`1` gaps shift rare symbols' bounds
+/// past `total`). Wired into two consumers:
 ///
 /// * [`crate::encoder::encode_legacy_rgb`] /
-///   [`crate::encoder::encode_legacy_rgb_rle`] (round 6, encode side):
-///   when any of the three residual planes (B', G, R') matches this
-///   signature, the encoder skips the type-7 emission and falls
-///   through to a type-1 (uncompressed) frame, which is byte-exact
-///   on every fixture per `audit/12 §7.1` Strategy E + `audit/13
-///   §3` cross-validation.
+///   [`crate::encoder::encode_legacy_rgb_rle`] (round 6, encode side
+///   Strategy E): when any of the three residual planes (B', G, R')
+///   matches this signature, the encoder skips the type-7 emission
+///   and falls through to a type-1 (uncompressed) frame, which is
+///   byte-exact on every fixture per `audit/12 §7.1` Strategy E +
+///   `audit/13 §3` cross-validation. A self-roundtrip pair-packed
+///   encoder is impossible (the pair-pack span exceeds the divisor
+///   `total`, so symbols would be placed at unaddressable indices),
+///   so Strategy E is the only valid encode-side handling.
 ///
-/// * [`crate::channel::decode_legacy_channel`] (round 7, decode side
-///   defensive harness): when the transmitted freq table matches
-///   this signature, the decoder returns
-///   [`Error::LegacyRareSymbolClusterUnsupported`] rather than
-///   silently mis-decoding the body. Audit/12 §5..§6 confirms the
-///   proprietary's pair-packed 513-entry CDF and the cleanroom's
-///   flat 257-entry CDF are *not* bit-equivalent for this signature,
-///   so a foreign encoder's stream with this freq table would feed
-///   a different residual sequence to our predictor than to the
-///   proprietary's. Surfacing the mismatch explicitly is preferable
-///   to silent miscoding for any downstream caller that ingests
-///   wild type-7 streams.
+/// * [`crate::channel::decode_legacy_channel`] (round 96, decode side
+///   Strategy F): when the transmitted freq table matches this
+///   signature the decoder builds the proprietary's pair-packed
+///   513-entry CDF ([`build_legacy_pair_packed_cdf`]) and decodes
+///   against it via the `spec/07` §5.2 even-index descent, reproducing
+///   the proprietary decode bit-faithfully (including its rare-symbol
+///   mis-decode, audit/12 §3.6). Such a stream was not produced by
+///   our encoder (Strategy E re-routes it), so it is foreign /
+///   proprietary-encoded input.
 pub(crate) fn is_rare_symbol_cluster(freq: &[u32; 256]) -> bool {
     let total: u64 = freq.iter().map(|&f| f as u64).sum();
     if total == 0 {
