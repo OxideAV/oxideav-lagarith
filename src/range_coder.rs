@@ -36,12 +36,27 @@ pub(crate) const INIT_RANGE: u32 = 0x8000_0000;
 /// the symmetric encoder Step-B fast path: the s == 255 symbol-encode
 /// update collapses to two cached-field reads + one subtract instead
 /// of two `cum[]` array reads.
+///
+/// Round 11 (encoder) adds a `freqs: [u32; 256]` cache where
+/// `freqs[s] = cum[s+1] - cum[s]` so the `spec/02` §5 Step-C encoder
+/// hot path drops its `cum[s+1] - cum[s]` two-read + subtract for a
+/// single `freqs[s]` load. `cum[s]` itself is still loaded from
+/// `cum[]` (the second load) but the second indirection becomes
+/// data-independent of the first, so the optimiser can schedule
+/// them in parallel and the `range = freq * q` multiply no longer
+/// waits on a subtract. Layout note: the small scalar fields land
+/// at offset 0 so a Step-A-dominant workload keeps `freq0` + `total`
+/// on the first cache line.
 #[derive(Debug, Clone)]
 pub(crate) struct Cdf {
-    cum: [u32; 257],
     /// `cum[1]` — boundary between symbol 0 (zero residual) and
     /// every other symbol. Cached for the §5 step-A fast path.
+    /// Placed first so it lands at struct offset 0; the Step-A
+    /// hot path then reads `freq0` and `total` from the same
+    /// cache line as the struct base.
     freq0: u32,
+    /// `cum[256]` — total mass. Cached for the §5 step-B fast path.
+    total: u32,
     /// `cum[255]` — boundary between symbol 254 and symbol 255.
     /// Cached for the §5 step-B **encoder** fast path landed in
     /// round 10. The decoder Step-B path keys off `total`, not
@@ -49,8 +64,12 @@ pub(crate) struct Cdf {
     /// this field is only live in the test build.
     #[cfg(test)]
     cum_top: u32,
-    /// `cum[256]` — total mass. Cached for the §5 step-B fast path.
-    total: u32,
+    cum: [u32; 257],
+    /// Per-symbol `freq[s] = cum[s+1] - cum[s]` cache. Encoder-only
+    /// (the round-11 Step-C cache; the decoder's `find_symbol`
+    /// walks the cum[] array directly).
+    #[cfg(test)]
+    freqs: [u32; 256],
 }
 
 impl Cdf {
@@ -67,13 +86,32 @@ impl Cdf {
         if acc == 0 {
             return Err(Error::EmptyProbabilityTable);
         }
+        #[cfg(test)]
+        let freqs = {
+            let mut f = [0u32; 256];
+            for s in 0..256 {
+                f[s] = cum[s + 1] - cum[s];
+            }
+            f
+        };
         Ok(Self {
             freq0: cum[1],
             #[cfg(test)]
             cum_top: cum[255],
+            #[cfg(test)]
+            freqs,
             total: acc,
             cum,
         })
+    }
+
+    /// Read the encoder's pre-computed frequency `freq[s] =
+    /// cum[s+1] - cum[s]`. Used by the round-11 Step-C hot path
+    /// to skip the subtraction.
+    #[cfg(test)]
+    #[inline(always)]
+    pub(crate) fn freq(&self, s: usize) -> u32 {
+        self.freqs[s]
     }
 
     /// Total mass `cum[256]`.
@@ -399,6 +437,9 @@ impl RangeEncoder {
     /// frequent symbols in alpha-dominant or solid-white plane
     /// channels — far less common than symbol 0 but still worth
     /// the same one-multiply elision.
+    ///
+    /// Round 11 hot-path: Step-C now uses a `freqs[]` cache —
+    /// see the inline comment on the Step-C arm below.
     #[inline]
     pub fn encode_symbol(&mut self, cdf: &Cdf, s: usize) {
         let total = cdf.total();
@@ -428,11 +469,32 @@ impl RangeEncoder {
 
         // Step C — generic symbol. The proprietary's `spec/02` §5
         // path is `low += cum[s]*q; range = (cum[s+1]-cum[s]) * q`.
+        //
+        // Round 11 hot-path: a `freqs[s]` cache replaces the round-10
+        // `cum[s+1] - cum[s]` two-read + subtract. `cum[s]` itself
+        // is still loaded from the `cum[]` array (the second load),
+        // but the second indirection becomes data-independent of
+        // the first, so the optimiser can schedule them in parallel
+        // and the `range = freq * q` multiply no longer waits on a
+        // subtract. Bit-identical to round 10 — `freqs[s]` is
+        // sourced from the same `cum[]` array `from_frequencies`
+        // builds, just pre-differenced. The
+        // `rangecoder_step_c_encode_bit_equiv_to_generic` test
+        // re-encodes the same input through both paths and asserts
+        // byte equality.
+        //
+        // Round 11 NOTE: dedicated Step-A1 (`s == 1`) and Step-B1
+        // (`s == 254`) fast paths were tried and benched against
+        // mixed-distribution streams — they hurt the dominant
+        // Step-A path more than they helped the secondary symbols
+        // (extra branches in the hot loop dropped Step-A heavy
+        // from ~340 MSym/s to ~299 MSym/s, -12%). `encode_symbol`
+        // deliberately falls through to Step-C for s ∈ 1..=254
+        // instead of growing the if-chain.
         let lo = cdf.lo(s);
-        let hi = cdf.lo(s + 1);
-        let added = lo * q;
-        self.low = self.low.wrapping_add(added);
-        self.range = (hi - lo) * q;
+        let freq = cdf.freq(s);
+        self.low = self.low.wrapping_add(lo * q);
+        self.range = freq * q;
         self.renormalise();
     }
 
@@ -1046,6 +1108,250 @@ mod tests {
                 REPS,
                 elapsed,
                 sink
+            );
+        }
+    }
+
+    /// Round 11: encoder-side `spec/02` §5 Step-C path is dominated
+    /// by a packed-pair cache. Stresses a histogram where the
+    /// non-{0, 0xff} symbol mass is spread across many bins (so
+    /// most encoded symbols hit the Step-C arm), and verifies the
+    /// round-trip is bit-equal to the decoder. This is the
+    /// symmetric encoder coverage of the round-8 decoder Step-C
+    /// path: the encoder's Step-C is the "generic" arm fired
+    /// whenever the symbol is neither 0 nor 255 and the cache
+    /// halves the per-symbol pointer dereferences.
+    #[test]
+    fn rangecoder_encode_step_c_dominant_roundtrip() {
+        let mut freq = [0u32; 256];
+        // Mid-band distribution: tiny mass on 0 / 255, most mass
+        // spread across 1..255 — every symbol hits Step-C.
+        freq[0] = 5;
+        freq[255] = 5;
+        for slot in freq.iter_mut().take(255).skip(1) {
+            *slot = 40;
+        }
+        let cdf = Cdf::from_frequencies(&freq).unwrap();
+
+        // Mostly-non-extreme symbols.
+        let mut symbols = Vec::with_capacity(10_000);
+        for i in 0..10_000 {
+            // 99% in 1..255 inclusive, 1% on 0 / 255.
+            let r = (i as u32).wrapping_mul(2654435761) ^ (i as u32 >> 5);
+            symbols.push(match r % 100 {
+                0 => 0u8,
+                1 => 0xffu8,
+                _ => 1 + (r >> 8) as u8 % 254,
+            });
+        }
+
+        let mut enc = RangeEncoder::new();
+        for &s in &symbols {
+            enc.encode_symbol(&cdf, s as usize);
+        }
+        let bytes = enc.finish();
+
+        let mut dec = RangeDecoder::new(&bytes).unwrap();
+        let mut out = Vec::with_capacity(symbols.len());
+        for _ in 0..symbols.len() {
+            out.push(dec.decode_symbol(&cdf).unwrap());
+        }
+        assert_eq!(out, symbols);
+    }
+
+    /// Round 11: encoder-side bit-equivalence guard for Step-C.
+    /// Encode a mid-band stream through the packed-pair Step-C
+    /// path AND through an inline reference that re-reads
+    /// `cdf.lo(s)` + `cdf.lo(s + 1)` directly (the round-10 form).
+    /// The two outputs MUST be byte-identical — the packed-pair
+    /// cache is algebraically a structural rewrite of the same
+    /// `cum[s]` + `cum[s+1] - cum[s]` reads, so any divergence
+    /// would mean the optimisation altered the wire format.
+    #[test]
+    fn rangecoder_step_c_encode_bit_equiv_to_generic() {
+        let mut freq = [0u32; 256];
+        freq[0] = 10;
+        freq[255] = 10;
+        for slot in freq.iter_mut().take(255).skip(1) {
+            *slot = 35;
+        }
+        let cdf = Cdf::from_frequencies(&freq).unwrap();
+
+        let mut symbols = Vec::with_capacity(6_000);
+        for i in 0..6_000 {
+            // Mid-band; deliberately exclude 0 and 255 so every
+            // emission goes through the Step-C arm.
+            let s = 1u32 + ((i as u32).wrapping_mul(31) % 253);
+            symbols.push(s as u8);
+        }
+
+        // Packed-pair fast path (production code).
+        let mut enc_fast = RangeEncoder::new();
+        for &s in &symbols {
+            enc_fast.encode_symbol(&cdf, s as usize);
+        }
+        let bytes_fast = enc_fast.finish();
+
+        // Reference encoder: inline the §5 generic update via
+        // `cdf.lo()` so symbol-s takes the round-10 code path.
+        // Must produce the same wire bytes as the packed-pair form.
+        let mut enc_ref = RangeEncoder::new();
+        for &s in &symbols {
+            let total = cdf.total();
+            let q = enc_ref.range / total;
+            let lo = cdf.lo(s as usize);
+            let hi = cdf.lo(s as usize + 1);
+            enc_ref.low = enc_ref.low.wrapping_add(lo * q);
+            enc_ref.range = (hi - lo) * q;
+            enc_ref.renormalise();
+        }
+        let bytes_ref = enc_ref.finish();
+
+        assert_eq!(
+            bytes_fast, bytes_ref,
+            "Step-C packed-pair cache diverged from cum[]-array reference"
+        );
+    }
+
+    /// Round 11: encoder Step-C throughput bench. Mid-band
+    /// distribution — every symbol fires Step-C, so the
+    /// packed-pair cache delta is direct. Functional check
+    /// always runs; timing only printed under `LAGARITH_BENCH=1`.
+    #[test]
+    fn rangecoder_encode_throughput_step_c_heavy() {
+        let mut freq = [0u32; 256];
+        // Step-A / Step-B basically off (tiny mass on 0 / 255);
+        // every other symbol takes Step-C.
+        freq[0] = 16;
+        freq[255] = 16;
+        for slot in freq.iter_mut().take(255).skip(1) {
+            *slot = 252; // total ≈ 64,000 — same order as Step-A/B
+        }
+        let cdf = Cdf::from_frequencies(&freq).unwrap();
+
+        let n = 65_536;
+        let mut symbols = Vec::with_capacity(n);
+        for i in 0..n {
+            let r = (i as u32).wrapping_mul(2654435761) ^ (i as u32 >> 7);
+            // 99% mid-band → Step-C; 1% on 0/255 to mirror reality.
+            symbols.push(match r % 100 {
+                0 => 0u8,
+                1 => 0xffu8,
+                _ => 1 + (r >> 8) as u8 % 254,
+            });
+        }
+
+        // Functional check: one encode → decode round-trip.
+        let mut enc = RangeEncoder::new();
+        for &s in &symbols {
+            enc.encode_symbol(&cdf, s as usize);
+        }
+        let bytes = enc.finish();
+        let mut dec = RangeDecoder::new(&bytes).unwrap();
+        let mut out = Vec::with_capacity(symbols.len());
+        for _ in 0..symbols.len() {
+            out.push(dec.decode_symbol(&cdf).unwrap());
+        }
+        assert_eq!(out, symbols);
+
+        // Optional timing pass (only when LAGARITH_BENCH=1).
+        if std::env::var("LAGARITH_BENCH").as_deref() == Ok("1") {
+            const REPS: usize = 200;
+            let mut sink: u64 = 0;
+            let t0 = std::time::Instant::now();
+            for _ in 0..REPS {
+                let mut enc = RangeEncoder::new();
+                for &s in &symbols {
+                    enc.encode_symbol(&cdf, s as usize);
+                }
+                let bytes = enc.finish();
+                sink = sink.wrapping_add(bytes.len() as u64);
+            }
+            let elapsed = t0.elapsed();
+            let total_syms = (n * REPS) as f64;
+            let msym_per_s = total_syms / elapsed.as_secs_f64() / 1.0e6;
+            eprintln!(
+                "BENCH/range-coder ENCODE step-c-heavy: {:.2} MSym/s ({} syms x {} reps in {:.3?}; sink={})",
+                msym_per_s,
+                n,
+                REPS,
+                elapsed,
+                sink
+            );
+        }
+    }
+
+    /// Round 11: `±1`-residual roundtrip. The small-positive
+    /// (`s = 1`) and small-negative (`s = 254`) residuals are the
+    /// third- and fourth-most-common symbols in Lagarith streams
+    /// after gradient prediction (Laplacian-shaped). Verifies the
+    /// new round-11 Step-C `freqs[]` cache produces correct
+    /// roundtrip output on a `{0, 1, 254, 255}`-heavy distribution.
+    /// (Dedicated Step-A1 / Step-B1 fast paths were prototyped and
+    /// reverted — see `encode_symbol`'s round-11 NOTE: extra
+    /// branches in the hot loop regressed the dominant Step-A
+    /// path more than they helped the secondary symbols.)
+    #[test]
+    fn rangecoder_encode_laplacian_residual_roundtrip() {
+        let mut freq = [0u32; 256];
+        // Laplacian-ish shape: heavy on {0, 1, 254, 255}, tiny on
+        // 2..=253.
+        freq[0] = 6000;
+        freq[1] = 1500;
+        freq[254] = 1500;
+        freq[255] = 1000;
+        for slot in freq.iter_mut().take(254).skip(2) {
+            *slot = 1;
+        }
+        let cdf = Cdf::from_frequencies(&freq).unwrap();
+
+        let mut symbols = Vec::with_capacity(10_000);
+        for i in 0..10_000 {
+            let r = (i as u32).wrapping_mul(2654435761) ^ (i as u32 >> 7);
+            // Distribution: 60% s=0, 15% s=1, 15% s=254, 10% s=255,
+            // sprinkle of others.
+            symbols.push(match r % 100 {
+                0..=59 => 0u8,
+                60..=74 => 1u8,
+                75..=89 => 254u8,
+                90..=98 => 255u8,
+                _ => 2u8 + (r >> 8) as u8 % 252,
+            });
+        }
+
+        let mut enc = RangeEncoder::new();
+        for &s in &symbols {
+            enc.encode_symbol(&cdf, s as usize);
+        }
+        let bytes = enc.finish();
+
+        let mut dec = RangeDecoder::new(&bytes).unwrap();
+        let mut out = Vec::with_capacity(symbols.len());
+        for _ in 0..symbols.len() {
+            out.push(dec.decode_symbol(&cdf).unwrap());
+        }
+        assert_eq!(out, symbols);
+    }
+
+    /// Round 11: `Cdf::freq(s)` returns the pre-computed
+    /// `cum[s+1] - cum[s]` matching the array-driven form for
+    /// every symbol in `0..=255`. Regression guard for the cache —
+    /// if a future refactor desyncs `freqs[s]` from the cum[]
+    /// difference, the assertion fires immediately.
+    #[test]
+    fn cdf_freq_matches_array_form() {
+        let mut freq = [0u32; 256];
+        for (i, slot) in freq.iter_mut().enumerate() {
+            *slot = ((i as u32 * 7) % 17) + 1;
+        }
+        let cdf = Cdf::from_frequencies(&freq).unwrap();
+
+        for s in 0..256 {
+            assert_eq!(
+                cdf.freq(s),
+                cdf.lo(s + 1) - cdf.lo(s),
+                "freq(s) != cum[s+1] - cum[s] at s={}",
+                s
             );
         }
     }

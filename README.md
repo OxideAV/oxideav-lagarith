@@ -148,9 +148,39 @@ Bit-identity vs. the generic Step-C path is verified by
 bool cache refactor is regression-guarded by
 `rangecoder_shift_low_started_byte_equiv_to_option`.
 
+Round 11 lands the **Step-C `freqs[]` cache** on the encoder
+side. The §5 Step-C arm dominates whenever the symbol is
+neither `0` nor `255` (the surviving ~5% of post-gradient
+residuals spreads across symbols `1..=254`); for those cases
+the generic update reads `lo = cum[s]` *and* `hi = cum[s+1]`
+*and* computes `hi - lo` before the `range = (hi - lo) * q`
+multiply. Round 11 hoists the subtraction to `from_frequencies`
+time by caching `freqs[s] = cum[s+1] - cum[s]` on the `Cdf`
+struct; the Step-C hot path then loads `lo = cdf.lo(s)` and
+`freq = cdf.freq(s)` in parallel and the `range = freq * q`
+multiply no longer waits on a subtract. On a 65,536-symbol
+Step-C-heavy fixture (99% mid-band symbols `1..=254`, 200 reps,
+release build, macOS aarch64) the round-11 encoder delivers
+**~244 MSym/s vs. ~225 MSym/s** for the round-10 baseline =
+**1.08× speedup** on Step-C-dominant workloads. Step-A and
+Step-B benches stay within run-to-run noise of round 10 (~334
+vs. ~333 MSym/s on Step-A; ~333 vs. ~327 MSym/s on Step-B) —
+the new cache field does not regress the dominant paths.
+Bit-identity vs. the round-10 `cum[]`-array Step-C form is
+verified by `rangecoder_step_c_encode_bit_equiv_to_generic`,
+which encodes the same mid-band stream through both paths and
+asserts byte equality. The `freqs[s]` cache layout itself is
+regression-guarded by `cdf_freq_matches_array_form`. Dedicated
+Step-A1 (`s == 1`) / Step-B1 (`s == 254`) fast paths were
+prototyped and reverted: the extra branches in the hot loop
+regressed the dominant Step-A path more than they helped the
+secondary symbols (the post-gradient Laplacian residual is
+sharp enough that symbols `±1` are an order of magnitude
+rarer than symbol `0`).
+
 ## Tests
 
-121 unit + integration tests cover the range coder, Fibonacci
+126 unit + integration tests cover the range coder, Fibonacci
 prefix, RLE escape, predictor + decorrelation, channel-header
 dispatcher, the channel-header `0x01..=0x03` arithmetic-with-RLE
 path and the `0x05..=0x07` raw-RLE path, an end-to-end encode →

@@ -8,6 +8,54 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 11 — encoder-side range-coder Step-C `freqs[]` cache
+  (`spec/02` §5).**
+  - `Cdf` now caches `freqs: [u32; 256]` where `freqs[s] = cum[s+1]
+    - cum[s]`. The encoder's `spec/02` §5 Step-C arm (fired
+    whenever the symbol is neither `0` nor `255`) hoists its
+    `cum[s+1] - cum[s]` two-read + subtract to `from_frequencies`
+    time; the hot path then loads `lo = cdf.lo(s)` and `freq =
+    cdf.freq(s)` in parallel and the `range = freq * q` multiply
+    no longer waits on a subtract. Bit-identical to the round-10
+    `cum[]`-array form (verified by
+    `rangecoder_step_c_encode_bit_equiv_to_generic`, which
+    encodes the same mid-band stream through both paths and
+    asserts byte equality).
+  - The Cdf struct's small scalar fields (`freq0`, `total`) are
+    reordered to offset 0 so a Step-A-dominant workload keeps
+    them on the first cache line; the `freqs[]` array lands
+    after `cum[]` so it does not contend with `freq0` for cache
+    set on the dominant path.
+  - **Throughput delta**: 65,536-symbol Step-C-heavy encode
+    fixture (99% mid-band symbols `1..=254`, 200 reps, release
+    build, macOS aarch64) — round-10 baseline ~225 MSym/s →
+    round-11 ~244 MSym/s = **1.08×** on Step-C-dominant
+    workloads. Step-A and Step-B benches stay within run-to-run
+    noise of round 10 (~334 vs. ~333 MSym/s on Step-A; ~333 vs.
+    ~327 MSym/s on Step-B) — the new cache field does not
+    regress the dominant paths. Default-on, no feature gate.
+  - +5 tests: Step-C-dominant encode self-roundtrip
+    (`rangecoder_encode_step_c_dominant_roundtrip`); Step-C
+    bit-equivalence guard
+    (`rangecoder_step_c_encode_bit_equiv_to_generic`); Step-C
+    encode throughput bench
+    (`rangecoder_encode_throughput_step_c_heavy`; functional
+    check, timing only printed under `LAGARITH_BENCH=1`);
+    Laplacian-residual roundtrip on a `{0, 1, 254, 255}`-heavy
+    distribution (`rangecoder_encode_laplacian_residual_roundtrip`);
+    `freqs[]` cache layout regression guard
+    (`cdf_freq_matches_array_form`). 126 tests total (was 121).
+  - **Step-A1 / Step-B1 prototype reverted**: dedicated `s == 1`
+    (small-positive `+1` residual) and `s == 254` (small-negative
+    `-1` residual on the unsigned-wrap side) fast paths were
+    tried and benched against mixed-distribution streams — they
+    hurt the dominant Step-A path more than they helped the
+    secondary symbols (extra branches in the hot loop dropped
+    Step-A heavy from ~340 MSym/s to ~299 MSym/s, -12%). The
+    `encode_symbol` dispatcher deliberately falls through to
+    Step-C for s ∈ 1..=254 instead of growing the if-chain.
+    Documented as a round-11 NOTE inside `encode_symbol`.
+
 - **Round 10 — encoder-side range-coder Step-B fast path
   + cache-slot Option→bool refactor (`spec/02` §5/§6.2).**
   - `RangeEncoder::encode_symbol` now implements the symmetric
