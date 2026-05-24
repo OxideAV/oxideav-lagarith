@@ -7,7 +7,10 @@ Pure-Rust Lagarith lossless video codec for the
 
 **Rounds 1..5 — arithmetic-coded RGB / YV12 / YUY2 + NULL-frame
 replay + reduced-resolution + legacy RGB (type 7) with Rule B
-first-column predictor + RLE-then-Fibonacci channel sub-path.**
+first-column predictor + RLE-then-Fibonacci channel sub-path.
+Round 124 — modern RGB(A) first-column predictor corrected to
+**Rule B** (was Rule A), byte-exact against the independent ffmpeg
+`lagarith` decoder for power-of-two-pixel RGB24/RGB32/RGBA frames.**
 This `master` branch is the clean-room rebuild against the
 strict-isolation cleanroom workspace at
 [`docs/video/lagarith/`](https://github.com/OxideAV/docs/tree/master/video/lagarith).
@@ -53,10 +56,14 @@ but is forbidden input.
    loaded from `tables/01-residual-rle-decoder-lut.csv`.
 6. **Spatial predictor** ([`spec/03` §3](https://github.com/OxideAV/docs/blob/master/video/lagarith/spec/03-channel-decorrelation-and-predictors.md)):
    left predictor on row 0; JPEG-LS clamped median on rows ≥ 1.
-   The first-column-of-row rule depends on frame type — modern
-   types (2/4/8/10/11) use **Rule A** (`TL = L = plane[y-1][W-1]`);
-   the legacy type-7 path uses **Rule B**
-   (`TL = plane[y-2][W-1]` for `y ≥ 2`) per `spec/07` §9.1 item 7b.
+   The first-column-of-row rule is **Rule B**
+   (`TL = plane[y-2][W-1]` for `y ≥ 2`, Rule A fallback at `y = 1`)
+   for the modern RGB(A) types (2/4/8) and the legacy type-7 path
+   alike (`spec/06` §3.2 / `spec/07` §9.1 item 7b). Rule B was
+   confirmed for the modern types byte-exactly against the
+   independent ffmpeg `lagarith` decoder (round 124); the prior
+   Rule A choice mis-decoded real streams. YV12/YUY2 retain Rule A
+   pending a clean ffmpeg pin.
 7. **Cross-plane decorrelation** ([`spec/03` §4](https://github.com/OxideAV/docs/blob/master/video/lagarith/spec/03-channel-decorrelation-and-predictors.md)):
    RGB families only — `R += G; B += G` post-prediction; alpha is
    stored raw.
@@ -211,7 +218,7 @@ type-7 stream still awaits a fixture oracle
 
 ## Tests
 
-129 unit + integration tests cover the range coder, Fibonacci
+132 unit + integration tests cover the range coder, Fibonacci
 prefix, RLE escape, predictor + decorrelation, channel-header
 dispatcher, the channel-header `0x01..=0x03` arithmetic-with-RLE
 path and the `0x05..=0x07` raw-RLE path, an end-to-end encode →
@@ -227,29 +234,43 @@ worked-example boundary shifts, and length-correct decode through
 both the channel decoder and `decode_frame` — the YUY2
 odd-width floor-chroma layout (audit/00 §9.4), and the NULL-frame
 ("JUMP") replay path through both the `Decoder` wrapper and the
-`decode_frame_with_prev` helper.
+`decode_frame_with_prev` helper, and (round 124) three
+**ffmpeg-cross-validated** byte-exact pins for the modern
+arithmetic RGB24 (8×8, 16×16) and RGBA (16×16) paths
+([`tests/ffmpeg_pins.rs`](tests/ffmpeg_pins.rs)).
 
-### SIMD-vs-scalar predictor (`spec/06` §3.5)
+### SIMD-vs-scalar predictor (`spec/06` §3.2)
 
-For frame types 2 / 4 / 8 / 10 / 11 the crate's predictor
-implements **Rule A / Strategy A** (`TL = L = plane[y-1][W-1]`
-for every row `y >= 1`, per `spec/06` §3.6), which is
+For frame types 2 / 4 / 8 the crate's predictor implements
+**Rule B** (`TL = plane[y-2][W-1]` for `y >= 2`, Rule A fallback
+at `y = 1`, per `spec/06` §3.2), the linear-memory walk
 *carry-equivalent* to the proprietary's SIMD inner-loop. No
-separate SIMD code path is therefore required for byte-
-equivalent output on these types.
+separate SIMD code path is required for byte-equivalent output.
+Frame type 7 (legacy RGB) uses the same Rule B (`spec/07` §9.1
+item 7b). YV12 (type 10) / YUY2 (type 3) / reduced-resolution
+(type 11) retain Rule A pending a clean ffmpeg pin (their planar
+scan order interacts with the DIB flip differently — see
+"Cross-decoder validation" below).
 
-For frame type 7 (legacy RGB) the predictor uses **Rule B**
-(`TL = plane[y-2][W-1]` for `y >= 2`, falls back to Rule A for
-`y = 1`) per `spec/07` §9.1 item 7b, mirroring the proprietary's
-linear-memory walk through the SIMD predictor on the legacy
-path.
+### Cross-decoder validation — ffmpeg black-box oracle
 
-### Byte-exact encoder validation — SPECGAP
+Round 124 closes the long-standing byte-exact-validation SPECGAP
+for the modern RGB(A) path. ffmpeg ships a `lagarith` **decoder**
+(no encoder), so the crate's own encoder output is wrapped in a
+minimal `LAGS`-coded AVI and decoded by `ffmpeg -f rawvideo`; for
+every power-of-two-pixel-count RGB24 / RGB32 / RGBA frame tested,
+ffmpeg reproduces the original pixels byte-for-byte (after the
+positive-`biHeight` bottom-up flip). This independently confirms
+the wire format and resolved the open audit/01 §9.1 first-column
+dispatch question in favour of **Rule B** — the prior Rule A
+choice mis-decoded these streams in ffmpeg. The committed pins in
+`tests/ffmpeg_pins.rs` run in CI without ffmpeg.
 
-Rounds 1..4 continue the self-roundtrip-only contract. Byte-exact
-validation against the proprietary encoder requires either a
-proprietary-encoded AVI fixture (we don't carry one in tree —
-`docs/video/lagarith/reference/binaries/` only holds the DLL
-black-box, not encoded video) or an AVI sample from
-`samples.oxideav.org` (returned HTTP 404 at the time of round 4).
-This is an Auditor concern for a future round.
+Open items (out of scope for round 124, no GitHub issue per
+workspace policy): (a) non-power-of-two pixel counts expose a
+range-coder framing divergence vs ffmpeg in the modern path;
+(b) YV12 / YUY2 planar scan-order vs the DIB flip needs a clean
+ffmpeg pin; (c) ffmpeg does not implement the type-1 Uncompressed
+path, so it cannot oracle that type. Byte-exact parity against a
+*proprietary-encoded* AVI still awaits a fixture
+(`samples.oxideav.org/lagarith/`, 404 per audit/04 §5).

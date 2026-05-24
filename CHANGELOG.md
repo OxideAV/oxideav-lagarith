@@ -6,7 +6,32 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Round 124 — modern arithmetic RGB(A) first-column predictor
+  corrected from Rule A to Rule B.** The modern RGB24 / RGB32
+  (types 2 / 4) and RGBA (type 8) decode + encode paths now use
+  the **Rule B** first-column-of-row predictor
+  (`TL = plane[y-2][W-1]` for `y >= 2`, `spec/06` §3.2) instead of
+  Rule A. The cleanroom's audit/01 §9.1 had left the Rule A vs
+  Rule B dispatch open because a horizontal-ramp fixture makes the
+  two rules degenerate (first column constant ⇒ `TL == T`). A
+  black-box differential decode against the independent ffmpeg
+  `lagarith` decoder — feeding it `LAGS`-wrapped frames built under
+  each rule — resolves it: ffmpeg reproduces the original pixels
+  byte-exactly only for Rule B encodes (every power-of-two
+  pixel-count RGB24 / RGB32 / RGBA frame tested). The prior Rule A
+  decode produced wrong pixels for real Lagarith RGB streams.
+
 ### Added
+
+- **Round 124 — ffmpeg cross-decoder byte-exact pins.**
+  `tests/ffmpeg_pins.rs` commits three RGB24 (8×8, 16×16) and RGBA
+  (16×16) frames produced by the crate encoder and verified to
+  decode to their original pixels through ffmpeg's `lagarith`
+  decoder (used purely as a black-box oracle). The pins are
+  committed so the regression runs in CI without ffmpeg; they
+  guard against any reversion of the modern path back to Rule A.
 
 - **Round 96 — pair-packed 513-entry CDF decode path (legacy
   type 7, `spec/07` §3.1 + §3.4 audit-corrected; audit/12 §7.1

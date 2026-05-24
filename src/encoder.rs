@@ -161,10 +161,14 @@ pub fn encode_arith_rgb24(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
     // Cross-plane decorrelation (forward).
     cross_plane_decorrelate_rgb_forward(&mut plane_b, &plane_g, &mut plane_r);
 
-    // Spatial predictor (forward).
-    let res_b = apply_plane_forward(&plane_b, width as usize, height as usize);
-    let res_g = apply_plane_forward(&plane_g, width as usize, height as usize);
-    let res_r = apply_plane_forward(&plane_r, width as usize, height as usize);
+    // Spatial predictor (forward) — **Rule B** first-column-of-row,
+    // matching the decoder (ffmpeg-confirmed; see `decode_arith_rgb`).
+    let res_b =
+        apply_plane_forward_with_rule(&plane_b, width as usize, height as usize, FirstColRule::B);
+    let res_g =
+        apply_plane_forward_with_rule(&plane_g, width as usize, height as usize, FirstColRule::B);
+    let res_r =
+        apply_plane_forward_with_rule(&plane_r, width as usize, height as usize, FirstColRule::B);
 
     // Per-channel encode.
     let ch_b = encode_channel_simple(&res_b);
@@ -676,10 +680,15 @@ pub fn encode_arith_rgba(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
 
     cross_plane_decorrelate_rgb_forward(&mut plane_b, &plane_g, &mut plane_r);
 
-    let res_b = apply_plane_forward(&plane_b, width as usize, height as usize);
-    let res_g = apply_plane_forward(&plane_g, width as usize, height as usize);
-    let res_r = apply_plane_forward(&plane_r, width as usize, height as usize);
-    let res_a = apply_plane_forward(&plane_a, width as usize, height as usize);
+    // **Rule B** first-column-of-row, matching the decoder.
+    let res_b =
+        apply_plane_forward_with_rule(&plane_b, width as usize, height as usize, FirstColRule::B);
+    let res_g =
+        apply_plane_forward_with_rule(&plane_g, width as usize, height as usize, FirstColRule::B);
+    let res_r =
+        apply_plane_forward_with_rule(&plane_r, width as usize, height as usize, FirstColRule::B);
+    let res_a =
+        apply_plane_forward_with_rule(&plane_a, width as usize, height as usize, FirstColRule::B);
 
     let ch_b = encode_channel_simple(&res_b);
     let ch_g = encode_channel_simple(&res_g);

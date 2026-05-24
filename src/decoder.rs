@@ -325,9 +325,38 @@ fn decode_arith_rgb(
     let mut plane_g = decode_channel(slices[1], n_pixels)?; // wire "G" -> output +1 (G)
     let mut plane_r = decode_channel(slices[2], n_pixels)?; // wire "B" -> output +2 (R)
 
-    apply_plane_inverse(&mut plane_b, width as usize, height as usize);
-    apply_plane_inverse(&mut plane_g, width as usize, height as usize);
-    apply_plane_inverse(&mut plane_r, width as usize, height as usize);
+    // First-column-of-row rule: **Rule B** (`TL = plane[y-2][W-1]`
+    // for `y >= 2`). This is the `spec/06` §3.2 "linear-memory TL"
+    // rule the proprietary's SIMD predictor walks; it is shared by
+    // the modern RGB(A) arithmetic path. The audit/01 §9.1 dispatch
+    // question (Rule A vs Rule B) was open in the cleanroom because
+    // a horizontal-ramp fixture makes the two rules degenerate (the
+    // first column is constant down its column, so `TL == T` and
+    // both rules reduce to `T`). A black-box differential decode
+    // against the independent ffmpeg `lagarith` decoder — fed our
+    // own `LAGS`-wrapped frames built under each rule — resolves it:
+    // ffmpeg reproduces the original pixels byte-exactly only for
+    // **Rule B** encodes (every power-of-two pixel-count RGB24 /
+    // RGB32 / RGBA frame tested). Rule A mis-decodes the same
+    // streams. See `tests/ffmpeg_pins.rs`.
+    apply_plane_inverse_with_rule(
+        &mut plane_b,
+        width as usize,
+        height as usize,
+        FirstColRule::B,
+    );
+    apply_plane_inverse_with_rule(
+        &mut plane_g,
+        width as usize,
+        height as usize,
+        FirstColRule::B,
+    );
+    apply_plane_inverse_with_rule(
+        &mut plane_r,
+        width as usize,
+        height as usize,
+        FirstColRule::B,
+    );
 
     // `spec/03` §4: wire stores R-G and B-G. Output positions +0 and
     // +2 had G subtracted; restore via += G. Output position +1 (G)
@@ -377,10 +406,32 @@ fn decode_arith_rgba(
     let mut plane_r = decode_channel(slices[2], n_pixels)?; // wire B -> output +2 = R
     let mut plane_a = decode_channel(slices[3], n_pixels)?;
 
-    apply_plane_inverse(&mut plane_b, width as usize, height as usize);
-    apply_plane_inverse(&mut plane_g, width as usize, height as usize);
-    apply_plane_inverse(&mut plane_r, width as usize, height as usize);
-    apply_plane_inverse(&mut plane_a, width as usize, height as usize);
+    // **Rule B** first-column-of-row predictor — ffmpeg-confirmed for
+    // the modern RGBA arithmetic path; see `decode_arith_rgb`.
+    apply_plane_inverse_with_rule(
+        &mut plane_b,
+        width as usize,
+        height as usize,
+        FirstColRule::B,
+    );
+    apply_plane_inverse_with_rule(
+        &mut plane_g,
+        width as usize,
+        height as usize,
+        FirstColRule::B,
+    );
+    apply_plane_inverse_with_rule(
+        &mut plane_r,
+        width as usize,
+        height as usize,
+        FirstColRule::B,
+    );
+    apply_plane_inverse_with_rule(
+        &mut plane_a,
+        width as usize,
+        height as usize,
+        FirstColRule::B,
+    );
 
     cross_plane_decorrelate_rgb(&mut plane_b, &plane_g, &mut plane_r);
     // Alpha plane has no cross-plane decorrelation per `spec/03`

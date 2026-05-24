@@ -10,24 +10,39 @@
 //!
 //! The MED predictor needs `TL` for column 0 of row `y >= 1`, which
 //! has no immediate left neighbour. Two rules apply per `spec/06`
-//! §3.6 / `spec/07` §9.1 item 7b:
+//! §3.2 / `spec/07` §9.1 item 7b:
 //!
 //! - **Rule A** (`TL = L = plane[y-1][W-1]`): the simple "wrap
-//!   around" rule the modern coder of `spec/06` uses; the gradient
-//!   collapses to `T`. Used by frame types 2 / 4 / 8 / 10 / 11.
+//!   around" rule; the gradient collapses to `T`. Not used by any
+//!   frame type the decoder ships — retained for tests and for the
+//!   degenerate `y == 1` fallback of Rule B.
 //! - **Rule B** (`TL = plane[y-2][W-1]` for `y >= 2`): the
-//!   linear-memory rule that the proprietary's SIMD predictor walks
-//!   one step further back. Used by frame type 7 (legacy RGB) per
-//!   `spec/07` §9.1 item 7b. For `y == 1` Rule B falls back to Rule
-//!   A because there is no `y - 2` row.
+//!   linear-memory rule the proprietary's SIMD predictor walks one
+//!   step further back. This is the rule the **modern arithmetic
+//!   RGB(A)** path (types 2 / 4 / 8) uses, as well as the legacy
+//!   type-7 RGB path (`spec/07` §9.1 item 7b). For `y == 1` Rule B
+//!   falls back to Rule A because there is no `y - 2` row.
+//!
+//! Rule B for the modern types was confirmed against the independent
+//! ffmpeg `lagarith` decoder (black-box oracle): `LAGS`-wrapped
+//! frames built under Rule B decode to the original pixels
+//! byte-exactly in ffmpeg, whereas Rule A mis-decodes them. This
+//! resolves the cleanroom's open audit/01 §9.1 dispatch question — a
+//! horizontal-ramp fixture makes the two rules degenerate (first
+//! column constant ⇒ `TL == T`), so the static analysis could not
+//! distinguish them. See `tests/ffmpeg_pins.rs`.
 
 /// Selects the first-column-of-row rule for the inverse predictor.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum FirstColRule {
-    /// `TL = L = plane[y-1][W-1]`. Modern coder (types 2/4/8/10/11).
+    /// `TL = L = plane[y-1][W-1]`. Degenerate "wrap-around" rule;
+    /// not used by any shipping decode path (kept for tests + the
+    /// `y == 1` fallback of Rule B).
     A,
     /// `TL = plane[y-2][W-1]` for `y >= 2` (Rule A for `y == 1`).
-    /// Legacy type-7 path per `spec/07` §9.1 item 7b.
+    /// The modern arithmetic RGB(A) path (types 2/4/8) and the
+    /// legacy type-7 path both use this (`spec/06` §3.2 /
+    /// `spec/07` §9.1 item 7b; ffmpeg-confirmed for the modern path).
     B,
 }
 
