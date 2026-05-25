@@ -6,6 +6,67 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Round 138 (encoder round 14) — per-channel header-form
+  selection (`encode_channel_best`) covering all 8 wire forms
+  the dispatcher accepts (`spec/03` §2.1, `spec/06` §1.7 + §2.7).**
+  The new selector encodes the plane through every legal form
+  (`0xff` solid-fill, `0x00` Fibonacci+arith, `0x01..0x03`
+  Fibonacci+arith+pre-RLE, `0x04` raw memcpy, `0x05..0x07`
+  raw+RLE) and returns the shortest. Headers `0x05..0x07` are
+  new on the encoder side, exposed via the standalone
+  `encode_channel_raw_rle` primitive; headers `0x01..0x03` were
+  already implemented in `encode_channel_arith_rle` but were not
+  in the auto-selection set. The `spec/06` §1.5 fall-back rule
+  (pre-RLE count `>= n_pixels`) is enforced — illegal candidates
+  are skipped, never emitted.
+
+  Rationale: the proprietary encoder at `lagarith.dll!0x18000c500`
+  picks between these forms per-channel (`spec/06` §2.8). The
+  cleanroom encoder cannot reproduce the proprietary heuristic
+  byte-exactly without the disassembled selector (out of scope —
+  the byte-exact path is the Auditor-blocked probability-loader
+  question), but a candidate-enumerate-then-min selector is
+  guaranteed-legal *and* guaranteed-shortest per the spec's wire-
+  format invariants: a decoder reads byte 0, routes to the matching
+  sub-path, and recovers the same plane regardless of which form
+  the encoder picked. Replacing `encode_channel_simple` with
+  `encode_channel_best` in frame-encoder call sites cannot regress
+  self-roundtrip correctness; it can only shorten output.
+
+  Measured size delta on a representative post-gradient residual
+  fixture (1900 zeros + 100 Laplacian-tail non-zero bytes, the
+  canonical Lagarith profile per `spec/06` §6.4): the round-13
+  `encode_channel_simple` produces 143 bytes; `encode_channel_best`
+  produces 90 bytes (header `0x01`, arith+RLE at escape_len=1) =
+  **37% smaller**. The frame-encoder call sites continue to use
+  `encode_channel_simple` for now — flipping each frame type
+  individually is the next bounded step once a per-frame-type
+  benchmark fixture is wired so the size-delta can be measured per
+  type rather than per channel.
+
+  Five new tests cover:
+  * `best_never_larger_than_simple` — the candidate-min selector
+    cannot produce a longer wire than the 2-candidate selector
+    (`encode_channel_simple`) across the fixture set, by
+    construction.
+  * `best_roundtrips_through_decoder` — every selected wire form
+    decodes back to the input plane via the existing
+    `decode_channel` dispatcher.
+  * `best_picks_rle_form_on_zero_heavy_plane` — on the canonical
+    95%-zero residual the selector picks `0x01..0x07` (RLE-bearing),
+    never raw `0x04`.
+  * `best_beats_raw_on_flat_with_zero_runs` — on a flat histogram
+    with a single moderate zero run, the selector beats raw `0x04`
+    by routing through `0x05..0x07`.
+  * `best_size_delta_on_residual_profile` — pins the >= 10% gain
+    measured above so a future Fibonacci-prefix or rescale rework
+    can't silently regress the new selector below the no-RLE
+    baseline.
+  * `raw_rle_channel_roundtrips` — the new `encode_channel_raw_rle`
+    primitive roundtrips at every `escape_len ∈ {1, 2, 3}`.
+
 ### Changed
 
 - **Round 135 (encoder round 13) — modern probability-model write

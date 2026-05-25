@@ -219,6 +219,39 @@ and asserts byte equality. The Step-A / Step-B / Step-C
 benches are unchanged (the round-12 change only affects
 `finish()`).
 
+Round 14 lands **per-channel header-form selection
+(`encode_channel_best`)**: the encoder now considers every wire
+form the decoder dispatcher accepts (`spec/03` §2.1 + `spec/06`
+§1.7) — `0xff` solid-fill, `0x00` Fibonacci+arith, `0x01..0x03`
+Fibonacci+arith with pre-RLE contraction, `0x04` raw memcpy, and
+`0x05..0x07` raw bytes with RLE post-processing — encodes the
+plane through each legal one, and returns the shortest. Headers
+`0x05..0x07` are new on the encoder side (exposed as
+`encode_channel_raw_rle`); headers `0x01..0x03` were already
+implemented in `encode_channel_arith_rle` but were not in the
+auto-selection set. The `spec/06` §1.5 fall-back rule (pre-RLE
+count `>= n_pixels` reverts dispatcher to header-`0x00`
+semantics) is enforced — illegal candidates are skipped, never
+emitted. Picking among legal forms is purely an encoder choice:
+a decoder reads byte 0, routes to the matching sub-path, and
+recovers the same plane regardless. So replacing
+`encode_channel_simple` with `encode_channel_best` cannot regress
+self-roundtrip correctness; it can only shrink output. On a
+representative post-gradient Lagarith residual (1900 zeros + 100
+Laplacian-tail non-zero bytes, the canonical profile per
+`spec/06` §6.4) the round-14 selector produces **90 bytes vs.
+143 bytes** for the round-13 two-candidate selector
+(`encode_channel_simple`, headers `0x00` / `0x04` only) =
+**37% smaller wire**, with header `0x01` (arith + RLE escape_len=1)
+winning. The frame-encoder call sites continue to use
+`encode_channel_simple` for now — flipping each frame type
+individually is the next bounded step once a per-frame-type
+benchmark fixture is wired so the size-delta can be measured per
+frame type rather than per channel. The new fixture-based
+selector tests cover every selected form's roundtrip, the
+zero-heavy / flat-with-runs pinned preferences, the never-larger-
+than-simple invariant, and the 10%+ measured gain.
+
 Round 13 lands the **modern probability-model write path**: the
 per-channel encode now rescales the raw byte-histogram so the
 **transmitted total stays inside the coder's `q >= 1` operating
@@ -277,7 +310,7 @@ type-7 stream still awaits a fixture oracle
 
 ## Tests
 
-138 unit + integration tests cover the range coder, Fibonacci
+149 unit + integration tests cover the range coder, Fibonacci
 prefix, RLE escape, predictor + decorrelation, channel-header
 dispatcher, the channel-header `0x01..=0x03` arithmetic-with-RLE
 path and the `0x05..=0x07` raw-RLE path, an end-to-end encode →
