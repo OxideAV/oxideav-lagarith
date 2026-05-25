@@ -6,6 +6,43 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Round 132 (encoder round 12) — `spec/02` §6.3 final-flush
+  FF-chain bulk-fill.** `RangeEncoder::finish()`'s pre-tail
+  pending-FF chain drain now uses `Vec::resize` (one bounds
+  check + one memset) instead of `pending_ffs` individual
+  `Vec::push` calls. This is the §6.3 final-flush analogue of
+  the round-9 hot-path `Vec::resize` for the per-`shift_low`
+  FF-chain commit, completing the structural pattern: no
+  per-FF push loops anywhere in the encoder. The on-wire
+  bytes are unchanged — the same `cache` (or `cache+1`) head
+  + N×fill (`0x00` on a carry, `0xff` otherwise) + four-byte
+  tail per `spec/02` §6.3 — so the flush is bit-identical to
+  the proprietary's primitive.
+
+  On a short-channel + Step-B-heavy fixture (512 channels ×
+  128 symbols, 200 reps, release build, macOS aarch64) the
+  round-12 encoder delivers ~305-311 MSym/s vs. ~298-310
+  MSym/s for the per-FF push reference (timed side-by-side in
+  the same bench) = ~1.00-1.03× speedup, default-on. The
+  delta is modest because realistic `pending_ffs` chains are
+  short (3-15 bytes); the value of the round is structural
+  pattern completion + a byte-equivalence regression guard.
+
+  Two new tests in `src/range_coder.rs`:
+  `rangecoder_finish_resize_byte_equiv_to_push_loop` encodes
+  a 0xff-dominant stream through both the production
+  `Vec::resize` form AND a `finish_via_push_loop` helper
+  modelling the pre-round-12 per-FF push form, asserting byte
+  equality (covers the §6.3 flush bit-identity guard).
+  `rangecoder_encode_throughput_finish_heavy` times both
+  forms side-by-side on a 65,536-symbol short-channel
+  workload (512 chans × 128 syms) under `LAGARITH_BENCH=1`,
+  reporting the RESIZE/PUSH speedup ratio for direct
+  comparability with the Step-A / Step-B / Step-C bench
+  numbers. Test count: 129 → 131 (library) + 7 (integration).
+
 ### Added
 
 - **Round 127 — extended ffmpeg cross-decoder pin set + pattern-

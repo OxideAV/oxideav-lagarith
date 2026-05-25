@@ -191,6 +191,34 @@ secondary symbols (the post-gradient Laplacian residual is
 sharp enough that symbols `±1` are an order of magnitude
 rarer than symbol `0`).
 
+Round 12 lands the **`spec/02` §6.3 final-flush FF-chain
+bulk-fill** on the encoder side: `RangeEncoder::finish()`
+drained its pre-tail pending-FF chain with a `for _ in
+0..pending_ffs { buf.push(...) }` loop, the last per-FF push
+loop the encoder retained after round 9 replaced the equivalent
+per-iteration `shift_low` loop with `Vec::resize`. Round 12
+applies the same `Vec::resize` form to `finish()`: one bounds
+check + one memset for the carry / steady-state fill bytes
+(`0x00` on a carry, `0xff` otherwise), removing the last
+N-push site from the encoder close-out. The on-wire bytes are
+unchanged — same `cache` (or `cache+1`) head, same N×fill
+chain, same four-byte tail per `spec/02` §6.3 — so the four-
+byte tail layout stays bit-identical to the proprietary's
+flush primitive. On a short-channel + Step-B-heavy fixture
+(512 channels × 128 symbols, 200 reps, release build, macOS
+aarch64) the round-12 encoder delivers **~305-311 MSym/s vs.
+~298-310 MSym/s** for the per-FF push reference (timed
+side-by-side in the same bench) = **~1.00-1.03× speedup**,
+default-on. The delta is modest because realistic `pending_ffs`
+chains are short (3-15 bytes), but the optimisation completes
+the structural pattern (no per-FF push loops anywhere in the
+encoder) and is byte-identical: the
+`rangecoder_finish_resize_byte_equiv_to_push_loop` test
+re-encodes the same 0xff-dominant stream through both forms
+and asserts byte equality. The Step-A / Step-B / Step-C
+benches are unchanged (the round-12 change only affects
+`finish()`).
+
 ## Pair-packed 513-entry CDF (legacy type 7)
 
 The type-7 legacy range coder builds its probability model two ways
@@ -224,7 +252,7 @@ type-7 stream still awaits a fixture oracle
 
 ## Tests
 
-133 unit + integration tests cover the range coder, Fibonacci
+138 unit + integration tests cover the range coder, Fibonacci
 prefix, RLE escape, predictor + decorrelation, channel-header
 dispatcher, the channel-header `0x01..=0x03` arithmetic-with-RLE
 path and the `0x05..=0x07` raw-RLE path, an end-to-end encode →

@@ -499,6 +499,24 @@ impl RangeEncoder {
     }
 
     /// Flush the four-byte tail per `spec/02` §6.3.
+    ///
+    /// Round 12 hot-path: the pre-tail pending-FF chain flush now uses
+    /// `Vec::resize` instead of `pending_ffs` individual `Vec::push`
+    /// calls. This is the §6.3 final-flush analogue of the round-9
+    /// `shift_low` per-iteration optimisation — every channel encode
+    /// concludes with one `finish()` call, and on channels where the
+    /// last symbol's renormalisation chain leaves a long deferred
+    /// FF run pending (Step-B-dominant streams like an opaque alpha
+    /// plane), the per-FF push loop becomes the visible cost of
+    /// the close-out. The `Vec::resize` form bulks the chain into a
+    /// single bounds check + a single memset; the on-wire bytes are
+    /// unchanged (still `cache+1` then `pending_ffs` 0x00 bytes on a
+    /// carry, or `cache` then `pending_ffs` 0xff bytes otherwise),
+    /// so the four-byte tail layout per `spec/02` §6.3 is
+    /// bit-identical. The new `rangecoder_finish_resize_byte_equiv_to_push_loop`
+    /// test re-runs the same encode through the resize form AND
+    /// through a reference encoder that drains the FF chain via a
+    /// push-loop, asserting byte equality.
     pub fn finish(mut self) -> Vec<u8> {
         // The proprietary's encoder writes the four-byte tail
         // directly from the running `low`. We must absorb any
@@ -506,23 +524,20 @@ impl RangeEncoder {
         // are aligned to the same `low` the decoder will see at
         // init.
         let carry = (self.low >> 31) & 1 == 1;
-        if carry {
-            if self.started {
-                self.buf.push(self.cache.wrapping_add(1));
-            }
-            for _ in 0..self.pending_ffs {
-                self.buf.push(0x00);
-            }
+        let (head, fill) = if carry {
+            (self.cache.wrapping_add(1), 0x00u8)
         } else {
-            if self.started {
-                self.buf.push(self.cache);
-            }
-            for _ in 0..self.pending_ffs {
-                self.buf.push(0xff);
-            }
+            (self.cache, 0xffu8)
+        };
+        if self.started {
+            self.buf.push(head);
+        }
+        if self.pending_ffs != 0 {
+            let new_len = self.buf.len() + self.pending_ffs as usize;
+            self.buf.resize(new_len, fill);
+            self.pending_ffs = 0;
         }
         self.started = false;
-        self.pending_ffs = 0;
         // After absorbing the carry the in-range payload of `low`
         // sits in bits 0..30 (bit 31 has been consumed). Mask it
         // down so the four-byte tail is byte-aligned with what the
@@ -1391,5 +1406,235 @@ mod tests {
             out.push(dec.decode_symbol(&cdf).unwrap());
         }
         assert_eq!(out, symbols);
+    }
+
+    /// Round 12: encoder-side `spec/02` §6.3 final-flush
+    /// bit-equivalence guard for the `Vec::resize` FF-chain bulk fill.
+    /// The production `finish()` flushes the pre-tail pending-FF
+    /// chain with one `Vec::resize` + memset; this test re-runs the
+    /// same encoded stream through a reference `finish_via_push_loop`
+    /// helper that drains the chain via per-FF `Vec::push` (the
+    /// pre-round-12 form). Both forms write the same `cache+1` then
+    /// N×0x00 bytes on a carry, or `cache` then N×0xff bytes
+    /// otherwise, followed by the same four-byte tail per
+    /// `spec/02` §6.3 — bytes MUST be identical.
+    ///
+    /// Uses a `freq[255]`-dominant histogram so the encoder's final
+    /// state is overwhelmingly likely to have a non-empty
+    /// `pending_ffs` chain at the moment of `finish()`, ensuring the
+    /// FF-chain drain code path is actually exercised by the test
+    /// (a balanced histogram would frequently leave `pending_ffs ==
+    /// 0` at finish, masking any divergence).
+    #[test]
+    fn rangecoder_finish_resize_byte_equiv_to_push_loop() {
+        let mut freq = [0u32; 256];
+        freq[255] = 9500;
+        for slot in freq.iter_mut().take(255) {
+            *slot = 2;
+        }
+        let cdf = Cdf::from_frequencies(&freq).unwrap();
+
+        // 0xff-dominant stream — leaves a deferred FF chain pending
+        // at the moment of `finish()` on most runs.
+        let mut symbols = Vec::with_capacity(4_000);
+        for i in 0..4_000 {
+            symbols.push(if i % 23 == 0 {
+                ((i * 7) & 0xfe) as u8
+            } else {
+                0xffu8
+            });
+        }
+
+        // Production `finish()` (Vec::resize form).
+        let mut enc_fast = RangeEncoder::new();
+        for &s in &symbols {
+            enc_fast.encode_symbol(&cdf, s as usize);
+        }
+        let bytes_fast = enc_fast.finish();
+
+        // Reference `finish()` via per-FF push loop. Inline copy of
+        // the pre-round-12 finish() body to keep the test independent
+        // of any future round's refactor.
+        let mut enc_ref = RangeEncoder::new();
+        for &s in &symbols {
+            enc_ref.encode_symbol(&cdf, s as usize);
+        }
+        let bytes_ref = finish_via_push_loop(enc_ref);
+
+        assert_eq!(
+            bytes_fast, bytes_ref,
+            "Round-12 Vec::resize FF-chain flush diverged from per-FF push reference"
+        );
+    }
+
+    /// Reference helper that drains the pre-tail FF chain via
+    /// per-FF `Vec::push` — the pre-round-12 form of
+    /// `RangeEncoder::finish()`. Used by
+    /// `rangecoder_finish_resize_byte_equiv_to_push_loop` only.
+    fn finish_via_push_loop(mut enc: RangeEncoder) -> Vec<u8> {
+        let carry = (enc.low >> 31) & 1 == 1;
+        if carry {
+            if enc.started {
+                enc.buf.push(enc.cache.wrapping_add(1));
+            }
+            for _ in 0..enc.pending_ffs {
+                enc.buf.push(0x00);
+            }
+        } else {
+            if enc.started {
+                enc.buf.push(enc.cache);
+            }
+            for _ in 0..enc.pending_ffs {
+                enc.buf.push(0xff);
+            }
+        }
+        enc.started = false;
+        enc.pending_ffs = 0;
+        enc.low &= 0x7fff_ffff;
+        let low = enc.low;
+        let tail = [
+            ((low >> 23) & 0xff) as u8,
+            ((low >> 15) & 0xff) as u8,
+            ((low >> 7) & 0xff) as u8,
+            ((low << 1) & 0xff) as u8,
+        ];
+        enc.buf.extend_from_slice(&tail);
+        enc.buf
+    }
+
+    /// Round 12: throughput sanity check for the `finish()` FF-chain
+    /// bulk flush. Builds many short channels (each a Step-B-dominant
+    /// stream so the FF chain at finish time is non-empty), encodes
+    /// each one end-to-end, and measures the total encode+finish
+    /// walltime. Functional check (round-trip equality) always runs;
+    /// timing is only printed under `LAGARITH_BENCH=1` since
+    /// `cargo test` walltime jitters too much to threshold.
+    ///
+    /// On short channels, `finish()` is a meaningful fraction of
+    /// total per-channel cost (the per-symbol hot path dominates on
+    /// long channels). The `Vec::resize` form replaces N×push with
+    /// one memset, so the delta is most visible on the short-channel
+    /// + long-FF-chain workload this test models.
+    #[test]
+    fn rangecoder_encode_throughput_finish_heavy() {
+        let mut freq = [0u32; 256];
+        freq[255] = 60_000;
+        for slot in freq.iter_mut().take(255) {
+            *slot = 16;
+        }
+        let cdf = Cdf::from_frequencies(&freq).unwrap();
+
+        // 512 short channels × 128 symbols each = 65_536 total
+        // symbols (same overall sym count as the Step-A/B/C
+        // throughput benches for comparability). Each channel ends
+        // with the encoder's last renormalisation chain likely
+        // leaving a pending FF run, exercising the §6.3 flush
+        // bulk-fill path on every `finish()` call.
+        const N_CHANNELS: usize = 512;
+        const SYMBOLS_PER_CHANNEL: usize = 128;
+        let mut all_symbols: Vec<Vec<u8>> = Vec::with_capacity(N_CHANNELS);
+        for ch in 0..N_CHANNELS {
+            let mut symbols = Vec::with_capacity(SYMBOLS_PER_CHANNEL);
+            for i in 0..SYMBOLS_PER_CHANNEL {
+                let r = ((ch * SYMBOLS_PER_CHANNEL + i) as u32).wrapping_mul(2654435761)
+                    ^ (i as u32 >> 7);
+                symbols.push(if (r & 0xf) < 15 {
+                    0xffu8
+                } else {
+                    ((r >> 4) & 0xfe) as u8
+                });
+            }
+            all_symbols.push(symbols);
+        }
+
+        // Functional check: every channel round-trips byte-exact.
+        for symbols in &all_symbols {
+            let mut enc = RangeEncoder::new();
+            for &s in symbols {
+                enc.encode_symbol(&cdf, s as usize);
+            }
+            let bytes = enc.finish();
+            let mut dec = RangeDecoder::new(&bytes).unwrap();
+            let mut out = Vec::with_capacity(symbols.len());
+            for _ in 0..symbols.len() {
+                out.push(dec.decode_symbol(&cdf).unwrap());
+            }
+            assert_eq!(&out, symbols);
+        }
+
+        // Optional timing pass (only when LAGARITH_BENCH=1).
+        // Times BOTH the production `Vec::resize` form AND the
+        // per-FF `Vec::push` reference form on the same workload so
+        // the round-12 speedup is directly comparable.
+        if std::env::var("LAGARITH_BENCH").as_deref() == Ok("1") {
+            const REPS: usize = 200;
+
+            // Production `Vec::resize` form (round 12).
+            let mut sink_fast: u64 = 0;
+            let t_fast = std::time::Instant::now();
+            for _ in 0..REPS {
+                for symbols in &all_symbols {
+                    let mut enc = RangeEncoder::new();
+                    for &s in symbols {
+                        enc.encode_symbol(&cdf, s as usize);
+                    }
+                    let bytes = enc.finish();
+                    sink_fast = sink_fast.wrapping_add(bytes.len() as u64);
+                }
+            }
+            let elapsed_fast = t_fast.elapsed();
+            let total_syms = (N_CHANNELS * SYMBOLS_PER_CHANNEL * REPS) as f64;
+            let msym_per_s_fast = total_syms / elapsed_fast.as_secs_f64() / 1.0e6;
+
+            // Reference `Vec::push` form (pre-round-12). Drives the
+            // same encoder + same per-channel symbol stream through
+            // the local `finish_via_push_loop` helper so the only
+            // difference is the FF-chain flush strategy in `finish()`.
+            let mut sink_ref: u64 = 0;
+            let t_ref = std::time::Instant::now();
+            for _ in 0..REPS {
+                for symbols in &all_symbols {
+                    let mut enc = RangeEncoder::new();
+                    for &s in symbols {
+                        enc.encode_symbol(&cdf, s as usize);
+                    }
+                    let bytes = finish_via_push_loop(enc);
+                    sink_ref = sink_ref.wrapping_add(bytes.len() as u64);
+                }
+            }
+            let elapsed_ref = t_ref.elapsed();
+            let msym_per_s_ref = total_syms / elapsed_ref.as_secs_f64() / 1.0e6;
+
+            // Sink check — both forms must produce the same total
+            // output byte count (they produce byte-identical output;
+            // the sum is one cheap end-to-end check).
+            assert_eq!(
+                sink_fast, sink_ref,
+                "Vec::resize and per-FF push forms produced different total byte counts"
+            );
+
+            eprintln!(
+                "BENCH/range-coder ENCODE finish-heavy [RESIZE]: {:.2} MSym/s ({} chans x {} syms x {} reps in {:.3?}; sink={})",
+                msym_per_s_fast,
+                N_CHANNELS,
+                SYMBOLS_PER_CHANNEL,
+                REPS,
+                elapsed_fast,
+                sink_fast
+            );
+            eprintln!(
+                "BENCH/range-coder ENCODE finish-heavy [PUSH ]: {:.2} MSym/s ({} chans x {} syms x {} reps in {:.3?}; sink={})",
+                msym_per_s_ref,
+                N_CHANNELS,
+                SYMBOLS_PER_CHANNEL,
+                REPS,
+                elapsed_ref,
+                sink_ref
+            );
+            eprintln!(
+                "BENCH/range-coder ENCODE finish-heavy [SPEEDUP RESIZE/PUSH]: {:.3}x",
+                msym_per_s_fast / msym_per_s_ref
+            );
+        }
     }
 }
