@@ -10,7 +10,13 @@ replay + reduced-resolution + legacy RGB (type 7) with Rule B
 first-column predictor + RLE-then-Fibonacci channel sub-path.
 Round 124 — modern RGB(A) first-column predictor corrected to
 **Rule B** (was Rule A), byte-exact against the independent ffmpeg
-`lagarith` decoder for power-of-two-pixel RGB24/RGB32/RGBA frames.**
+`lagarith` decoder for power-of-two-pixel RGB24/RGB32/RGBA frames.
+Round 127 — extends the ffmpeg cross-decoder pin set to seven
+power-of-two pixel sizes (RGB24 4×4 / 8×8 / 8×16 / 16×16 and RGBA
+4×4 / 8×8 / 16×16), characterises the residual **pattern-sensitive
+divergence** that survives the pow2 selection, and attributes it to
+the un-disassembled probability-loader at `lagarith.dll!0x180001050`
+(see `tests/ffmpeg_pins.rs` module docs).**
 This `master` branch is the clean-room rebuild against the
 strict-isolation cleanroom workspace at
 [`docs/video/lagarith/`](https://github.com/OxideAV/docs/tree/master/video/lagarith).
@@ -218,7 +224,7 @@ type-7 stream still awaits a fixture oracle
 
 ## Tests
 
-132 unit + integration tests cover the range coder, Fibonacci
+133 unit + integration tests cover the range coder, Fibonacci
 prefix, RLE escape, predictor + decorrelation, channel-header
 dispatcher, the channel-header `0x01..=0x03` arithmetic-with-RLE
 path and the `0x05..=0x07` raw-RLE path, an end-to-end encode →
@@ -234,10 +240,13 @@ worked-example boundary shifts, and length-correct decode through
 both the channel decoder and `decode_frame` — the YUY2
 odd-width floor-chroma layout (audit/00 §9.4), and the NULL-frame
 ("JUMP") replay path through both the `Decoder` wrapper and the
-`decode_frame_with_prev` helper, and (round 124) three
-**ffmpeg-cross-validated** byte-exact pins for the modern
-arithmetic RGB24 (8×8, 16×16) and RGBA (16×16) paths
-([`tests/ffmpeg_pins.rs`](tests/ffmpeg_pins.rs)).
+`decode_frame_with_prev` helper, and **seven**
+ffmpeg-cross-validated byte-exact pins for the modern
+arithmetic RGB24 (4×4, 8×8, 8×16, 16×16) and RGBA (4×4, 8×8, 16×16)
+paths ([`tests/ffmpeg_pins.rs`](tests/ffmpeg_pins.rs); round 124
+added the first three pins under structured patterns, round 127
+extended the set with random-seeded patterns across non-square
+and smaller pow2 sizes).
 
 ### SIMD-vs-scalar predictor (`spec/06` §3.2)
 
@@ -266,11 +275,28 @@ dispatch question in favour of **Rule B** — the prior Rule A
 choice mis-decoded these streams in ffmpeg. The committed pins in
 `tests/ffmpeg_pins.rs` run in CI without ffmpeg.
 
-Open items (out of scope for round 124, no GitHub issue per
-workspace policy): (a) non-power-of-two pixel counts expose a
-range-coder framing divergence vs ffmpeg in the modern path;
-(b) YV12 / YUY2 planar scan-order vs the DIB flip needs a clean
-ffmpeg pin; (c) ffmpeg does not implement the type-1 Uncompressed
-path, so it cannot oracle that type. Byte-exact parity against a
-*proprietary-encoded* AVI still awaits a fixture
-(`samples.oxideav.org/lagarith/`, 404 per audit/04 §5).
+Open items (out of scope per workspace policy, no GitHub issue):
+(a) **Pattern-sensitive ffmpeg divergence at pow2 sizes** — the
+crate's encoder, when fed structured residual patterns (e.g.
+`i * 73 + 11 → bit-slice`), produces frames at *power-of-two* pixel
+sizes that ffmpeg's lagarith decoder mis-decodes by ~40-60% even
+though the crate's own decoder self-roundtrips them byte-exactly.
+Random-seeded byte patterns at the same sizes decode cleanly in
+ffmpeg (verified across 4×4, 4×8, 8×8, 8×16, 16×16, 32×32 for both
+RGB24 and RGBA, three seeds each). Most-likely root: the wire's
+raw-histogram → cumulative-frequency + shift-exponent conversion at
+`lagarith.dll!0x180001050` (referenced from `spec/02` §5 + `spec/04`
+§5/§6, **not disassembled into cleanroom spec**); ffmpeg's
+implementation almost certainly mirrors a normalisation step our
+encoder/decoder collapse to identity. Closing the gap is an
+Extractor-round deliverable (disassemble + spec `0x180001050`).
+(b) Non-pow2 pixel counts compound (a) with a related pow2-total
+gap (rescale-to-next-pow2 partial-fix confirmed in r127 but not
+byte-exact); same docs gap blocks both. (c) YV12 / YUY2 planar
+scan-order vs the DIB flip needs a clean ffmpeg pin — round 127
+established YV12/YUY2 self-roundtrip is independent of Rule A vs
+Rule B, so the gap is downstream of the predictor. (d) ffmpeg does
+not implement the type-1 Uncompressed path, so it cannot oracle
+that type. Byte-exact parity against a *proprietary-encoded* AVI
+still awaits a fixture (`samples.oxideav.org/lagarith/`, 404 per
+audit/04 §5).

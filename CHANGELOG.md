@@ -6,6 +6,47 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Round 127 — extended ffmpeg cross-decoder pin set + pattern-
+  sensitivity characterisation.** The pin file now carries four new
+  random-seeded committed frames in addition to round 124's three:
+  RGB24 4×4 + 8×16 and RGBA 4×4 + 8×8, all built from the same LCG
+  pixel source (`state * 0x9e37_79b9 + 0x12345`, seed `0xdeadbeef`,
+  high byte per pixel) and all verified to decode byte-for-byte
+  through ffmpeg's `lagarith` decoder via a minimal `LAGS`-coded AVI
+  wrapper. Seven total pins now run in CI without ffmpeg.
+
+  Round 127 also empirically characterises the residual gap: the
+  crate encoder's compatibility with ffmpeg is **pattern-sensitive
+  even within the power-of-two-pixel-count regime**. The structured
+  `i * 73 + 11 → bit-slice` test pattern (used by the existing
+  self-roundtrip tests) at the same pow2 sizes that the random
+  patterns sweep cleanly produces ffmpeg-divergent frames (e.g.
+  ~40% byte match at 16×16, single-byte off-by-N residuals
+  scattered through the planes). The crate's own decoder
+  self-roundtrips both pattern classes byte-exactly, so the
+  divergence sits on ffmpeg's side of the wire-format interpretation.
+  The most likely root cause is the channel-prefix probability-loader
+  at `lagarith.dll!0x180001050` (referenced from `spec/02` §5 and
+  `spec/04` §5/§6 but **not disassembled into cleanroom spec**),
+  which converts the wire's raw frequency histogram into the
+  internal cumulative + shift-exponent struct the modern range
+  coder consumes. ffmpeg's implementation almost certainly mirrors a
+  normalisation step that the crate's encoder/decoder pair collapses
+  to identity (`q = range / total` with raw `total`).
+
+  A prototype encoder-side `rescale_to_pow2` fix was explored that
+  converted non-pow2 channel totals to the smallest power of two
+  before encoding (matching the legacy coder's `spec/07` §3.2
+  approach) — this closed the non-pow2 5×5 / 3×3 frame gap exactly
+  but did not address the pattern-sensitive pow2 cases, confirming
+  the two issues share the same un-disassembled normalisation root.
+  The prototype is not landed (no spec-derived rationale for changing
+  the wire format from raw to rescaled freqs without the
+  `0x180001050` reference); the gap remains documented for the
+  Extractor round.
+
 ### Fixed
 
 - **Round 124 — modern arithmetic RGB(A) first-column predictor
