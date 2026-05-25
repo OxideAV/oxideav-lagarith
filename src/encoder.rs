@@ -16,8 +16,95 @@ use crate::predict::{
     apply_plane_forward, apply_plane_forward_with_rule, cross_plane_decorrelate_rgb_forward,
     FirstColRule,
 };
-use crate::range_coder::{Cdf, RangeEncoder};
+use crate::range_coder::{Cdf, RangeEncoder, TOP};
 use crate::rle::contract_raw;
+
+/// Largest transmitted-frequency total the modern range coder can
+/// decode without the `q = range / total` quotient (`spec/02` §5)
+/// collapsing to zero.
+///
+/// `spec/02` §2 puts the post-renormalisation `range` in
+/// `[TOP + 1, 2^31]` (TOP = `0x800000`). Step A/B/C all start from
+/// `q = range / total`; for the arithmetic to stay valid the
+/// quotient must be `>= 1` at the worst case `range = TOP + 1`,
+/// which requires `total <= TOP + 1`. We cap at `TOP` so the
+/// worst-case quotient is `(TOP + 1) / TOP = 1` with one bit of
+/// headroom.
+///
+/// `spec/04` §5 documents that the proprietary loader normalises the
+/// per-symbol histogram (its `0x180001530..0x18000158a` block) before
+/// building the reciprocal-multiply LUT — the same `q >= 1` guarantee,
+/// reached the same way. The validation correction in `spec/04` §5
+/// then establishes that the *wire* still carries a raw byte-histogram
+/// whose total equals the symbol count for the fixtures probed (16 for
+/// 4x4, 256 for 16x16, …) — all far below `TOP`. So this cap is a
+/// no-op for every plane the proprietary fixtures exercise; it only
+/// engages for planes whose symbol count exceeds `TOP` (> ~8.39M
+/// residuals, e.g. a single 4K+ plane), where a raw total would push
+/// `q` to zero and break the coder.
+const MAX_MODERN_TOTAL: u32 = TOP;
+
+/// Rescale a 256-entry raw histogram so its total stays within
+/// [`MAX_MODERN_TOTAL`], preserving the nonzero set (every
+/// `freq[s] > 0` maps to a transmitted frequency `>= 1`, so no symbol
+/// the plane actually uses becomes undecodable).
+///
+/// When the raw total already fits, the histogram is returned
+/// **unchanged** — this keeps the wire byte-identical to the raw-
+/// histogram form for the common small/medium plane (`spec/04` §5
+/// validation correction), so the existing self-roundtrip fixtures
+/// are unaffected.
+///
+/// When the raw total exceeds the cap, frequencies are scaled by
+/// `floor(freq[s] * cap / sum)`, clamped up to `1` for every nonzero
+/// slot, then any residual overshoot is trimmed from the largest
+/// slots (never below `1`). The result satisfies
+/// `sum(out) <= MAX_MODERN_TOTAL` and `out[s] > 0 <=> freq[s] > 0`.
+/// Because the encoder transmits this exact rescaled table and the
+/// decoder rebuilds the identical CDF from it (`spec/04` §6), the
+/// arithmetic coder remains exact: only the probability model
+/// changes, never the symbol→byte mapping, so decoded bytes match
+/// the input byte-for-byte.
+fn rescale_to_max_total(freq: &[u32; 256], cap: u32) -> [u32; 256] {
+    let sum: u64 = freq.iter().map(|&f| f as u64).sum();
+    if sum <= cap as u64 {
+        return *freq;
+    }
+    let cap64 = cap as u64;
+    let mut out = [0u32; 256];
+    for s in 0..256 {
+        if freq[s] == 0 {
+            continue;
+        }
+        // floor(freq * cap / sum), clamped to >= 1 so a used symbol
+        // never drops out of the transmitted table.
+        let scaled = (freq[s] as u64 * cap64 / sum).max(1);
+        out[s] = scaled as u32;
+    }
+    // The `max(1, …)` clamps can lift the running sum above `cap`
+    // (each of the up-to-256 nonzero slots can add at most 1 over its
+    // floored share). Trim the overshoot from the largest slots,
+    // never reducing a nonzero slot below 1.
+    let mut total: u64 = out.iter().map(|&f| f as u64).sum();
+    while total > cap64 {
+        // Find the largest slot with headroom above 1.
+        let mut victim = usize::MAX;
+        let mut best = 1u32;
+        for (s, &f) in out.iter().enumerate() {
+            if f > best {
+                best = f;
+                victim = s;
+            }
+        }
+        // `total > cap` with every nonzero slot already at 1 is
+        // impossible: at most 256 slots × 1 = 256 <= cap. So a victim
+        // with `f > 1` always exists here.
+        debug_assert_ne!(victim, usize::MAX, "overshoot trim found no victim");
+        out[victim] -= 1;
+        total -= 1;
+    }
+    out
+}
 
 /// Encode a uncompressed (frame type 1) frame.
 pub fn encode_uncompressed(payload: &[u8]) -> Vec<u8> {
@@ -72,7 +159,15 @@ pub fn encode_channel_simple(plane: &[u8]) -> Vec<u8> {
         return vec![0xff, plane[0]];
     }
 
-    // Encode arithmetic body.
+    // Rescale the histogram so the transmitted total stays inside the
+    // modern coder's `q = range / total >= 1` operating range
+    // (`spec/02` §2 / §5; see `MAX_MODERN_TOTAL`). For planes whose
+    // symbol count is <= TOP this is the raw histogram unchanged.
+    let freq = rescale_to_max_total(&freq, MAX_MODERN_TOTAL);
+
+    // Encode arithmetic body. The CDF and the transmitted prefix come
+    // from the *same* rescaled table, so the decoder rebuilds the
+    // identical CDF and recovers the original bytes (`spec/04` §6).
     let cdf = Cdf::from_frequencies(&freq).expect("CDF builds for non-empty plane");
     let mut enc = RangeEncoder::new();
     for &b in plane {
@@ -124,6 +219,12 @@ pub fn encode_channel_arith_rle(plane: &[u8], escape_len: usize) -> Vec<u8> {
     if pre_rle_count >= plane.len() {
         return encode_channel_simple(plane);
     }
+
+    // Same modern-coder `q >= 1` cap as the header-0x00 path: the
+    // pre-RLE symbol stream's histogram must not push the transmitted
+    // total past TOP (`spec/02` §5). No-op for the small streams the
+    // RLE fixtures exercise.
+    let freq = rescale_to_max_total(&freq, MAX_MODERN_TOTAL);
 
     let cdf = Cdf::from_frequencies(&freq).unwrap();
     let mut enc = RangeEncoder::new();
@@ -696,4 +797,135 @@ pub fn encode_arith_rgba(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
     let ch_a = encode_channel_simple(&res_a);
 
     pack_channels(8, &[&ch_b, &ch_g, &ch_r, &ch_a])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::channel::decode_channel;
+
+    /// Header-0x00 encode path with an explicit total cap, used by the
+    /// rescale tests to drive [`rescale_to_max_total`] through the full
+    /// modern-coder wire at small scale (a production-cap test would
+    /// need a > TOP-pixel plane = tens of MB). Always emits the
+    /// header-0x00 form (no raw-memcpy fallback) so the arithmetic +
+    /// rescaled-prefix path is exercised unconditionally.
+    fn encode_channel_simple_capped(plane: &[u8], cap: u32) -> Vec<u8> {
+        let mut freq = [0u32; 256];
+        for &b in plane {
+            freq[b as usize] = freq[b as usize].saturating_add(1);
+        }
+        let freq = rescale_to_max_total(&freq, cap);
+        let cdf = Cdf::from_frequencies(&freq).unwrap();
+        let mut enc = RangeEncoder::new();
+        for &b in plane {
+            enc.encode_symbol(&cdf, b as usize);
+        }
+        let body = enc.finish();
+        let prefix = encode_freq_table(&freq);
+        let mut out = Vec::with_capacity(1 + prefix.len() + body.len());
+        out.push(0x00);
+        out.extend_from_slice(&prefix);
+        out.extend_from_slice(&body);
+        out
+    }
+
+    /// `rescale_to_max_total` leaves a histogram whose total already
+    /// fits under the cap **byte-identical** — the common small/medium
+    /// plane keeps the raw-histogram wire (`spec/04` §5 validation
+    /// correction).
+    #[test]
+    fn rescale_noop_when_total_fits() {
+        let mut freq = [0u32; 256];
+        freq[0] = 4000;
+        freq[7] = 50;
+        freq[255] = 46; // total 4096 << TOP
+        let out = rescale_to_max_total(&freq, MAX_MODERN_TOTAL);
+        assert_eq!(out, freq, "fits-under-cap must be a verbatim passthrough");
+    }
+
+    /// Above the cap, the rescaled total never exceeds the cap, and
+    /// every symbol the plane actually used keeps a transmitted
+    /// frequency `>= 1` (no used symbol drops out of the table).
+    #[test]
+    fn rescale_caps_total_and_preserves_nonzero() {
+        let mut freq = [0u32; 256];
+        // Dominant symbol plus a long tail of rare-but-present symbols.
+        freq[0] = 10_000_000; // > TOP on its own
+        for s in 1..=200u32 {
+            freq[s as usize] = 1; // rarest possible — must survive
+        }
+        let cap = MAX_MODERN_TOTAL;
+        let out = rescale_to_max_total(&freq, cap);
+        let total: u64 = out.iter().map(|&f| f as u64).sum();
+        assert!(total <= cap as u64, "total {total} exceeds cap {cap}");
+        for s in 0..256 {
+            assert_eq!(
+                out[s] > 0,
+                freq[s] > 0,
+                "nonzero-preservation broken at symbol {s}",
+            );
+        }
+    }
+
+    /// A small cap that forces many `max(1, …)` clamps still yields a
+    /// total within the cap (overshoot-trim path).
+    #[test]
+    fn rescale_small_cap_overshoot_trim() {
+        let mut freq = [0u32; 256];
+        for s in 0..256u32 {
+            freq[s as usize] = 1000; // 256 equal slots, total 256_000
+        }
+        let cap = 300u32; // forces clamps + trim
+        let out = rescale_to_max_total(&freq, cap);
+        let total: u64 = out.iter().map(|&f| f as u64).sum();
+        assert!(total <= cap as u64, "total {total} exceeds cap {cap}");
+        assert!(out.iter().all(|&f| f >= 1), "every used slot stays >= 1");
+    }
+
+    /// End-to-end self-roundtrip through the modern wire with a tiny
+    /// cap: the rescaled histogram both drives the CDF and is the
+    /// transmitted prefix, so `decode_channel` rebuilds the identical
+    /// CDF and recovers the original residual bytes byte-for-byte
+    /// (`spec/04` §6). This is the small-scale stand-in for a
+    /// > TOP-pixel plane — the same code path, the same invariant.
+    #[test]
+    fn rescale_capped_channel_roundtrip() {
+        // A plane whose raw total (700) far exceeds the tiny cap (64),
+        // with a dominant symbol and several rare ones.
+        let mut plane = vec![0u8; 600];
+        plane.extend(std::iter::repeat_n(17u8, 60));
+        plane.extend(std::iter::repeat_n(200u8, 30));
+        plane.extend([3u8, 9, 9, 250, 1, 1, 1, 1, 128, 128]);
+        let n = plane.len();
+        for cap in [16u32, 32, 64, 128, 300] {
+            let channel = encode_channel_simple_capped(&plane, cap);
+            let decoded = decode_channel(&channel, n).unwrap();
+            assert_eq!(decoded, plane, "roundtrip mismatch at cap {cap}");
+        }
+    }
+
+    /// A genuine `total > TOP` plane round-trips at the production cap.
+    /// Sized just over TOP so the raw histogram would drive
+    /// `q = range / total` to zero without the rescale; with the
+    /// rescale it decodes byte-exactly. (~8.4 MB plane — the one heavy
+    /// test that proves the production-cap path.)
+    #[test]
+    fn rescale_production_cap_large_plane_roundtrip() {
+        let n = TOP as usize + 1024; // just past the q>=1 cliff
+        let mut plane = vec![0u8; n];
+        // Sprinkle a handful of non-zero symbols so the histogram has
+        // a real tail (and the encode isn't a degenerate solid fill).
+        for (i, b) in plane.iter_mut().enumerate() {
+            if i % 4096 == 0 {
+                *b = ((i / 4096) % 200 + 1) as u8;
+            }
+        }
+        let channel = encode_channel_simple(&plane);
+        // Must be the arithmetic header-0x00 form (rescale engaged),
+        // not a raw-memcpy fallback.
+        assert_eq!(channel[0], 0x00, "expected header-0x00 arith channel");
+        let decoded = decode_channel(&channel, n).unwrap();
+        assert_eq!(decoded, plane, "large-plane roundtrip mismatch");
+    }
 }

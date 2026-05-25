@@ -8,6 +8,51 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Round 135 (encoder round 13) — modern probability-model write
+  path: transmitted-frequency rescale to the `q >= 1` operating
+  range (`spec/02` §2 / §5, `spec/04` §5 / §6).** The per-channel
+  modern-coder encode path (`encode_channel_simple` header-0x00 and
+  `encode_channel_arith_rle` header-0x01..0x03) now rescales the
+  raw byte-histogram through `rescale_to_max_total` before it builds
+  the CDF and the Fibonacci prefix, so the transmitted total stays
+  `<= MAX_MODERN_TOTAL = TOP (0x800000)`.
+
+  Rationale: `spec/02` §5 starts every symbol with `q = range /
+  total`; `spec/02` §2 floors the post-renormalisation `range` at
+  `TOP + 1`, so a transmitted `total > TOP` drives `q` to zero and
+  the coder produces `range = 0` (and a divide-by-zero in the
+  decoder's Step-C `low / q`). `spec/04` §5 documents that the
+  proprietary loader normalises the histogram for exactly this
+  `q >= 1` guarantee; its validation correction establishes the
+  *wire* still carries a raw histogram for the fixtures probed —
+  every one well under `TOP`. The rescale therefore **no-ops for
+  every sub-TOP plane** (the common case), keeping the wire
+  byte-identical to the raw-histogram form, and engages only for
+  planes whose symbol count exceeds `TOP` (> ~8.39M residuals — a
+  single 4K+ plane), which the prior encoder could not encode at
+  all. The rescale is `floor(freq[s] * cap / sum)` clamped up to
+  `1` for every nonzero slot (so no used symbol drops out of the
+  table), with any residual overshoot trimmed from the largest
+  slots, never below `1`. Encoder and decoder build the identical
+  CDF from the transmitted rescaled table (`spec/04` §6), so the
+  arithmetic coder stays exact — only the probability model
+  changes, never the symbol→byte mapping.
+
+  Five new tests in `src/encoder.rs`: `rescale_noop_when_total_fits`
+  (verbatim passthrough under the cap), `rescale_caps_total_and_
+  preserves_nonzero` (total `<= cap` + nonzero-preservation on a
+  dominant-plus-rare-tail histogram), `rescale_small_cap_overshoot_
+  trim` (256 equal slots forced through the trim path),
+  `rescale_capped_channel_roundtrip` (small-cap end-to-end modern-
+  wire self-roundtrip across five caps), and
+  `rescale_production_cap_large_plane_roundtrip` (a genuine
+  `total > TOP` ~8.4M-residual plane that round-trips byte-exactly
+  at the production cap — the prior encoder would have broken on
+  it). Test count: 131 → 136 (library) + 7 (integration). Still
+  self-roundtrip-only; byte-exact-vs-proprietary remains
+  Auditor/Extractor-blocked on the un-disassembled probability
+  loader at `0x180001050`.
+
 - **Round 132 (encoder round 12) — `spec/02` §6.3 final-flush
   FF-chain bulk-fill.** `RangeEncoder::finish()`'s pre-tail
   pending-FF chain drain now uses `Vec::resize` (one bounds

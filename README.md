@@ -219,6 +219,31 @@ and asserts byte equality. The Step-A / Step-B / Step-C
 benches are unchanged (the round-12 change only affects
 `finish()`).
 
+Round 13 lands the **modern probability-model write path**: the
+per-channel encode now rescales the raw byte-histogram so the
+**transmitted total stays inside the coder's `q >= 1` operating
+range** before building the CDF and the Fibonacci prefix. `spec/02`
+§5 starts every symbol with `q = range / total` and `spec/02` §2
+floors the renormalised `range` at `TOP + 1`, so a transmitted
+`total > TOP (0x800000)` collapses `q` to zero and breaks the
+coder. `spec/04` §5 documents the proprietary loader normalising
+the histogram for exactly this guarantee; its validation correction
+shows the wire still carries a raw histogram for every probed
+fixture — all far below `TOP`. So the rescale **no-ops for every
+sub-`TOP` plane** (the wire stays byte-identical to the
+raw-histogram form) and engages only for planes whose symbol count
+exceeds `TOP` (> ~8.39M residuals — a single 4K+ plane), which the
+prior encoder could not encode at all. The rescale is
+`floor(freq * cap / sum)` clamped up to `1` per nonzero slot (no
+used symbol drops out) with overshoot trimmed from the largest
+slots; encoder and decoder build the identical CDF from the
+transmitted rescaled table (`spec/04` §6), so the coder stays
+exact. Five new tests cover the passthrough, the cap +
+nonzero-preservation invariants, the overshoot-trim path, a
+small-cap end-to-end self-roundtrip, and a genuine `total > TOP`
+~8.4M-residual plane that round-trips byte-exactly at the
+production cap.
+
 ## Pair-packed 513-entry CDF (legacy type 7)
 
 The type-7 legacy range coder builds its probability model two ways
