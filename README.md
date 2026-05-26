@@ -219,6 +219,35 @@ and asserts byte equality. The Step-A / Step-B / Step-C
 benches are unchanged (the round-12 change only affects
 `finish()`).
 
+Round 15 (round 141) lands the **legacy-fork analogue**:
+**per-channel header-form selection for type-7 (legacy RGB)**
+(`encode_legacy_channel_best` + frame-level `encode_legacy_rgb_best`).
+The selector enumerates the four wire forms `decode_legacy_channel`
+accepts — bare-Fibonacci (`0x00`, `spec/07` §2.5 / §6.3) plus the
+three RLE-then-Fibonacci variants (`0x01..0x03` one per
+`escape_len ∈ {1, 2, 3}`, `spec/07` §2.3 / §2.4) — and returns
+the shortest. Strategy E (`audit/12 §7.1`) propagates through the
+frame-level wrapper. Empirical correction to `spec/07` §6.3's
+"compression trade-off" framing: with the proprietary's bit-packed
+Fibonacci layout, the encoded freq table produces **zero `0x00`
+bytes** on every realistic histogram probed (dense, sparse,
+two-symbol, biased-mid-band), so the RLE escape has nothing to
+swallow and the three RLE-then-Fib candidates end up `+4 bytes`
+longer than bare-Fib (the u32 length field is dead weight). The
+selector therefore picks header `0x00` on every realistic input,
+ties broken in favour of bare-Fib (byte-identical to the previous
+`encode_legacy_channel` output — no roundtrip suite churn). The
+new selector is therefore a **never-worse defensive guarantee**
++ a forward path for any future Fibonacci variant the spec adds
+that does emit zero bytes; the `legacy_best_always_picks_bare_on_realistic_inputs`
+test pins the current empirical invariant so a Fibonacci-encoder
+tweak that begins emitting zero bytes surfaces as a deliberate
+failure here. 8 new tests cover never-larger-than-bare, every-
+sub-path-roundtrips, legal-header-only emission, the tie-breaker
+keeps the bare-Fib bytes byte-identical, frame-level roundtrip on
+4×4 / 8×8 / 16×12 BGR24, frame-level never-larger, Strategy E
+propagation, and the empirical bare-only-wins pin.
+
 Round 14 lands **per-channel header-form selection
 (`encode_channel_best`)**: the encoder now considers every wire
 form the decoder dispatcher accepts (`spec/03` §2.1 + `spec/06`
@@ -310,7 +339,7 @@ type-7 stream still awaits a fixture oracle
 
 ## Tests
 
-149 unit + integration tests cover the range coder, Fibonacci
+157 unit + integration tests cover the range coder, Fibonacci
 prefix, RLE escape, predictor + decorrelation, channel-header
 dispatcher, the channel-header `0x01..=0x03` arithmetic-with-RLE
 path and the `0x05..=0x07` raw-RLE path, an end-to-end encode →

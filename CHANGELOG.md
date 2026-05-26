@@ -8,6 +8,41 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 141 (encoder round 15) — legacy-fork per-channel
+  header-form selection for type-7 (`encode_legacy_channel_best`
+  + frame-level `encode_legacy_rgb_best`, `spec/07` §6.3).** The
+  selector enumerates the four wire forms `decode_legacy_channel`
+  accepts — bare-Fibonacci (`0x00`, `spec/07` §2.5 / §6.3) plus
+  the three RLE-then-Fibonacci variants (`0x01..0x03`, one per
+  `escape_len ∈ {1, 2, 3}`, `spec/07` §2.3 / §2.4) — and returns
+  the shortest. Tie-breaker preserves the bare-Fibonacci form
+  byte-identically. Strategy E (`audit/12 §7.1`) propagates
+  through the frame-level wrapper unchanged.
+
+  Empirical correction to `spec/07` §6.3's "compression
+  trade-off" framing: with the proprietary's bit-packed Fibonacci
+  layout (`spec/07` §2.2), the encoded freq-table byte stream
+  produces **zero `0x00` bytes** on every realistic histogram
+  probed (dense / sparse / two-symbol / biased-mid-band). The RLE
+  escape (`spec/05`) requires runs of `0x00` *bytes* to fire, so
+  it cannot shrink the freq-table buffer; the three
+  RLE-then-Fibonacci candidates end up `+4 bytes` longer than
+  bare-Fib (the u32 length field of `spec/07` §2.3 is dead
+  weight). The selector therefore picks header `0x00` on every
+  realistic input — making it a **never-worse defensive
+  guarantee** plus a forward path for any future Fibonacci
+  variant the spec adds that does emit zero bytes. The cleanroom
+  encoder's wire output is byte-identical against the existing
+  legacy roundtrip suite.
+
+  8 new tests cover: never-larger-than-bare-Fib, every-sub-path-
+  roundtrips through `decode_legacy_channel`, legal-header-only
+  emission (`0x00..=0x03`), the tie-breaker keeps bare-Fib bytes
+  byte-identical, frame-level roundtrip on 4×4 / 8×8 / 16×12
+  BGR24, frame-level never-larger than `encode_legacy_rgb`,
+  Strategy E propagation through the new frame wrapper, and the
+  empirical bare-only-wins pin across the four fixture profiles.
+
 - **Round 138 (encoder round 14) — per-channel header-form
   selection (`encode_channel_best`) covering all 8 wire forms
   the dispatcher accepts (`spec/03` §2.1, `spec/06` §1.7 + §2.7).**

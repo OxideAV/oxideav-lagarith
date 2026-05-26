@@ -806,6 +806,113 @@ pub fn encode_legacy_channel(plane: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Encode one **type-7 (legacy RGB)** channel by trying every
+/// supported wire form and returning the smallest valid body —
+/// the legacy-fork analogue of [`encode_channel_best`] for the
+/// modern fork.
+///
+/// `spec/07` §6.3 explicitly frames the choice between
+/// **bare-Fibonacci** (header `0x00`, the canonical cleanroom
+/// path) and the three **RLE-then-Fibonacci** sub-paths
+/// (header `0x01..=0x03`, one per `escape_len ∈ {1, 2, 3}`)
+/// as an *encoder-side compression trade-off* — bare-Fibonacci
+/// works for any frequency distribution, while
+/// RLE-then-Fibonacci compresses the freq-table channel prefix
+/// better when the freq table is sparse (long runs of zero
+/// frequencies for unused symbols). A canonical encoder
+/// implementing all paths and picking the shortest is the
+/// most flexible legal form.
+///
+/// The legacy fork's channel-header dispatcher
+/// ([`crate::channel::decode_legacy_channel`]) accepts headers
+/// `0x00..=0x03` and rejects anything outside that range, so the
+/// candidate set is exhaustively four: one bare-Fibonacci form
+/// plus three RLE-then-Fibonacci variants. Tie-breaker: the
+/// bare-Fibonacci form wins on a tie (preserves the historical
+/// `encode_legacy_channel` preference and keeps the wire byte-
+/// identical on inputs where the RLE prefix is no smaller).
+///
+/// **Wire compatibility.** As with the modern fork's
+/// `encode_channel_best`, the choice between legacy sub-paths is
+/// per-channel and externally invisible — the decoder reads byte 0,
+/// routes to the matching sub-path, and recovers the same plane
+/// regardless of which form the encoder picked
+/// (`spec/07` §1.3 / §6.3). Replacing `encode_legacy_channel` with
+/// `encode_legacy_channel_best` in [`encode_legacy_rgb`] cannot
+/// regress self-roundtrip correctness; it can only shrink output.
+pub fn encode_legacy_channel_best(plane: &[u8]) -> Vec<u8> {
+    debug_assert!(!plane.is_empty(), "encode_legacy_channel_best: empty plane");
+
+    // Candidate `0x00` — bare-Fibonacci (always legal for any
+    // non-empty plane).
+    let mut best = encode_legacy_channel(plane);
+
+    // Candidates `0x01..=0x03` — RLE-then-Fibonacci. The RLE
+    // contraction targets the *Fibonacci-coded freq table* (256-byte
+    // proprietary canonical buffer), not the residuals; whether it
+    // shrinks the channel depends on the freq-table byte stream
+    // having zero-byte runs the escape can swallow. Always legal —
+    // there is no fall-back rule on the legacy path equivalent to
+    // `spec/06` §1.5; the trampoline accepts any escape_len in
+    // {1, 2, 3} per `spec/07` §2.3 / §2.4.
+    for escape_len in 1..=3usize {
+        let candidate = encode_legacy_channel_rle(plane, escape_len);
+        if candidate.len() < best.len() {
+            best = candidate;
+        }
+    }
+
+    best
+}
+
+/// Encode a **type-7 (legacy RGB)** frame using
+/// [`encode_legacy_channel_best`] per-channel — same pipeline as
+/// [`encode_legacy_rgb`] except the per-channel entropy stage is the
+/// header-form selector. Strategy E (`audit/12 §7.1`) still
+/// propagates: rare-symbol-cluster residual histograms divert to
+/// type 1 (the divergence is in the range-coder body, not the
+/// channel-prefix form, so it triggers identically here).
+///
+/// Test-only — drives the new round-141 roundtrip suite for the
+/// legacy header-form selector. The frame-level `encode_legacy_rgb`
+/// continues to use `encode_legacy_channel` for now; flipping the
+/// production call site is a follow-up step paired with a per-
+/// fixture-class size-delta benchmark (parallel to how the modern
+/// fork's `encode_arith_rgb24` still calls `encode_channel_simple`
+/// at the end of round 138).
+pub fn encode_legacy_rgb_best(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let n = width as usize * height as usize;
+    debug_assert_eq!(pixels.len(), n * 3);
+
+    let mut plane_b = Vec::with_capacity(n);
+    let mut plane_g = Vec::with_capacity(n);
+    let mut plane_r = Vec::with_capacity(n);
+    for px in pixels.chunks_exact(3) {
+        plane_b.push(px[0]);
+        plane_g.push(px[1]);
+        plane_r.push(px[2]);
+    }
+
+    cross_plane_decorrelate_rgb_forward(&mut plane_b, &plane_g, &mut plane_r);
+
+    let res_b =
+        apply_plane_forward_with_rule(&plane_b, width as usize, height as usize, FirstColRule::B);
+    let res_g =
+        apply_plane_forward_with_rule(&plane_g, width as usize, height as usize, FirstColRule::B);
+    let res_r =
+        apply_plane_forward_with_rule(&plane_r, width as usize, height as usize, FirstColRule::B);
+
+    if type7_residuals_need_strategy_e(&res_b, &res_g, &res_r) {
+        return encode_uncompressed(pixels);
+    }
+
+    let ch_b = encode_legacy_channel_best(&res_b);
+    let ch_g = encode_legacy_channel_best(&res_g);
+    let ch_r = encode_legacy_channel_best(&res_r);
+
+    pack_channels(7, &[&ch_b, &ch_g, &ch_r])
+}
+
 /// Compute a 256-entry histogram from a residual plane.
 fn histogram_from_plane(plane: &[u8]) -> [u32; 256] {
     let mut freq = [0u32; 256];
@@ -1267,6 +1374,322 @@ mod tests {
             simple.len(),
             delta,
         );
+    }
+
+    // ─────────── encode_legacy_channel_best — type-7 sub-path selection ───────────
+
+    /// `encode_legacy_channel_best` never produces a larger wire body
+    /// than `encode_legacy_channel` (the bare-Fibonacci baseline).
+    /// The selector strictly extends the candidate set with three
+    /// RLE-then-Fibonacci alternatives; the worst case is a tie —
+    /// never a regression.
+    #[test]
+    fn legacy_best_never_larger_than_bare_fib() {
+        for plane in legacy_best_test_planes() {
+            let bare = encode_legacy_channel(&plane);
+            let best = encode_legacy_channel_best(&plane);
+            assert!(
+                best.len() <= bare.len(),
+                "legacy best ({}) larger than bare ({}) on plane len {} \
+                 (best header {:#x}, bare header {:#x})",
+                best.len(),
+                bare.len(),
+                plane.len(),
+                best[0],
+                bare[0],
+            );
+        }
+    }
+
+    /// Every candidate header form `encode_legacy_channel_best` can
+    /// pick round-trips through `decode_legacy_channel` back to the
+    /// input plane, regardless of which sub-path the selector chose.
+    #[test]
+    fn legacy_best_roundtrips_through_decoder() {
+        use crate::channel::decode_legacy_channel;
+        for plane in legacy_best_test_planes() {
+            let channel = encode_legacy_channel_best(&plane);
+            let decoded = decode_legacy_channel(&channel, plane.len()).unwrap();
+            assert_eq!(
+                decoded,
+                plane,
+                "legacy roundtrip mismatch (best header {:#x}, plane len {})",
+                channel[0],
+                plane.len(),
+            );
+        }
+    }
+
+    /// The selector accepts only the four legal legacy headers
+    /// (`0x00..=0x03`); anything else would be rejected by
+    /// `decode_legacy_channel` as `Error::BadChannelHeader`.
+    #[test]
+    fn legacy_best_only_emits_legal_headers() {
+        for plane in legacy_best_test_planes() {
+            let channel = encode_legacy_channel_best(&plane);
+            let header = channel[0];
+            assert!(
+                (0x00..=0x03).contains(&header),
+                "legacy selector emitted illegal header {header:#x}",
+            );
+        }
+    }
+
+    /// Tie-breaker invariant: when the bare-Fibonacci form and the
+    /// shortest RLE-then-Fibonacci candidate produce equal-length
+    /// wire bodies (the realistic case — see
+    /// `legacy_best_always_picks_bare_on_realistic_inputs`), the
+    /// selector must return the bare-Fibonacci form unchanged. This
+    /// preserves the historical `encode_legacy_channel` byte stream
+    /// on every fixture and keeps the existing legacy roundtrip
+    /// tests in `roundtrip_tests.rs` byte-identical against the
+    /// new selector.
+    #[test]
+    fn legacy_best_tie_breaker_prefers_bare() {
+        // Use the same sparse fixture as
+        // `legacy_best_always_picks_bare_on_realistic_inputs`'s
+        // `sparse_7` case — empirically bare ties with all three
+        // RLE candidates (each +4 bytes from the u32 length field).
+        let mut plane = Vec::with_capacity(800);
+        for i in 0..800 {
+            plane.push(if i % 7 == 0 {
+                ((i / 7) % 5 + 1) as u8
+            } else {
+                0
+            });
+        }
+        let bare = encode_legacy_channel(&plane);
+        let best = encode_legacy_channel_best(&plane);
+        // Selector must pick bare on a tie (or strict win).
+        assert!(best.len() <= bare.len());
+        assert_eq!(best[0], 0x00, "tie-breaker must keep bare-Fib form");
+        // And the bytes must be byte-identical to the bare form, so
+        // the existing roundtrip suite's byte-by-byte assumptions
+        // about `encode_legacy_channel` output (if any) still hold.
+        assert_eq!(best, bare, "bare-tie must be byte-identical to bare");
+    }
+
+    /// `encode_legacy_rgb_best` (frame-level wrapper) round-trips
+    /// through `decode_frame` for the same fixture sizes the
+    /// existing `encode_legacy_rgb` roundtrip tests cover. This
+    /// confirms the per-channel selector composes correctly with
+    /// the type-7 frame-layout dispatcher (`spec/01` + `spec/07`
+    /// §1.2 channel-offset header).
+    #[test]
+    fn legacy_rgb_best_frame_roundtrips() {
+        use crate::decoder::{decode_frame, PixelKind};
+        // 4×4, 8×8, 16×12 — the existing legacy_rgb_roundtrip_*
+        // sizes from `roundtrip_tests.rs`. Stick to RGB-pattern
+        // inputs that won't trigger Strategy E.
+        for &(w, h) in &[(4u32, 4u32), (8, 8), (16, 12)] {
+            let n = (w * h) as usize;
+            // BGR24 pattern: gradient + offset so residuals aren't
+            // rare-symbol-cluster.
+            let mut pixels = Vec::with_capacity(n * 3);
+            for i in 0..n {
+                pixels.push(((i * 5 + 11) & 0xff) as u8);
+                pixels.push(((i * 7 + 3) & 0xff) as u8);
+                pixels.push(((i * 11 + 19) & 0xff) as u8);
+            }
+            let frame = encode_legacy_rgb_best(&pixels, w, h);
+            // Type byte 7 — confirms the frame-layout wrapper wasn't
+            // diverted to type 1 (`encode_uncompressed`) by Strategy E.
+            assert_eq!(
+                frame[0], 7,
+                "legacy_rgb_best Strategy E unexpectedly fired at {w}x{h}"
+            );
+            let decoded = decode_frame(&frame, w, h, PixelKind::Bgr24).unwrap();
+            assert_eq!(
+                decoded.pixels, pixels,
+                "legacy_rgb_best roundtrip mismatch at {w}x{h}",
+            );
+        }
+    }
+
+    /// Empirical finding: on every realistic residual histogram
+    /// probed, the Fibonacci-coded freq table produces **zero
+    /// `0x00` bytes** (the variable-length bit packing is too dense
+    /// to leave 8 zero bits aligned at any byte boundary), so the
+    /// RLE-then-Fibonacci sub-paths (`0x01..=0x03`) cannot reduce
+    /// the channel-prefix size — they only add the 4-byte u32
+    /// length field of `spec/07` §2.3, ending up 4 bytes *larger*
+    /// than bare-Fibonacci on every fixture. The selector therefore
+    /// always picks header `0x00` on realistic input. This test
+    /// pins that invariant so a future Fibonacci-encoding tweak
+    /// that does emit zero bytes (e.g. a padding form) would
+    /// surface as a deliberate failure here rather than silently
+    /// changing wire bytes.
+    ///
+    /// This is the encoder-direction empirical correction to
+    /// `spec/07` §6.3's framing of the two sub-paths as a
+    /// "compression trade-off": with the proprietary's bit-packed
+    /// Fibonacci layout, the trade-off has only one viable choice
+    /// for the encoder; the RLE-then-Fibonacci sub-path exists in
+    /// the decoder dispatcher for completeness (and to support
+    /// any future Fibonacci variant the spec adds) but is dead
+    /// weight on every histogram the cleanroom encoder can
+    /// reasonably produce.
+    #[test]
+    fn legacy_best_always_picks_bare_on_realistic_inputs() {
+        // Spread of realistic profiles: dense, sparse, two-symbol,
+        // biased-mid-band. None should leave the bare-Fibonacci form
+        // by more than zero bytes (i.e. selector's choice == bare).
+        let cases: &[(&str, Vec<u8>)] = &[
+            ("dense_256", (0u8..=255).collect()),
+            ("sparse_7", {
+                let mut p = Vec::new();
+                for i in 0..800 {
+                    p.push(if i % 7 == 0 {
+                        ((i / 7) % 5 + 1) as u8
+                    } else {
+                        0
+                    });
+                }
+                p
+            }),
+            ("two_symbol", {
+                let mut p = vec![0u8; 1000];
+                for i in (0..1000).step_by(13) {
+                    p[i] = 1;
+                }
+                p
+            }),
+            ("biased_50", {
+                let mut p = Vec::new();
+                for i in 0..2000 {
+                    p.push(if i % 3 == 0 { ((i % 50) + 5) as u8 } else { 0 });
+                }
+                p
+            }),
+        ];
+        for (label, plane) in cases {
+            let bare = encode_legacy_channel(plane);
+            let best = encode_legacy_channel_best(plane);
+            assert_eq!(
+                best.len(),
+                bare.len(),
+                "{label}: RLE-then-Fib unexpectedly beat bare-Fib by {} bytes \
+                 (bare={}, best={}, header={:#x}) — likely the Fibonacci \
+                 encoder began emitting 0x00 bytes the RLE escape can swallow; \
+                 if intentional, update this pin and the README empirical note.",
+                bare.len() as i64 - best.len() as i64,
+                bare.len(),
+                best.len(),
+                best[0],
+            );
+            assert_eq!(best[0], 0x00, "{label}: selector picked non-bare form");
+        }
+    }
+
+    /// `encode_legacy_rgb_best` is never larger than `encode_legacy_rgb`
+    /// on the fixtures both can handle (Strategy E branches identically
+    /// on the same input — both fall back to type 1 on rare-cluster
+    /// residuals, both run the entropy stage otherwise). The shorter
+    /// frame on either input proves the per-channel selector
+    /// propagates through the frame-layout wrapper.
+    #[test]
+    fn legacy_rgb_best_frame_never_larger() {
+        for &(w, h) in &[(4u32, 4u32), (8, 8), (16, 12)] {
+            let n = (w * h) as usize;
+            let mut pixels = Vec::with_capacity(n * 3);
+            for i in 0..n {
+                pixels.push(((i * 5 + 11) & 0xff) as u8);
+                pixels.push(((i * 7 + 3) & 0xff) as u8);
+                pixels.push(((i * 11 + 19) & 0xff) as u8);
+            }
+            let bare = encode_legacy_rgb(&pixels, w, h);
+            let best = encode_legacy_rgb_best(&pixels, w, h);
+            assert!(
+                best.len() <= bare.len(),
+                "legacy_rgb_best frame ({}) larger than legacy_rgb ({}) at {w}x{h}",
+                best.len(),
+                bare.len(),
+            );
+        }
+    }
+
+    /// Strategy E (audit/12 §7.1) propagates through the new
+    /// `encode_legacy_rgb_best` exactly as it does through the
+    /// existing `encode_legacy_rgb` / `encode_legacy_rgb_rle` paths
+    /// — the rare-symbol-cluster signature lives in the *residual
+    /// histogram* fed to the entropy stage, which is invariant
+    /// across the channel-prefix form choices the selector picks
+    /// between. So a near-flat input that diverts to type 1 in
+    /// `encode_legacy_rgb` must also divert to type 1 here.
+    #[test]
+    fn legacy_rgb_best_strategy_e_propagates() {
+        // The 33×27 near-flat fixture from
+        // `legacy_rgb_strategy_e_routes_near_flat_to_type_1` in
+        // `roundtrip_tests.rs` (audit/12 §3 canonical size). A solid
+        // colour plane with a single centre-pixel perturbation
+        // produces `freq[0] >= 0.95 * pixel_count` after predict +
+        // decorrelate plus a small rare-symbol tail, tripping the
+        // signature on at least one plane.
+        let (w, h) = (33u32, 27);
+        let n = (w * h) as usize;
+        let (bg_b, bg_g, bg_r) = (0xa0u8, 0xd7u8, 0x40u8);
+        let mut pixels = Vec::with_capacity(n * 3);
+        for _ in 0..n {
+            pixels.push(bg_b);
+            pixels.push(bg_g);
+            pixels.push(bg_r);
+        }
+        // Flip the green byte of the centre pixel by +0x40 — same
+        // bit-twist `near_flat_bgr24` applies in the existing tests.
+        let centre = (n / 2) * 3 + 1;
+        pixels[centre] = pixels[centre].wrapping_add(0x40);
+        let frame = encode_legacy_rgb_best(&pixels, w, h);
+        // Type 1 = uncompressed; Strategy E successfully diverted.
+        assert_eq!(
+            frame[0], 1,
+            "Strategy E must propagate through encode_legacy_rgb_best (got type {})",
+            frame[0],
+        );
+    }
+
+    /// Fixture set for the legacy selector tests — a mix of profiles
+    /// that exercise both the bare-Fibonacci and the
+    /// RLE-then-Fibonacci sub-paths. None of these residual
+    /// histograms trip the rare-symbol-cluster signature (so they
+    /// stay on the legacy entropy path rather than diverting to
+    /// type 1 in the frame-level wrapper).
+    fn legacy_best_test_planes() -> Vec<Vec<u8>> {
+        let mut planes = Vec::new();
+
+        // (a) Small deterministic plane — drives the dispatcher's
+        // 2-byte channel prefix at minimum size.
+        planes.push(vec![10u8, 20, 30, 40, 50, 60, 70, 80]);
+
+        // (b) Medium plane with a flat-ish histogram — bare
+        // Fibonacci's freq table is *dense* (every entry nonzero),
+        // so RLE on the freq-table buffer has nothing to compress
+        // and bare-Fib should win.
+        let dense: Vec<u8> = (0u8..=255).collect();
+        planes.push(dense);
+
+        // (c) Sparse-histogram plane — only a handful of distinct
+        // symbols, so most of the 256-entry transmitted freq table
+        // is zero codewords. RLE on the freq-table buffer should
+        // dominate.
+        let mut sparse = Vec::with_capacity(400);
+        for i in 0..400 {
+            sparse.push(((i % 11) * 17) as u8);
+        }
+        planes.push(sparse);
+
+        // (d) Plane that produces a moderately concentrated
+        // histogram — somewhere between (b) and (c). Tests the
+        // "neither obviously wins" regime.
+        let mut mid = Vec::with_capacity(300);
+        for i in 0..300u32 {
+            mid.push((i.wrapping_mul(37).wrapping_add(11) & 0x3f) as u8);
+        }
+        planes.push(mid);
+
+        // (e) Small ramp — minimum non-degenerate size.
+        planes.push((0u8..16).collect());
+
+        planes
     }
 
     /// Shared fixture set for the selector tests — a mix of profiles
