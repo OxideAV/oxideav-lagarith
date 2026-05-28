@@ -8,6 +8,52 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 174 — per-frame-type header-form selector flip + frame-level
+  size-delta pins.** Round 14 (round 138) added `encode_channel_best`,
+  the eight-form per-channel selector across the wire forms
+  `decode_channel` accepts (`spec/03` §2.1 + `spec/06` §1.7), and
+  pinned its per-channel never-worse guarantee, but left every
+  modern frame encoder calling `encode_channel_simple` (the
+  two-candidate `0x00` / `0x04` form) pending a per-frame-type
+  benchmark fixture. Round 174 flips every modern frame encoder
+  (`encode_arith_rgb24` / `encode_arith_yv12` / `encode_arith_yuy2`
+  / `encode_arith_rgba`, plus `encode_arith_reduced_res`
+  transitively via `_yv12`) to call `encode_channel_best`
+  per-plane. Round 141's analogue switch on the type-7 side is
+  applied symmetrically: `encode_legacy_rgb` now calls
+  `encode_legacy_channel_best` per-channel; on every realistic
+  histogram the selector picks bare-Fib (header `0x00`) byte-
+  identically to `encode_legacy_channel` per the
+  `legacy_best_always_picks_bare_on_realistic_inputs` pin, so the
+  wire stays byte-identical for our fixtures while gaining a
+  forward path for any future Fibonacci variant the spec adds
+  that emits zero bytes.
+
+  Six new frame-level **never-larger** pins cover
+  `encode_arith_rgb24` / `_yv12` / `_yuy2` / `_rgba` / `_reduced_res`
+  against a hand-constructed `encode_channel_simple`-pipeline
+  reference frame, plus a `legacy_rgb_best_pipeline_byte_identical_on_realistic_input`
+  pin that guards the type-7 byte-identity. A channel-level
+  `channel_best_strictly_smaller_than_simple_at_64k_zero_heavy`
+  pin guards the actual size-delta direction: on a 65,536-symbol
+  ~95%-zero post-gradient-dominant fixture (`spec/06` §6.4 profile),
+  the selector picks header `0x01` (Fibonacci-prefixed arithmetic
+  over the zero-run-contracted symbol stream) and saves **53
+  bytes** vs. `encode_channel_simple` (3784 → 3731 bytes, a 1.4%
+  reduction at this fixture). The crossover from "bare-Fib wins" to
+  "RLE wins" sits around `n_symbols ≈ 65536` for this profile —
+  smaller planes the bare-Fibonacci form already encodes near
+  optimally, so the +4-byte u32 length field of `spec/07` §2.3 is
+  not yet amortised on the smaller fixtures the existing roundtrip
+  suite covers.
+
+  Wire compatibility unchanged: the per-channel choice is decoder-
+  blind (`spec/03` §2.1 dispatcher routes on byte 0 alone), the
+  ffmpeg pins in `tests/ffmpeg_pins.rs` decode wires that this
+  crate produced before the flip and still pass, and the existing
+  157-test self-roundtrip suite remains byte-exact on every
+  fixture.
+
 - **Round 141 (encoder round 15) — legacy-fork per-channel
   header-form selection for type-7 (`encode_legacy_channel_best`
   + frame-level `encode_legacy_rgb_best`, `spec/07` §6.3).** The

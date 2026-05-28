@@ -1409,3 +1409,489 @@ fn legacy_decode_self_roundtrip_unaffected_by_round_7_guard() {
     let dec = decode_frame(&frame, w, h, PixelKind::Bgr24).unwrap();
     assert_eq!(dec.pixels, pixels);
 }
+
+// ─────────── round 174: per-frame-type header-form selector ───────────
+//
+// Round 14 added `encode_channel_best` (the eight-form per-channel
+// selector) but left every modern frame encoder pinned on
+// `encode_channel_simple` (the two-candidate `0x00` / `0x04` form),
+// pending a per-frame-type benchmark fixture so the size-delta
+// could be measured per frame type rather than per channel.
+//
+// Round 174 flips every modern frame encoder
+// (`encode_arith_rgb24` / `_yv12` / `_yuy2` / `_rgba`, plus
+// `_reduced_res` transitively via `_yv12`) to call
+// `encode_channel_best` per-plane. The selector's per-channel
+// `best_never_larger_than_simple` pin in `encoder::tests` already
+// guards the per-channel direction; the tests below pin the
+// frame-level **composition** — that propagating the selector
+// through `pack_channels` + the frame-layout dispatcher cannot
+// regress the wire size relative to a hand-constructed
+// `encode_channel_simple`-pipeline reference frame.
+//
+// The `channel_best_strictly_smaller_than_simple_at_64k_zero_heavy`
+// test below pins the channel-level crossover (where the selector
+// actually picks an RLE form over bare-Fibonacci) so a future
+// regression that silently makes `encode_channel_best` collapse to
+// `encode_channel_simple` semantics surfaces as a concrete size
+// failure.
+//
+// The `legacy_rgb_best_pipeline_byte_identical_on_realistic_input`
+// test below pins that the type-7 call-site flip (`encode_legacy_rgb`
+// now calls `encode_legacy_channel_best`) is byte-identical to the
+// pre-round-174 bare-Fibonacci form on every realistic histogram,
+// matching the encoder-direction empirical correction documented in
+// `encoder::tests::legacy_best_always_picks_bare_on_realistic_inputs`.
+
+mod best_pipeline_size_delta {
+    use super::*;
+    use crate::encoder::{encode_channel_simple, encode_uncompressed};
+    use crate::frame::pack_channels;
+    use crate::predict::{
+        apply_plane_forward, apply_plane_forward_with_rule, cross_plane_decorrelate_rgb_forward,
+        FirstColRule,
+    };
+
+    /// A zero-heavy byte profile that mimics a post-gradient
+    /// Lagarith residual — `spec/06` §6.4 documents the realistic
+    /// distribution as `freq[0] >= 0.95 * pixel_count`. We
+    /// deterministically scatter Laplacian-tail non-zero bytes into
+    /// roughly the right slots so the histogram is dominated by
+    /// symbol 0 but not entirely so (the Step-A fast path's
+    /// expected production input).
+    fn zero_heavy_plane(n: usize) -> Vec<u8> {
+        let mut out = vec![0u8; n];
+        // Sprinkle ~5% non-zero bytes via a small Laplacian tail.
+        // Slot ordering: a deterministic stride avoids accidental
+        // alignment with the chroma sub-sample lattice in YUY2 /
+        // YV12 below.
+        for k in 0..(n / 20).max(1) {
+            let idx = (k * 37 + 11) % n;
+            // Laplacian-shaped magnitude: heavy on +/-1, light tail.
+            let mag = ((k * 73 + 19) & 0xf) as i32;
+            let signed = if k & 1 == 0 { mag } else { -mag };
+            out[idx] = (signed as i8) as u8;
+        }
+        out
+    }
+
+    /// Build a "simple-pipeline" type-2/4 frame from BGR24 pixels —
+    /// exactly what `encode_arith_rgb24` did before round 174 (so
+    /// the round-174 production output can be compared byte-count
+    /// against this baseline).
+    fn simple_rgb24_frame(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
+        let n = width as usize * height as usize;
+        let mut plane_b = Vec::with_capacity(n);
+        let mut plane_g = Vec::with_capacity(n);
+        let mut plane_r = Vec::with_capacity(n);
+        for px in pixels.chunks_exact(3) {
+            plane_b.push(px[0]);
+            plane_g.push(px[1]);
+            plane_r.push(px[2]);
+        }
+        cross_plane_decorrelate_rgb_forward(&mut plane_b, &plane_g, &mut plane_r);
+        let res_b = apply_plane_forward_with_rule(
+            &plane_b,
+            width as usize,
+            height as usize,
+            FirstColRule::B,
+        );
+        let res_g = apply_plane_forward_with_rule(
+            &plane_g,
+            width as usize,
+            height as usize,
+            FirstColRule::B,
+        );
+        let res_r = apply_plane_forward_with_rule(
+            &plane_r,
+            width as usize,
+            height as usize,
+            FirstColRule::B,
+        );
+        let ch_b = encode_channel_simple(&res_b);
+        let ch_g = encode_channel_simple(&res_g);
+        let ch_r = encode_channel_simple(&res_r);
+        let type_byte = if width % 4 == 0 { 4 } else { 2 };
+        pack_channels(type_byte, &[&ch_b, &ch_g, &ch_r])
+    }
+
+    /// Simple-pipeline type-8 (RGBA) reference — same shape as above.
+    fn simple_rgba_frame(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
+        let n = width as usize * height as usize;
+        let mut plane_b = Vec::with_capacity(n);
+        let mut plane_g = Vec::with_capacity(n);
+        let mut plane_r = Vec::with_capacity(n);
+        let mut plane_a = Vec::with_capacity(n);
+        for px in pixels.chunks_exact(4) {
+            plane_b.push(px[0]);
+            plane_g.push(px[1]);
+            plane_r.push(px[2]);
+            plane_a.push(px[3]);
+        }
+        cross_plane_decorrelate_rgb_forward(&mut plane_b, &plane_g, &mut plane_r);
+        let res_b = apply_plane_forward_with_rule(
+            &plane_b,
+            width as usize,
+            height as usize,
+            FirstColRule::B,
+        );
+        let res_g = apply_plane_forward_with_rule(
+            &plane_g,
+            width as usize,
+            height as usize,
+            FirstColRule::B,
+        );
+        let res_r = apply_plane_forward_with_rule(
+            &plane_r,
+            width as usize,
+            height as usize,
+            FirstColRule::B,
+        );
+        let res_a = apply_plane_forward_with_rule(
+            &plane_a,
+            width as usize,
+            height as usize,
+            FirstColRule::B,
+        );
+        let ch_b = encode_channel_simple(&res_b);
+        let ch_g = encode_channel_simple(&res_g);
+        let ch_r = encode_channel_simple(&res_r);
+        let ch_a = encode_channel_simple(&res_a);
+        pack_channels(8, &[&ch_b, &ch_g, &ch_r, &ch_a])
+    }
+
+    /// Simple-pipeline type-10 (YV12) reference.
+    fn simple_yv12_frame(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
+        let w = width as usize;
+        let h = height as usize;
+        let y_pixels = w * h;
+        let c_pixels = y_pixels / 4;
+        let plane_y = &pixels[..y_pixels];
+        let plane_v = &pixels[y_pixels..y_pixels + c_pixels];
+        let plane_u = &pixels[y_pixels + c_pixels..];
+        let res_y = apply_plane_forward(plane_y, w, h);
+        let cw = w / 2;
+        let ch = h / 2;
+        let res_v = apply_plane_forward(plane_v, cw, ch);
+        let res_u = apply_plane_forward(plane_u, cw, ch);
+        let ch_y = encode_channel_simple(&res_y);
+        let ch_v = encode_channel_simple(&res_v);
+        let ch_u = encode_channel_simple(&res_u);
+        pack_channels(10, &[&ch_y, &ch_v, &ch_u])
+    }
+
+    /// Simple-pipeline type-3 (YUY2) reference.
+    fn simple_yuy2_frame(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
+        let w = width as usize;
+        let h = height as usize;
+        let cw = w / 2;
+        let y_pixels = w * h;
+        let c_pixels = cw * h;
+        let mut plane_y = Vec::with_capacity(y_pixels);
+        let mut plane_u = Vec::with_capacity(c_pixels);
+        let mut plane_v = Vec::with_capacity(c_pixels);
+        for y in 0..h {
+            let in_row = y * w * 2;
+            for k in 0..cw {
+                plane_y.push(pixels[in_row + 4 * k]);
+                plane_u.push(pixels[in_row + 4 * k + 1]);
+                plane_y.push(pixels[in_row + 4 * k + 2]);
+                plane_v.push(pixels[in_row + 4 * k + 3]);
+            }
+        }
+        let res_y = apply_plane_forward(&plane_y, w, h);
+        let res_u = apply_plane_forward(&plane_u, cw, h);
+        let res_v = apply_plane_forward(&plane_v, cw, h);
+        let ch_y = encode_channel_simple(&res_y);
+        let ch_u = encode_channel_simple(&res_u);
+        let ch_v = encode_channel_simple(&res_v);
+        pack_channels(3, &[&ch_y, &ch_u, &ch_v])
+    }
+
+    /// Every test below decodes the production frame and asserts
+    /// it round-trips byte-exactly. That guard means a regression
+    /// of the new pipeline (e.g. mis-selected header that decodes
+    /// to a different plane) surfaces immediately, independent of
+    /// the size-delta assertion.
+    fn assert_decodes_to(frame: &[u8], pixels: &[u8], w: u32, h: u32, kind: PixelKind) {
+        let decoded = decode_frame(frame, w, h, kind).unwrap();
+        assert_eq!(
+            decoded.pixels, pixels,
+            "round-174 frame must round-trip byte-exactly under {kind:?} at {w}×{h}",
+        );
+    }
+
+    /// At large enough planes the per-channel selector picks an
+    /// RLE form (header `0x01` — Fibonacci-prefixed arithmetic over
+    /// the zero-run-contracted symbol stream) over the bare
+    /// Fibonacci+arith of `encode_channel_simple`. Empirically the
+    /// crossover is around `n_symbols = 65536` for the `~95% zero,
+    /// 5% scattered tail` profile this module synthesises — the
+    /// +4-byte u32 length field of `spec/07` §2.3 has to be
+    /// amortised across enough symbols for the post-RLE byte count
+    /// reduction to come out ahead. This test pins the crossover so
+    /// any future selector regression that silently picks bare-Fib
+    /// at this size surfaces immediately.
+    #[test]
+    fn channel_best_strictly_smaller_than_simple_at_64k_zero_heavy() {
+        let plane = zero_heavy_plane(65536);
+        let simple = encode_channel_simple(&plane);
+        let best = crate::encoder::encode_channel_best(&plane);
+        assert!(
+            best.len() < simple.len(),
+            "expected best<simple at n=65536, got best={} (h={:#x}) simple={} (h={:#x})",
+            best.len(),
+            best[0],
+            simple.len(),
+            simple[0],
+        );
+        // At this fixture size the selector should pick an RLE form
+        // — pin the header byte so a future encoder change that
+        // shifts the selector to a different sub-path surfaces
+        // here (and the saving migrates to whichever new form
+        // overtook 0x01).
+        assert!(
+            (0x01..=0x07).contains(&best[0]),
+            "expected an RLE header (0x01..=0x07), got {:#x}",
+            best[0]
+        );
+    }
+
+    // ─── type 4 (Arithmetic RGB24, width % 4 == 0) ───
+
+    #[test]
+    fn arith_rgb24_best_never_larger_than_simple() {
+        // Probe several power-of-two-pixel sizes (the same regime
+        // `tests/ffmpeg_pins.rs` covers). On every probed size the
+        // new pipeline must produce ≤ the simple-pipeline length.
+        for &(w, h) in &[(4u32, 4u32), (8, 8), (8, 16), (16, 16)] {
+            let pixels = pattern_bgr24(w, h);
+            let simple = simple_rgb24_frame(&pixels, w, h);
+            let best = encode_arith_rgb24(&pixels, w, h);
+            assert!(
+                best.len() <= simple.len(),
+                "rgb24 best ({}) larger than simple ({}) at {w}×{h}",
+                best.len(),
+                simple.len(),
+            );
+            assert_decodes_to(&best, &pixels, w, h, PixelKind::Bgr24);
+        }
+    }
+
+    // ─── type 8 (Arithmetic RGBA) ───
+
+    #[test]
+    fn arith_rgba_best_never_larger_than_simple() {
+        for &(w, h) in &[(4u32, 4u32), (8, 8), (16, 16)] {
+            let pixels = pattern_bgra32(w, h);
+            let simple = simple_rgba_frame(&pixels, w, h);
+            let best = encode_arith_rgba(&pixels, w, h);
+            assert!(
+                best.len() <= simple.len(),
+                "rgba best ({}) larger than simple ({}) at {w}×{h}",
+                best.len(),
+                simple.len(),
+            );
+            assert_decodes_to(&best, &pixels, w, h, PixelKind::Bgra32);
+        }
+    }
+
+    // ─── type 10 (Arithmetic YV12) ───
+
+    #[test]
+    fn arith_yv12_best_never_larger_than_simple() {
+        for &(w, h) in &[(4u32, 4u32), (8, 8), (16, 16)] {
+            let pixels = pattern_yv12(w, h);
+            let simple = simple_yv12_frame(&pixels, w, h);
+            let best = encode_arith_yv12(&pixels, w, h);
+            assert!(
+                best.len() <= simple.len(),
+                "yv12 best ({}) larger than simple ({}) at {w}×{h}",
+                best.len(),
+                simple.len(),
+            );
+            assert_decodes_to(&best, &pixels, w, h, PixelKind::Yv12);
+        }
+    }
+
+    // ─── type 3 (Arithmetic YUY2) ───
+
+    #[test]
+    fn arith_yuy2_best_never_larger_than_simple() {
+        for &(w, h) in &[(4u32, 4u32), (8, 8), (16, 16)] {
+            let pixels = pattern_yuy2(w, h);
+            let simple = simple_yuy2_frame(&pixels, w, h);
+            let best = encode_arith_yuy2(&pixels, w, h);
+            assert!(
+                best.len() <= simple.len(),
+                "yuy2 best ({}) larger than simple ({}) at {w}×{h}",
+                best.len(),
+                simple.len(),
+            );
+            assert_decodes_to(&best, &pixels, w, h, PixelKind::Yuy2);
+        }
+    }
+
+    // ─── type 11 (Reduced-resolution YV12) ───
+    //
+    // Type 11 routes through `encode_arith_yv12` after a 2× skip
+    // downsample (`spec/01` §2.4 — the wire body is a half-W/half-H
+    // type-10 frame with byte 0 rewritten to 0x0b). So the type-11
+    // never-larger guarantee follows transitively from
+    // `arith_yv12_best_never_larger_than_simple`. A separate
+    // self-roundtrip test is already covered by the existing
+    // `reduced_res_*_roundtrip` suite above; pin the size invariant
+    // here so the type-11 dispatcher's pipeline composition is
+    // explicitly guarded.
+    #[test]
+    fn arith_reduced_res_best_never_larger_than_simple() {
+        use crate::encoder::encode_arith_reduced_res;
+        for &(w, h) in &[(8u32, 8u32), (16, 16), (32, 32)] {
+            // `pattern_yv12_2x_block_constant` makes each 2×2 block
+            // constant so the nearest-neighbour 2× upscale matches
+            // the original full-resolution pixels — required for the
+            // reduced-res self-roundtrip to succeed.
+            let pixels = pattern_yv12_2x_block_constant(w, h);
+            // Construct the simple-pipeline reference: run the same
+            // downsample inline (so the comparison stays apples-to-
+            // apples), then drive it through `simple_yv12_frame` and
+            // rewrite byte 0 to 0x0b like `encode_arith_reduced_res`.
+            let wy = w as usize;
+            let hy = h as usize;
+            let half_w = wy / 2;
+            let half_h = hy / 2;
+            let small_cw = half_w / 2;
+            let small_ch = half_h / 2;
+            let small_y = half_w * half_h;
+            let small_c = small_cw * small_ch;
+            let mut buf = Vec::with_capacity(small_y + 2 * small_c);
+            let big_y = wy * hy;
+            let big_cw = wy / 2;
+            let big_ch = hy / 2;
+            let big_c = big_cw * big_ch;
+            // Y plane downsample (skip-by-2).
+            for y in 0..half_h {
+                let row = (2 * y) * wy;
+                for x in 0..half_w {
+                    buf.push(pixels[row + 2 * x]);
+                }
+            }
+            for y in 0..small_ch {
+                let row = big_y + (2 * y) * big_cw;
+                for x in 0..small_cw {
+                    buf.push(pixels[row + 2 * x]);
+                }
+            }
+            for y in 0..small_ch {
+                let row = big_y + big_c + (2 * y) * big_cw;
+                for x in 0..small_cw {
+                    buf.push(pixels[row + 2 * x]);
+                }
+            }
+            let mut simple = simple_yv12_frame(&buf, half_w as u32, half_h as u32);
+            simple[0] = 11;
+            let best = encode_arith_reduced_res(&pixels, w, h);
+            assert!(
+                best.len() <= simple.len(),
+                "reduced-res best ({}) larger than simple ({}) at {w}×{h}",
+                best.len(),
+                simple.len(),
+            );
+            assert_decodes_to(&best, &pixels, w, h, PixelKind::Yv12);
+        }
+    }
+
+    // ─── type 7 (Legacy RGB) ───
+    //
+    // `encode_legacy_rgb` flipped to call `encode_legacy_channel_best`
+    // per-channel in round 174. The
+    // `legacy_best_always_picks_bare_on_realistic_inputs` pin in
+    // `encoder::tests` already proves the selector picks the bare-
+    // Fibonacci header (`0x00`) on every realistic residual histogram
+    // the cleanroom encoder can produce, so the frame bytes should
+    // be byte-identical to a hand-constructed "always bare" baseline
+    // for our test fixtures.
+
+    #[test]
+    fn legacy_rgb_best_pipeline_byte_identical_on_realistic_input() {
+        use crate::encoder::{encode_legacy_channel, encode_legacy_rgb};
+        // The cleanroom's "always pick bare-Fibonacci" pipeline (the
+        // pre-round-174 form) constructed inline.
+        fn always_bare_legacy_rgb(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
+            let n = width as usize * height as usize;
+            let mut plane_b = Vec::with_capacity(n);
+            let mut plane_g = Vec::with_capacity(n);
+            let mut plane_r = Vec::with_capacity(n);
+            for px in pixels.chunks_exact(3) {
+                plane_b.push(px[0]);
+                plane_g.push(px[1]);
+                plane_r.push(px[2]);
+            }
+            cross_plane_decorrelate_rgb_forward(&mut plane_b, &plane_g, &mut plane_r);
+            let res_b = apply_plane_forward_with_rule(
+                &plane_b,
+                width as usize,
+                height as usize,
+                FirstColRule::B,
+            );
+            let res_g = apply_plane_forward_with_rule(
+                &plane_g,
+                width as usize,
+                height as usize,
+                FirstColRule::B,
+            );
+            let res_r = apply_plane_forward_with_rule(
+                &plane_r,
+                width as usize,
+                height as usize,
+                FirstColRule::B,
+            );
+            // Strategy E guard is the same — the same input goes
+            // through either path identically.
+            let fb = {
+                let mut f = [0u32; 256];
+                for &b in &res_b {
+                    f[b as usize] += 1;
+                }
+                f
+            };
+            let fg = {
+                let mut f = [0u32; 256];
+                for &b in &res_g {
+                    f[b as usize] += 1;
+                }
+                f
+            };
+            let fr = {
+                let mut f = [0u32; 256];
+                for &b in &res_r {
+                    f[b as usize] += 1;
+                }
+                f
+            };
+            use crate::legacy_range_coder::is_rare_symbol_cluster;
+            if is_rare_symbol_cluster(&fb)
+                || is_rare_symbol_cluster(&fg)
+                || is_rare_symbol_cluster(&fr)
+            {
+                return encode_uncompressed(pixels);
+            }
+            let ch_b = encode_legacy_channel(&res_b);
+            let ch_g = encode_legacy_channel(&res_g);
+            let ch_r = encode_legacy_channel(&res_r);
+            pack_channels(7, &[&ch_b, &ch_g, &ch_r])
+        }
+        for &(w, h) in &[(4u32, 4u32), (8, 8), (16, 12)] {
+            let pixels = pattern_bgr24(w, h);
+            let bare = always_bare_legacy_rgb(&pixels, w, h);
+            let best = encode_legacy_rgb(&pixels, w, h);
+            assert_eq!(
+                best, bare,
+                "round-174 legacy_rgb diverged from bare-Fibonacci baseline at {w}×{h} \
+                 — the `legacy_best_always_picks_bare_on_realistic_inputs` invariant \
+                 might have shifted; update both pins together if intentional"
+            );
+            assert_decodes_to(&best, &pixels, w, h, PixelKind::Bgr24);
+        }
+    }
+}

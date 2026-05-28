@@ -305,10 +305,14 @@ pub fn encode_channel_raw_rle(plane: &[u8], escape_len: usize) -> Vec<u8> {
 /// regardless of which form the encoder picked. So replacing
 /// `encode_channel_simple` with `encode_channel_best` in a frame
 /// encoder cannot regress self-roundtrip correctness; it can only
-/// shorten the output. The frame-encoder call sites continue to
-/// use `encode_channel_simple` for now — the wider switch is a
-/// follow-up round once a benchmark fixture is wired so the
-/// size-delta is measurable per frame type.
+/// shorten the output. As of round 174 every modern frame encoder
+/// (`encode_arith_rgb24` / `encode_arith_yv12` / `encode_arith_yuy2`
+/// / `encode_arith_rgba` and their `encode_arith_reduced_res`
+/// dispatcher) routes per-channel through this selector. The
+/// `encode_channel_simple` entry point is retained for direct use
+/// (header `0x00` / `0x04` two-candidate path) by the rescale-cap
+/// test scaffold (`encode_channel_simple_capped`) and by callers
+/// that want the historical wire byte-identically.
 pub fn encode_channel_best(plane: &[u8]) -> Vec<u8> {
     // Solid-fill / empty short-circuit — preserves the
     // `encode_channel_simple` early-return semantics (2 bytes is
@@ -448,10 +452,15 @@ pub fn encode_arith_rgb24(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
     let res_r =
         apply_plane_forward_with_rule(&plane_r, width as usize, height as usize, FirstColRule::B);
 
-    // Per-channel encode.
-    let ch_b = encode_channel_simple(&res_b);
-    let ch_g = encode_channel_simple(&res_g);
-    let ch_r = encode_channel_simple(&res_r);
+    // Per-channel encode — header-form selector picks the shortest
+    // wire body from the eight legal forms `decode_channel` accepts
+    // (`spec/03` §2.1 + `spec/06` §1.7). Per-channel and per-plane
+    // choices are externally invisible (the decoder dispatches on
+    // byte 0) so the wire stays decode-compatible with every
+    // conformant decoder; only the size can change.
+    let ch_b = encode_channel_best(&res_b);
+    let ch_g = encode_channel_best(&res_g);
+    let ch_r = encode_channel_best(&res_r);
 
     // Choose type 4 (width % 4 == 0) or type 2 (otherwise).
     let type_byte = if width % 4 == 0 { 4 } else { 2 };
@@ -488,9 +497,11 @@ pub fn encode_arith_yv12(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
         )
     };
 
-    let ch_y = encode_channel_simple(&res_y);
-    let ch_v = encode_channel_simple(&res_v);
-    let ch_u = encode_channel_simple(&res_u);
+    // Per-channel header-form selector — see `encode_channel_best`
+    // for the candidate set and `spec/06` §1.5 fall-back guard.
+    let ch_y = encode_channel_best(&res_y);
+    let ch_v = encode_channel_best(&res_v);
+    let ch_u = encode_channel_best(&res_u);
 
     pack_channels(10, &[&ch_y, &ch_v, &ch_u])
 }
@@ -526,9 +537,10 @@ pub fn encode_arith_yuy2(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
     let res_u = apply_plane_forward(&plane_u, cw, h);
     let res_v = apply_plane_forward(&plane_v, cw, h);
 
-    let ch_y = encode_channel_simple(&res_y);
-    let ch_u = encode_channel_simple(&res_u);
-    let ch_v = encode_channel_simple(&res_v);
+    // Per-channel header-form selector — see `encode_channel_best`.
+    let ch_y = encode_channel_best(&res_y);
+    let ch_u = encode_channel_best(&res_u);
+    let ch_v = encode_channel_best(&res_v);
 
     pack_channels(3, &[&ch_y, &ch_u, &ch_v])
 }
@@ -873,13 +885,17 @@ pub fn encode_legacy_channel_best(plane: &[u8]) -> Vec<u8> {
 /// type 1 (the divergence is in the range-coder body, not the
 /// channel-prefix form, so it triggers identically here).
 ///
-/// Test-only — drives the new round-141 roundtrip suite for the
-/// legacy header-form selector. The frame-level `encode_legacy_rgb`
-/// continues to use `encode_legacy_channel` for now; flipping the
-/// production call site is a follow-up step paired with a per-
-/// fixture-class size-delta benchmark (parallel to how the modern
-/// fork's `encode_arith_rgb24` still calls `encode_channel_simple`
-/// at the end of round 138).
+/// Originally introduced round 141 to drive the legacy header-form
+/// selector's roundtrip suite while the frame-level `encode_legacy_rgb`
+/// kept its bare-Fibonacci call site. Round 174 flipped
+/// `encode_legacy_rgb` to call `encode_legacy_channel_best` per-
+/// channel; on every realistic histogram the cleanroom encoder
+/// produces the selector picks bare-Fib (header `0x00`) byte-
+/// identically to `encode_legacy_channel` (per the
+/// `legacy_best_always_picks_bare_on_realistic_inputs` pin), so
+/// `encode_legacy_rgb_best` and `encode_legacy_rgb` produce the
+/// same wire bytes today. This helper is retained as an explicit
+/// "always pick the best legacy sub-path" entry point.
 pub fn encode_legacy_rgb_best(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
     let n = width as usize * height as usize;
     debug_assert_eq!(pixels.len(), n * 3);
@@ -994,9 +1010,18 @@ pub fn encode_legacy_rgb(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
         return encode_uncompressed(pixels);
     }
 
-    let ch_b = encode_legacy_channel(&res_b);
-    let ch_g = encode_legacy_channel(&res_g);
-    let ch_r = encode_legacy_channel(&res_r);
+    // Per-channel selector — header-form picker across the four
+    // legal legacy sub-paths (`0x00..=0x03`). On every realistic
+    // residual histogram the cleanroom encoder can produce the
+    // selector picks the bare-Fibonacci form (header `0x00`)
+    // byte-identically to `encode_legacy_channel`, per the
+    // `legacy_best_always_picks_bare_on_realistic_inputs` pin —
+    // so flipping the production call site here is a structural
+    // never-larger guarantee + a forward hook for any future
+    // Fibonacci variant the spec adds that does emit zero bytes.
+    let ch_b = encode_legacy_channel_best(&res_b);
+    let ch_g = encode_legacy_channel_best(&res_g);
+    let ch_r = encode_legacy_channel_best(&res_r);
 
     pack_channels(7, &[&ch_b, &ch_g, &ch_r])
 }
@@ -1075,10 +1100,11 @@ pub fn encode_arith_rgba(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
     let res_a =
         apply_plane_forward_with_rule(&plane_a, width as usize, height as usize, FirstColRule::B);
 
-    let ch_b = encode_channel_simple(&res_b);
-    let ch_g = encode_channel_simple(&res_g);
-    let ch_r = encode_channel_simple(&res_r);
-    let ch_a = encode_channel_simple(&res_a);
+    // Per-channel header-form selector — see `encode_channel_best`.
+    let ch_b = encode_channel_best(&res_b);
+    let ch_g = encode_channel_best(&res_g);
+    let ch_r = encode_channel_best(&res_r);
+    let ch_a = encode_channel_best(&res_a);
 
     pack_channels(8, &[&ch_b, &ch_g, &ch_r, &ch_a])
 }

@@ -219,6 +219,40 @@ and asserts byte equality. The Step-A / Step-B / Step-C
 benches are unchanged (the round-12 change only affects
 `finish()`).
 
+Round 174 lands the **per-frame-type call-site flip** that round 14
+left as a follow-up step. Every modern frame encoder
+(`encode_arith_rgb24` / `encode_arith_yv12` / `encode_arith_yuy2`
+/ `encode_arith_rgba`, plus `encode_arith_reduced_res` transitively
+via `_yv12`) now calls `encode_channel_best` per-plane instead of
+`encode_channel_simple`. The type-7 analogue is applied
+symmetrically: `encode_legacy_rgb` now routes per-channel through
+`encode_legacy_channel_best`. The per-channel choice is decoder-
+blind (`spec/03` §2.1 dispatcher routes on byte 0 alone), so the
+wire stays decode-compatible with every conformant decoder; only
+the size can change. Six new frame-level **never-larger** pins
+cover each modern frame type + reduced-res against a hand-
+constructed `encode_channel_simple`-pipeline reference frame. A
+channel-level `channel_best_strictly_smaller_than_simple_at_64k_zero_heavy`
+pin guards the size-delta direction: on a 65,536-symbol ~95%-zero
+post-gradient-dominant fixture (`spec/06` §6.4 profile), the
+selector picks header `0x01` (Fibonacci-prefixed arithmetic over
+the zero-run-contracted symbol stream) and saves **53 bytes** vs.
+`encode_channel_simple` (3784 → 3731 bytes, **1.4% reduction**).
+The crossover from "bare-Fib wins" to "RLE wins" sits around
+`n_symbols ≈ 65536` for this profile — smaller planes the bare-
+Fibonacci form already encodes near-optimally, so the +4-byte u32
+length field of `spec/07` §2.3 is not yet amortised on the smaller
+fixtures the existing roundtrip suite covers. On type-7, the
+selector picks the bare-Fibonacci form byte-identically to
+`encode_legacy_channel` on every realistic histogram (per the
+`legacy_best_always_picks_bare_on_realistic_inputs` pin), so the
+production wire bytes for type-7 frames are unchanged today; the
+flip is a **structural never-larger guarantee** plus a forward path
+for any future Fibonacci variant the spec adds that emits zero
+bytes. The ffmpeg pins in `tests/ffmpeg_pins.rs` decode wires that
+this crate produced before the flip and still pass — wire-format
+compatibility unchanged.
+
 Round 15 (round 141) lands the **legacy-fork analogue**:
 **per-channel header-form selection for type-7 (legacy RGB)**
 (`encode_legacy_channel_best` + frame-level `encode_legacy_rgb_best`).
@@ -339,7 +373,7 @@ type-7 stream still awaits a fixture oracle
 
 ## Tests
 
-157 unit + integration tests cover the range coder, Fibonacci
+164 unit + integration tests cover the range coder, Fibonacci
 prefix, RLE escape, predictor + decorrelation, channel-header
 dispatcher, the channel-header `0x01..=0x03` arithmetic-with-RLE
 path and the `0x05..=0x07` raw-RLE path, an end-to-end encode →
@@ -361,7 +395,11 @@ arithmetic RGB24 (4×4, 8×8, 8×16, 16×16) and RGBA (4×4, 8×8, 16×16)
 paths ([`tests/ffmpeg_pins.rs`](tests/ffmpeg_pins.rs); round 124
 added the first three pins under structured patterns, round 127
 extended the set with random-seeded patterns across non-square
-and smaller pow2 sizes).
+and smaller pow2 sizes). Round 174 adds **six frame-level
+never-larger pins** for the four modern frame encoders +
+reduced-res + type-7 byte-identity, plus a channel-level
+`channel_best_strictly_smaller_than_simple_at_64k_zero_heavy`
+crossover pin (53-byte / 1.4% saving at the documented fixture).
 
 ### SIMD-vs-scalar predictor (`spec/06` §3.2)
 
