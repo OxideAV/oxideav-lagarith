@@ -2343,4 +2343,143 @@ mod decoder_defensive_harness {
             }
         }
     }
+
+    // ─── reduced-resolution (type 11) dimension validation ───
+    //
+    // Round 187 tightens `decode_reduced_res` to reject host dimensions
+    // that aren't a multiple of 4. The 2× nearest-neighbour upscale
+    // per `spec/01` §2.4 reads from a half-resolution YV12 frame at
+    // `(W/2, H/2)`; for the upscaler to tile cleanly onto the host
+    // buffer we need `width == 2 * half_w` and `height == 2 * half_h`,
+    // and for the embedded half-res YV12 chroma plane (4:2:0,
+    // `spec/03` §6.1) we need `half_w` and `half_h` to each be even —
+    // i.e. host W and H each a multiple of 4. The previous bound
+    // checked only `half_w >= 1 && half_h >= 1`, which silently
+    // zeroed the chroma planes in release builds (and would
+    // `debug_assert!` panic in debug) when the host fed odd
+    // dimensions. The new bound surfaces these inputs as
+    // [`Error::BadDimensions`] before any wire bytes are consulted.
+
+    /// A type-11 frame at an odd width (`width % 2 == 1`) cannot
+    /// produce an integer-pixel 2× upscale; the decoder must surface
+    /// [`Error::BadDimensions`] up-front rather than running a
+    /// partially-correct upscale.
+    #[test]
+    fn reduced_res_odd_width_is_bad_dimensions() {
+        // Minimum non-empty type-11 prefix: 1 frame-type byte + 8
+        // channel-offset bytes (2 × u32) for a 3-plane YV12 body.
+        let mut payload = vec![11u8];
+        payload.extend_from_slice(&[0u8; 8]);
+        for &w in &[1u32, 3, 5, 7, 9, 13, 15, 17] {
+            let r = decode_frame(&payload, w, 8, PixelKind::Yv12);
+            assert!(
+                matches!(r, Err(Error::BadDimensions { width, height })
+                    if width == w && height == 8),
+                "expected Err(BadDimensions({w}, 8)) for type-11 at odd width, got {:?}",
+                r
+            );
+        }
+    }
+
+    /// A type-11 frame at an odd height (`height % 2 == 1`) likewise
+    /// cannot produce an integer-pixel 2× upscale; surface
+    /// [`Error::BadDimensions`].
+    #[test]
+    fn reduced_res_odd_height_is_bad_dimensions() {
+        let mut payload = vec![11u8];
+        payload.extend_from_slice(&[0u8; 8]);
+        for &h in &[1u32, 3, 5, 7, 9, 13, 15, 17] {
+            let r = decode_frame(&payload, 8, h, PixelKind::Yv12);
+            assert!(
+                matches!(r, Err(Error::BadDimensions { width, height })
+                    if width == 8 && height == h),
+                "expected Err(BadDimensions(8, {h})) for type-11 at odd height, got {:?}",
+                r
+            );
+        }
+    }
+
+    /// A type-11 frame at a width that is 2 mod 4 (even, but
+    /// `(W/2) % 2 == 1`) has an integer 2× upscale BUT the embedded
+    /// half-res YV12 chroma plane lands at a fractional `(W/4)`
+    /// column count; the decoder must surface [`Error::BadDimensions`]
+    /// rather than tiling the chroma planes against a width-mismatched
+    /// destination row.
+    #[test]
+    fn reduced_res_width_two_mod_four_is_bad_dimensions() {
+        let mut payload = vec![11u8];
+        payload.extend_from_slice(&[0u8; 8]);
+        for &w in &[2u32, 6, 10, 14, 18, 22] {
+            let r = decode_frame(&payload, w, 8, PixelKind::Yv12);
+            assert!(
+                matches!(r, Err(Error::BadDimensions { width, height })
+                    if width == w && height == 8),
+                "expected Err(BadDimensions({w}, 8)) for type-11 at width {w} (=2 mod 4), got {:?}",
+                r
+            );
+        }
+    }
+
+    /// Same as above for height (`H/2` odd → chroma half-height
+    /// fractional).
+    #[test]
+    fn reduced_res_height_two_mod_four_is_bad_dimensions() {
+        let mut payload = vec![11u8];
+        payload.extend_from_slice(&[0u8; 8]);
+        for &h in &[2u32, 6, 10, 14, 18, 22] {
+            let r = decode_frame(&payload, 8, h, PixelKind::Yv12);
+            assert!(
+                matches!(r, Err(Error::BadDimensions { width, height })
+                    if width == 8 && height == h),
+                "expected Err(BadDimensions(8, {h})) for type-11 at height {h} (=2 mod 4), got {:?}",
+                r
+            );
+        }
+    }
+
+    /// Zero-width / zero-height type-11 inputs (caught by the
+    /// general `decode_frame` dimension guard up-front) still
+    /// surface [`Error::BadDimensions`]. This pins the contract
+    /// edge so a future refactor cannot accidentally drop the
+    /// zero-dimension guard while keeping the multiple-of-4 guard.
+    #[test]
+    fn reduced_res_zero_dimensions_are_bad_dimensions() {
+        let mut payload = vec![11u8];
+        payload.extend_from_slice(&[0u8; 8]);
+        for &(w, h) in &[(0u32, 8u32), (8, 0), (0, 0)] {
+            let r = decode_frame(&payload, w, h, PixelKind::Yv12);
+            assert!(
+                matches!(r, Err(Error::BadDimensions { width, height })
+                    if width == w && height == h),
+                "expected Err(BadDimensions({w}, {h})) for type-11 at zero dim, got {:?}",
+                r
+            );
+        }
+    }
+
+    /// Confirm the validation only rejects the documented set — a
+    /// multiple-of-4 host dimension still flows into the decoder
+    /// proper (and surfaces whatever Err the malformed body emits,
+    /// rather than the dimension guard's [`Error::BadDimensions`]).
+    /// This pins the bound at exactly multiples-of-4 so a regression
+    /// that over-tightens (e.g. multiples-of-8) is caught.
+    #[test]
+    fn reduced_res_multiple_of_four_passes_dimension_guard() {
+        let mut payload = vec![11u8];
+        payload.extend_from_slice(&[0u8; 8]);
+        for &(w, h) in &[(4u32, 4u32), (8, 4), (4, 8), (8, 8), (12, 16), (16, 12)] {
+            let r = decode_frame(&payload, w, h, PixelKind::Yv12);
+            // The malformed body (all-zero offset table → empty
+            // channel slices) cannot decode either, but the failure
+            // mode must NOT be `BadDimensions` for these inputs — it
+            // must come from the downstream body parser.
+            match r {
+                Err(Error::BadDimensions { .. }) => {
+                    panic!("type-11 at {w}×{h} (multiple of 4) wrongly rejected by dimension guard")
+                }
+                Err(_) => { /* downstream parser surfaced a non-dimension Err — fine */ }
+                Ok(_) => { /* would also be acceptable, though unlikely on this malformed body */ }
+            }
+        }
+    }
 }

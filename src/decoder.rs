@@ -627,8 +627,21 @@ fn decode_arith_yuy2(
 /// upscales every plane (luma, V, U) onto the full-resolution
 /// output buffer.
 ///
-/// Width and height must both be at least 2 — anything smaller has
-/// no valid half-resolution YV12 representation.
+/// Host width and height must both be **multiples of 4**. The 2×
+/// nearest-neighbour upscale per `spec/01` §2.4 requires even host
+/// dimensions to land output samples on the integer pixel grid (the
+/// proprietary's upscaler at `lagarith.dll!0x18000ca90` /
+/// `0x18000cd40` writes 2×2 output blocks per input byte, which
+/// presupposes `width = 2 * half_w` and `height = 2 * half_h`).
+/// Beyond that, the half-resolution YV12 body itself carries 4:2:0
+/// chroma at quarter resolution (`spec/03` §6.1), so the half-W and
+/// half-H must each also be even — i.e. the host W and H must each
+/// be a multiple of 4 — otherwise the 2× upscaler reads from a
+/// `(half_w/2) × (half_h/2)` chroma plane it cannot tile into the
+/// host-buffer's `(W/2) × (H/2)` chroma slot. Non-multiple-of-4 host
+/// dimensions are rejected with [`Error::BadDimensions`]; the same
+/// error is returned for sub-2 host dimensions where the half-res
+/// YV12 wouldn't carry any luma at all.
 fn decode_reduced_res(
     payload: &[u8],
     width: u32,
@@ -639,6 +652,17 @@ fn decode_reduced_res(
         return Err(Error::PixelFormatMismatch {
             frame_type: payload[0],
         });
+    }
+    // Host W/H must be a multiple of 4 (see fn-doc): only then are
+    // the 2× upscale and the embedded half-res YV12 chroma both
+    // integer-aligned. Reject everything else up-front so the
+    // downstream `upscale_plane_2x` invocations cannot land on
+    // mismatched `(src_w, dst_w)` tiles (which in release would
+    // silently zero the chroma planes and in debug would
+    // `debug_assert!` panic — neither is a reasonable response to
+    // malformed input).
+    if width % 4 != 0 || height % 4 != 0 {
+        return Err(Error::BadDimensions { width, height });
     }
     let half_w = width / 2;
     let half_h = height / 2;

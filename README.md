@@ -373,7 +373,7 @@ type-7 stream still awaits a fixture oracle
 
 ## Tests
 
-186 unit + integration tests cover the range coder, Fibonacci
+192 unit + integration tests cover the range coder, Fibonacci
 prefix, RLE escape, predictor + decorrelation, channel-header
 dispatcher, the channel-header `0x01..=0x03` arithmetic-with-RLE
 path and the `0x05..=0x07` raw-RLE path, an end-to-end encode →
@@ -419,7 +419,20 @@ no-panic sweeps exercise (a) random byte streams across every
 frame-type byte (`0..=12`) × three seeds × eight lengths × four
 pixel kinds and (b) random per-channel bodies behind a valid
 type-4 offset table re-routed through the type-3 / -7 / -10
-dispatchers — every probe returns `Result`, none panics.
+dispatchers — every probe returns `Result`, none panics. Round
+187 extends the harness with **6 reduced-resolution (type 11)
+dimension-guard tests**: `decode_reduced_res` now rejects host
+W/H pairs that aren't multiples of 4 with `Error::BadDimensions`
+before any wire bytes are consulted (per `spec/01` §2.4 the 2×
+nearest-neighbour upscale requires `W = 2 * half_w` / `H = 2 *
+half_h` and the embedded half-res YV12 chroma sub-sampling
+requires `half_w` / `half_h` each even — i.e. host W / H each
+multiples of 4). The previous bound let odd dimensions flow into
+`upscale_plane_2x`, which `debug_assert!`-panicked in debug and
+silently zeroed chroma planes in release. Tests pin odd widths,
+odd heights, widths `≡ 2 mod 4`, heights `≡ 2 mod 4`, zero
+dimensions, and a positive pin that multiples-of-4 still flow
+into the body parser.
 
 ### SIMD-vs-scalar predictor (`spec/06` §3.2)
 

@@ -8,6 +8,33 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 187 — reduced-resolution (type 11) host-dimension guard (6
+  new tests).** `decode_reduced_res` now rejects host width/height
+  pairs that aren't multiples of 4 with `Error::BadDimensions` before
+  any wire bytes are consulted. Per `spec/01` §2.4 the type-11 wire
+  body is a type-10 (YV12) frame at half-W/half-H followed by a 2×
+  nearest-neighbour upscale onto the host's full-resolution YV12
+  buffer. For the upscaler to land output samples on the integer
+  pixel grid the host W and H must each be even (`width = 2 *
+  half_w`, `height = 2 * half_h`), and for the embedded half-res
+  YV12 chroma plane (`spec/03` §6.1 4:2:0 sub-sampling) the
+  half_w and half_h must each *also* be even — i.e. host W and H
+  each a multiple of 4. The previous bound checked only `half_w >=
+  1 && half_h >= 1`, which let odd-dimensioned malformed inputs
+  flow into `upscale_plane_2x` against a `(src_w, dst_w)` pair the
+  helper's `debug_assert!(dst_w == src_w * 2)` invariant doesn't
+  hold — `debug_assert!` panic in debug builds, silent zeroing of
+  the chroma planes in release. The new bound surfaces the
+  mismatch as `Error::BadDimensions` up-front, restoring the
+  defensive-harness contract (`Round 181`) for the type-11 path.
+  Tests cover odd widths (1, 3, 5, 7, 9, 13, 15, 17), odd heights
+  (same set), widths `≡ 2 mod 4` (2, 6, 10, 14, 18, 22 — even but
+  `(W/2) % 2 == 1` so the chroma sub-plane lands at fractional
+  `(W/4)` columns), heights `≡ 2 mod 4` (same set), zero
+  width/height (still surfaced as `BadDimensions` by the top-level
+  guard), and a positive pin that multiples-of-4 still flow into
+  the body parser (so a future regression that over-tightens to
+  multiples-of-8 is caught). 192 tests pass after the addition.
 - **Round 181 — decoder defensive harness (22 new tests).** Production-
   path robustness sweep against the public `decode_frame` /
   `decode_frame_with_prev` / `Decoder::decode` surface: every
