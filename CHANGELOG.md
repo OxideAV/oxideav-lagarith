@@ -8,6 +8,41 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 181 — decoder defensive harness (22 new tests).** Production-
+  path robustness sweep against the public `decode_frame` /
+  `decode_frame_with_prev` / `Decoder::decode` surface: every
+  documented failure mode in `crate::error::Error` is exercised with
+  a minimum-shape malformed fixture constructed in-line from the
+  spec-defined layout fields (no encoder path involved — these tests
+  target the decoder against arbitrary on-wire bytes, the actual
+  production attack surface). Coverage spans the `spec/01` §1.2
+  frame-type byte (`BadFrameType` for byte `0` and bytes `12..=255`,
+  `NullFrame` for empty payload, `BadDimensions` for zero-W/H input),
+  the `spec/01` §2.3 channel-offset table (`Truncated` short tables,
+  `OffsetOutOfRange` past-EOF and descending offsets), the `spec/03`
+  §2.1 channel-header dispatcher (`Truncated` short `0x01..=0x03`
+  u32-length / short `0x04` raw / short `0xff` fill channels;
+  `BadChannelHeader` for bytes `0x08..=0xfe`), the uncompressed and
+  solid frame-type sub-paths (`Truncated` for short bodies,
+  `PixelFormatMismatch` when a planar pixel kind is asked of a
+  packed-RGB / solid frame), and the `spec/01` §1.1 NULL-frame replay
+  contract (`NullFrameWithoutPredecessor` on the stateful `Decoder`'s
+  first frame and `decode_frame_with_prev` with `prev=None`;
+  `PixelFormatMismatch{frame_type:0}` on a NULL replay with
+  mismatched dimensions or pixel kind). Two deterministic-LCG-seeded
+  no-panic sweeps round out the harness: `random_payload_no_panic_sweep`
+  exercises every frame-type byte (`0..=12`) × three seeds × eight
+  lengths × four pixel kinds; `random_channel_bodies_no_panic_sweep`
+  exercises random per-channel bodies behind a valid type-4 offset
+  table re-routed through the type-3 / -7 / -10 dispatchers. Every
+  probe returns `Result`, none panics. Test count moves from 164 →
+  186 (157 → 179 in the unit-test bin + 7 unchanged integration
+  tests in `tests/ffmpeg_pins.rs`). No production-code changes — the
+  harness pins the existing decoder's defensive behaviour so any
+  regression that introduces a panic on a malformed channel surfaces
+  here as a concrete test failure rather than as a host-process
+  crash.
+
 - **Round 174 — per-frame-type header-form selector flip + frame-level
   size-delta pins.** Round 14 (round 138) added `encode_channel_best`,
   the eight-form per-channel selector across the wire forms

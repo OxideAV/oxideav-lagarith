@@ -373,7 +373,7 @@ type-7 stream still awaits a fixture oracle
 
 ## Tests
 
-164 unit + integration tests cover the range coder, Fibonacci
+186 unit + integration tests cover the range coder, Fibonacci
 prefix, RLE escape, predictor + decorrelation, channel-header
 dispatcher, the channel-header `0x01..=0x03` arithmetic-with-RLE
 path and the `0x05..=0x07` raw-RLE path, an end-to-end encode →
@@ -400,6 +400,26 @@ never-larger pins** for the four modern frame encoders +
 reduced-res + type-7 byte-identity, plus a channel-level
 `channel_best_strictly_smaller_than_simple_at_64k_zero_heavy`
 crossover pin (53-byte / 1.4% saving at the documented fixture).
+Round 181 adds a **decoder defensive harness** (22 new tests) that
+systematically feeds malformed inputs through the production
+`decode_frame` / `decode_frame_with_prev` / `Decoder::decode`
+surface and asserts each surfaces the documented `Err(_)` variant
+rather than panicking: empty payloads (`NullFrame`), zero
+dimensions (`BadDimensions`), out-of-range frame-type bytes
+(`BadFrameType` for `0` and `12..=255`), truncated uncompressed
+bodies and solid-fill colour bytes (`Truncated`), planar pixel
+formats requested against packed-RGB / solid frames
+(`PixelFormatMismatch`), short / descending / past-EOF channel-
+offset tables (`Truncated` + `OffsetOutOfRange`), short and
+unknown channel-header bytes through the `spec/03` §2.1
+dispatcher (`Truncated` + `BadChannelHeader`), and the stateful
+NULL-frame replay invariants (`NullFrameWithoutPredecessor` +
+`PixelFormatMismatch{frame_type:0}`). Two deterministic-LCG-seeded
+no-panic sweeps exercise (a) random byte streams across every
+frame-type byte (`0..=12`) × three seeds × eight lengths × four
+pixel kinds and (b) random per-channel bodies behind a valid
+type-4 offset table re-routed through the type-3 / -7 / -10
+dispatchers — every probe returns `Result`, none panics.
 
 ### SIMD-vs-scalar predictor (`spec/06` §3.2)
 

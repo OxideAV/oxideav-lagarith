@@ -1895,3 +1895,452 @@ mod best_pipeline_size_delta {
         }
     }
 }
+
+// ─────────── round 181: decoder defensive harness ───────────
+//
+// Production-path robustness: `decode_frame`, `decode_frame_with_prev`,
+// and `Decoder::decode` must surface every malformed-input failure as
+// an `Err(_)` rather than panicking. This module sweeps every documented
+// failure mode in `crate::error::Error` against the `decode_frame`
+// dispatch tree (`spec/01` §1.2 frame-type byte, `spec/01` §2.3
+// channel-offset table, `spec/03` §2.1 + `spec/06` §1 channel-header
+// dispatcher, `spec/01` §1.1 NULL-frame replay) by constructing
+// minimum-sized malformed fixtures.
+//
+// Each test asserts the `Err(_)` variant where it is stable (matches
+// the documented `Error::*` per `spec/01` §1.2 / `spec/06` §1.5 /
+// `spec/05` §4.2 etc.). A few tests assert only that decode returns
+// `Err(_)` (not panics) — for inputs where any of several variants
+// would be a legitimate report.
+//
+// All inputs are constructed in-line from spec-defined layout fields;
+// no encoder path is involved (the encoder is a `#[cfg(test)]` helper
+// for self-roundtrip — these tests target the decoder against
+// arbitrary on-wire bytes, the actual production attack surface).
+
+mod decoder_defensive_harness {
+    use super::*;
+    use crate::frame::pack_channels;
+    use crate::Error;
+
+    // ─── frame-type / dispatch-level malformed inputs ───
+
+    /// `decode_frame` must surface a zero-byte payload as
+    /// [`Error::NullFrame`] — the stateless decoder cannot replay a
+    /// predecessor (`spec/01` §1.1 frames the NULL-frame replay as a
+    /// container-layer responsibility).
+    #[test]
+    fn decode_frame_empty_payload_is_null_frame() {
+        let r = decode_frame(&[], 4, 4, PixelKind::Bgr24);
+        assert!(
+            matches!(r, Err(Error::NullFrame)),
+            "expected Err(NullFrame), got {:?}",
+            r
+        );
+    }
+
+    /// Zero-width and zero-height inputs are caller-bug inputs (no
+    /// surface area for a Lagarith decode); surfaced as
+    /// [`Error::BadDimensions`] before any wire bytes are consulted.
+    #[test]
+    fn decode_frame_zero_dimensions_are_bad_dimensions() {
+        let some_payload = vec![1u8; 64];
+        for &(w, h) in &[(0u32, 4u32), (4, 0), (0, 0)] {
+            let r = decode_frame(&some_payload, w, h, PixelKind::Bgr24);
+            assert!(
+                matches!(r, Err(Error::BadDimensions { width, height }) if width == w && height == h),
+                "expected Err(BadDimensions({w}, {h})), got {:?}",
+                r
+            );
+        }
+    }
+
+    /// Frame-type byte 0 is reserved out per `spec/01` §1.2; the
+    /// decoder must surface [`Error::BadFrameType(0)`].
+    #[test]
+    fn decode_frame_type_zero_is_bad_frame_type() {
+        let payload = vec![0u8, 0, 0, 0, 0];
+        let r = decode_frame(&payload, 4, 4, PixelKind::Bgr24);
+        assert!(
+            matches!(r, Err(Error::BadFrameType(0))),
+            "expected Err(BadFrameType(0)), got {:?}",
+            r
+        );
+    }
+
+    /// Frame-type bytes 12..=255 are reserved out per `spec/01` §1.2.
+    /// Sweep the range and assert each surfaces
+    /// [`Error::BadFrameType(_)`] with the expected byte echoed back.
+    #[test]
+    fn decode_frame_high_type_bytes_are_bad_frame_type() {
+        for byte in [12u8, 13, 50, 100, 200, 0xfe, 0xff] {
+            let payload = vec![byte, 0, 0, 0, 0];
+            let r = decode_frame(&payload, 4, 4, PixelKind::Bgr24);
+            assert!(
+                matches!(r, Err(Error::BadFrameType(b)) if b == byte),
+                "type {byte}: expected Err(BadFrameType({byte})), got {:?}",
+                r
+            );
+        }
+    }
+
+    // ─── uncompressed (type 1) malformed inputs ───
+
+    /// Uncompressed (type 1) requires `1 + buffer_len(W, H)` payload
+    /// bytes per `spec/01` §2.1. A short payload surfaces
+    /// [`Error::Truncated`].
+    #[test]
+    fn decode_uncompressed_truncated_body_is_truncated() {
+        // 4×4 BGR24 needs 48 body bytes + 1 type byte = 49; offer 10.
+        let mut payload = vec![1u8];
+        payload.extend(std::iter::repeat(0u8).take(9));
+        let r = decode_frame(&payload, 4, 4, PixelKind::Bgr24);
+        assert!(
+            matches!(r, Err(Error::Truncated { .. })),
+            "expected Err(Truncated), got {:?}",
+            r
+        );
+    }
+
+    // ─── solid (types 5/6/9) malformed inputs ───
+
+    /// Type 5 (Solid Grey) needs 2 bytes (type + fill); type 6 (Solid
+    /// RGB) needs 4 bytes (type + B + G + R); type 9 (Solid RGBA)
+    /// needs 5. Truncated payloads surface [`Error::Truncated`].
+    #[test]
+    fn decode_solid_truncated_colour_bytes_is_truncated() {
+        for type_byte in [5u8, 6, 9] {
+            let r = decode_frame(&[type_byte], 4, 4, PixelKind::Bgr24);
+            assert!(
+                matches!(r, Err(Error::Truncated { .. })),
+                "type {type_byte}: expected Err(Truncated), got {:?}",
+                r
+            );
+        }
+        // type 6 with two bytes (need 4)
+        let r = decode_frame(&[6u8, 0, 0], 4, 4, PixelKind::Bgr24);
+        assert!(matches!(r, Err(Error::Truncated { .. })));
+        // type 9 with four bytes (need 5)
+        let r = decode_frame(&[9u8, 0, 0, 0, 0], 4, 4, PixelKind::Bgra32);
+        assert!(r.is_ok(), "5 bytes is exactly the minimum");
+    }
+
+    /// Solid frames produce a packed RGB / RGBA output, so asking
+    /// for `Yv12` against a solid frame surfaces
+    /// [`Error::PixelFormatMismatch`].
+    #[test]
+    fn decode_solid_with_planar_pixel_format_is_mismatch() {
+        for type_byte in [5u8, 6, 9] {
+            let mut payload = vec![type_byte];
+            payload.extend([0x42u8; 4]); // enough for any solid shape
+            let r = decode_frame(&payload, 4, 4, PixelKind::Yv12);
+            assert!(
+                matches!(r, Err(Error::PixelFormatMismatch { frame_type }) if frame_type == type_byte),
+                "type {type_byte}: expected Err(PixelFormatMismatch), got {:?}",
+                r
+            );
+        }
+    }
+
+    // ─── arithmetic RGB24/RGBA channel-offset-table malformed inputs ───
+
+    /// 3-channel frame types (2, 4) carry an 8-byte offset table; a
+    /// payload too short to hold it surfaces [`Error::Truncated`].
+    #[test]
+    fn decode_arith_rgb_truncated_offset_table_is_truncated() {
+        // Type 4 (Arithmetic RGB24): needs at least 9 bytes for
+        // type + 8-byte offset table.
+        for type_byte in [2u8, 4] {
+            let r = decode_frame(&[type_byte, 0, 0], 4, 4, PixelKind::Bgr24);
+            assert!(
+                matches!(r, Err(Error::Truncated { .. })),
+                "type {type_byte}: expected Err(Truncated), got {:?}",
+                r
+            );
+        }
+    }
+
+    /// 4-channel frame type 8 (Arithmetic RGBA) carries a 12-byte
+    /// offset table; a payload too short surfaces [`Error::Truncated`].
+    #[test]
+    fn decode_arith_rgba_truncated_offset_table_is_truncated() {
+        let r = decode_frame(&[8u8, 0, 0, 0, 0], 4, 4, PixelKind::Bgra32);
+        assert!(
+            matches!(r, Err(Error::Truncated { .. })),
+            "expected Err(Truncated), got {:?}",
+            r
+        );
+    }
+
+    /// An offset that points past the frame end is
+    /// [`Error::OffsetOutOfRange`] per the `split_channels`
+    /// preconditions.
+    #[test]
+    fn decode_arith_rgb_offset_past_eof_is_out_of_range() {
+        // Type 4 frame: byte 0 = 4, bytes 1..9 = two u32 offsets.
+        // Set the first offset to a huge value to trigger the bound
+        // check.
+        let mut payload = vec![4u8];
+        payload.extend_from_slice(&0xffff_ffffu32.to_le_bytes()); // offset to G
+        payload.extend_from_slice(&0u32.to_le_bytes()); // offset to B
+                                                        // pad some channel-body bytes so split_channels gets a non-tiny
+                                                        // frame to grade against
+        payload.extend(std::iter::repeat(0u8).take(64));
+        let r = decode_frame(&payload, 4, 4, PixelKind::Bgr24);
+        assert!(
+            matches!(r, Err(Error::OffsetOutOfRange)),
+            "expected Err(OffsetOutOfRange), got {:?}",
+            r
+        );
+    }
+
+    /// Offsets that go backwards (offset_to_B < offset_to_G) are
+    /// [`Error::OffsetOutOfRange`] per `split_channels`'s ascending-
+    /// offsets invariant.
+    #[test]
+    fn decode_arith_rgb_descending_offsets_are_out_of_range() {
+        // Type 4 frame with offset_to_G = 30 but offset_to_B = 20.
+        let mut payload = vec![4u8];
+        payload.extend_from_slice(&30u32.to_le_bytes()); // offset to G
+        payload.extend_from_slice(&20u32.to_le_bytes()); // offset to B
+        payload.extend(std::iter::repeat(0u8).take(64));
+        let r = decode_frame(&payload, 4, 4, PixelKind::Bgr24);
+        assert!(
+            matches!(r, Err(Error::OffsetOutOfRange)),
+            "expected Err(OffsetOutOfRange), got {:?}",
+            r
+        );
+    }
+
+    /// Asking for `Yv12` against a type-4 (Arithmetic RGB24) frame
+    /// surfaces [`Error::PixelFormatMismatch`] (the decoder uses the
+    /// pixel kind to choose between packed BGR24 and BGRA32 outputs;
+    /// `Yv12` is not in either set).
+    #[test]
+    fn decode_arith_rgb24_with_planar_pixel_format_is_mismatch() {
+        // Build a minimum-shape type-4 frame with a 0xff fill channel
+        // body so the dispatcher reaches the pixel-format gate.
+        let ch_b = vec![0xffu8, 0x10];
+        let ch_g = vec![0xffu8, 0x20];
+        let ch_r = vec![0xffu8, 0x30];
+        let frame = pack_channels(4, &[&ch_b, &ch_g, &ch_r]);
+        let r = decode_frame(&frame, 4, 4, PixelKind::Yv12);
+        assert!(
+            matches!(r, Err(Error::PixelFormatMismatch { .. })),
+            "expected Err(PixelFormatMismatch), got {:?}",
+            r
+        );
+    }
+
+    // ─── channel-header dispatcher malformed inputs ───
+    //
+    // Each test packs valid channel-offset table bytes, then injects
+    // a deliberately malformed per-channel body. The dispatcher must
+    // surface the documented error variant rather than panic.
+
+    /// Channel-header `0x01..=0x03` requires a u32 length field
+    /// (5 bytes minimum). A 2-byte channel surfaces
+    /// [`Error::Truncated`].
+    #[test]
+    fn decode_arith_rgb24_channel_header_01_short_is_truncated() {
+        // Three channels, each just `[header, 0x00]` so the u32 read
+        // in `decode_channel` would walk off the end.
+        for header in [0x01u8, 0x02, 0x03] {
+            let ch = vec![header, 0x00];
+            let frame = pack_channels(4, &[&ch, &ch, &ch]);
+            let r = decode_frame(&frame, 4, 4, PixelKind::Bgr24);
+            assert!(
+                matches!(r, Err(Error::Truncated { .. })),
+                "header {header:#x}: expected Err(Truncated), got {:?}",
+                r
+            );
+        }
+    }
+
+    /// Channel-header `0x04` requires `1 + n_pixels` body bytes;
+    /// a shorter channel surfaces [`Error::Truncated`].
+    #[test]
+    fn decode_arith_rgb24_channel_header_04_short_is_truncated() {
+        // 4×4 RGB24 frame: each channel needs 16 raw bytes after
+        // the `0x04` header. Offer 3.
+        let ch = vec![0x04u8, 0, 0, 0];
+        let frame = pack_channels(4, &[&ch, &ch, &ch]);
+        let r = decode_frame(&frame, 4, 4, PixelKind::Bgr24);
+        assert!(
+            matches!(r, Err(Error::Truncated { .. })),
+            "expected Err(Truncated), got {:?}",
+            r
+        );
+    }
+
+    /// Channel-header `0xff` requires a 2-byte channel (header + fill);
+    /// a one-byte channel surfaces [`Error::Truncated`].
+    #[test]
+    fn decode_arith_rgb24_channel_header_ff_short_is_truncated() {
+        let ch = vec![0xffu8];
+        let frame = pack_channels(4, &[&ch, &ch, &ch]);
+        let r = decode_frame(&frame, 4, 4, PixelKind::Bgr24);
+        assert!(
+            matches!(r, Err(Error::Truncated { .. })),
+            "expected Err(Truncated), got {:?}",
+            r
+        );
+    }
+
+    /// Channel-header bytes outside `{0x00..=0x07, 0xff}` are
+    /// [`Error::BadChannelHeader`] per `spec/03` §2.1.
+    #[test]
+    fn decode_arith_rgb24_channel_header_bad_byte_is_bad_channel_header() {
+        for header in [0x08u8, 0x09, 0x10, 0x42, 0x7f, 0x80, 0xfe] {
+            let ch = vec![header, 0, 0, 0, 0, 0, 0, 0];
+            let frame = pack_channels(4, &[&ch, &ch, &ch]);
+            let r = decode_frame(&frame, 4, 4, PixelKind::Bgr24);
+            assert!(
+                matches!(r, Err(Error::BadChannelHeader(b)) if b == header),
+                "header {header:#x}: expected Err(BadChannelHeader({header:#x})), got {:?}",
+                r
+            );
+        }
+    }
+
+    // ─── stateful NULL-frame replay malformed inputs ───
+
+    /// A stateful [`Decoder`] handed a zero-byte first payload has no
+    /// predecessor to replay; surfaces
+    /// [`Error::NullFrameWithoutPredecessor`].
+    #[test]
+    fn stateful_decoder_null_first_frame_is_no_predecessor() {
+        let mut dec = Decoder::new();
+        let r = dec.decode(&[], 4, 4, PixelKind::Bgr24);
+        assert!(
+            matches!(r, Err(Error::NullFrameWithoutPredecessor)),
+            "expected Err(NullFrameWithoutPredecessor), got {:?}",
+            r
+        );
+    }
+
+    /// A NULL frame applied to a different (W, H, kind) than the
+    /// predecessor is a host-integration error per the
+    /// `decode_frame_with_prev` cross-check; surfaces
+    /// [`Error::PixelFormatMismatch { frame_type: 0 }`] (the NULL
+    /// frame type byte is reported as 0 — there is no real frame-type
+    /// byte on the wire to echo back).
+    #[test]
+    fn null_replay_with_mismatched_dims_is_mismatch() {
+        // Prime the decoder with a 4×4 BGR24 solid grey frame.
+        let prime = vec![5u8, 0x77];
+        let mut dec = Decoder::new();
+        let _first = dec.decode(&prime, 4, 4, PixelKind::Bgr24).unwrap();
+        // Now hand it a NULL frame at *different* dimensions.
+        let r = dec.decode(&[], 8, 8, PixelKind::Bgr24);
+        assert!(
+            matches!(r, Err(Error::PixelFormatMismatch { frame_type: 0 })),
+            "expected Err(PixelFormatMismatch{{frame_type:0}}), got {:?}",
+            r
+        );
+    }
+
+    /// Same as above but with a mismatched pixel kind.
+    #[test]
+    fn null_replay_with_mismatched_pixel_kind_is_mismatch() {
+        let prime = vec![5u8, 0x77];
+        let mut dec = Decoder::new();
+        let _first = dec.decode(&prime, 4, 4, PixelKind::Bgr24).unwrap();
+        let r = dec.decode(&[], 4, 4, PixelKind::Bgra32);
+        assert!(
+            matches!(r, Err(Error::PixelFormatMismatch { frame_type: 0 })),
+            "expected Err(PixelFormatMismatch{{frame_type:0}}), got {:?}",
+            r
+        );
+    }
+
+    /// `decode_frame_with_prev` with `prev = None` and a NULL payload
+    /// surfaces [`Error::NullFrameWithoutPredecessor`] — the same
+    /// invariant the stateful `Decoder` enforces, exercised through
+    /// the helper directly.
+    #[test]
+    fn decode_frame_with_prev_null_no_predecessor_is_no_predecessor() {
+        let r = decode_frame_with_prev(&[], 4, 4, PixelKind::Bgr24, None);
+        assert!(
+            matches!(r, Err(Error::NullFrameWithoutPredecessor)),
+            "expected Err(NullFrameWithoutPredecessor), got {:?}",
+            r
+        );
+    }
+
+    // ─── randomised no-panic sweep ───
+    //
+    // For inputs the spec does not bind to a specific failure variant,
+    // assert only that decode terminates with `Result<_, _>` rather
+    // than panicking. Deterministic LCG ensures reproducibility.
+
+    fn lcg_bytes(seed: u64, n: usize) -> Vec<u8> {
+        let mut s = seed;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            out.push((s >> 33) as u8);
+        }
+        out
+    }
+
+    /// Feed deterministic pseudo-random byte streams (varying first
+    /// byte across the valid 1..=11 frame-type range + a few invalid
+    /// values + several lengths) through `decode_frame`. Each call
+    /// must return `Ok` or `Err` — never panic. Reproducibility comes
+    /// from the LCG seed.
+    #[test]
+    fn random_payload_no_panic_sweep() {
+        for type_byte in 0u8..=12 {
+            for &seed in &[0x1234_5678_9abc_def0u64, 0xfeed_face_dead_beef, 0] {
+                for &len in &[1usize, 2, 5, 9, 16, 33, 64, 128] {
+                    let mut payload = lcg_bytes(seed.wrapping_add(len as u64), len);
+                    payload[0] = type_byte;
+                    // Decode against each accepted (W, H, kind) shape;
+                    // anything that returns Err is fine, anything that
+                    // returns Ok is fine; the test fails only on
+                    // panic.
+                    let _ = decode_frame(&payload, 4, 4, PixelKind::Bgr24);
+                    let _ = decode_frame(&payload, 4, 4, PixelKind::Bgra32);
+                    let _ = decode_frame(&payload, 4, 4, PixelKind::Yv12);
+                    let _ = decode_frame(&payload, 4, 4, PixelKind::Yuy2);
+                }
+            }
+        }
+    }
+
+    /// Random per-channel bodies behind a valid type-4 RGB24 offset
+    /// table — the channel dispatcher must not panic on any byte
+    /// pattern in the channel body. Catches dispatcher-level
+    /// regressions that would only surface against adversarial
+    /// wire bytes.
+    #[test]
+    fn random_channel_bodies_no_panic_sweep() {
+        for &seed in &[0xa5a5_5a5a_a5a5_5a5au64, 0x0fed_cba9_8765_4321, 1] {
+            for &per_channel_len in &[1usize, 4, 9, 17, 33, 80] {
+                let ch_b = lcg_bytes(seed, per_channel_len);
+                let ch_g = lcg_bytes(seed.wrapping_add(1), per_channel_len);
+                let ch_r = lcg_bytes(seed.wrapping_add(2), per_channel_len);
+                let frame = pack_channels(4, &[&ch_b, &ch_g, &ch_r]);
+                let _ = decode_frame(&frame, 4, 4, PixelKind::Bgr24);
+                let _ = decode_frame(&frame, 4, 4, PixelKind::Bgra32);
+                // Also exercise the type-7 legacy decoder against
+                // the same random byte stream (different range coder,
+                // different prefix layout).
+                let mut t7_frame = frame.clone();
+                t7_frame[0] = 7;
+                let _ = decode_frame(&t7_frame, 4, 4, PixelKind::Bgr24);
+                // And the YV12 dispatcher (3 planes Y/V/U).
+                let mut t10_frame = frame.clone();
+                t10_frame[0] = 10;
+                let _ = decode_frame(&t10_frame, 4, 4, PixelKind::Yv12);
+                // And the YUY2 dispatcher.
+                let mut t3_frame = frame.clone();
+                t3_frame[0] = 3;
+                let _ = decode_frame(&t3_frame, 4, 4, PixelKind::Yuy2);
+            }
+        }
+    }
+}
