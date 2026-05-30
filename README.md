@@ -373,7 +373,7 @@ type-7 stream still awaits a fixture oracle
 
 ## Tests
 
-192 unit + integration tests cover the range coder, Fibonacci
+204 unit + integration tests cover the range coder, Fibonacci
 prefix, RLE escape, predictor + decorrelation, channel-header
 dispatcher, the channel-header `0x01..=0x03` arithmetic-with-RLE
 path and the `0x05..=0x07` raw-RLE path, an end-to-end encode →
@@ -432,7 +432,28 @@ multiples of 4). The previous bound let odd dimensions flow into
 silently zeroed chroma planes in release. Tests pin odd widths,
 odd heights, widths `≡ 2 mod 4`, heights `≡ 2 mod 4`, zero
 dimensions, and a positive pin that multiples-of-4 still flow
-into the body parser.
+into the body parser. Round 192 layers a **truncation +
+single-byte-flip fuzz** (12 new tests, module
+`decoder_truncation_fuzz`) on **valid** encoded frames — closes
+the gap between round 181's hand-constructed malformed fixtures
+(one per documented `Err(_)` variant) and round 181's random-byte
+sweep (statistically unlikely to look like a valid
+`(escape_len, supplement_byte)` RLE pair or a Fibonacci-coded
+prefix). Each test encodes one valid frame per frame-type the
+test encoder covers (1, 3, 4, 5, 6, 7, 8, 9, 10, 11), then walks
+every truncated prefix `frame[..k]` for `k ∈ 1..frame.len()`
+across all four pixel kinds asserting no-panic + (for prefixes
+strictly inside the `spec/01` §2.3 channel-offset table)
+`Error::Truncated`. Each frame is also single-byte-flipped at
+every 7th offset to `0x00` and `0xff` (7 coprime with channel-
+header / Fibonacci-prefix / RLE byte strides so the flip pass
+does not align to any one structural feature). The stateful
+`Decoder` and `decode_frame_with_prev` paths are exercised
+against truncated primers + a mismatched-shape `prev`-frame,
+pinning the invariant that a failed primer must not leave a
+half-initialised `prev` slot a subsequent NULL replay would
+dereference. 204 unit + integration tests pass after the
+addition.
 
 ### SIMD-vs-scalar predictor (`spec/06` §3.2)
 

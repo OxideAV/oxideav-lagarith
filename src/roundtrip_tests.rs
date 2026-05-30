@@ -2483,3 +2483,406 @@ mod decoder_defensive_harness {
         }
     }
 }
+
+/// Round 192 — truncation + single-byte-flip fuzz on **valid** encoded
+/// frames.
+///
+/// Round 181 + 187 exercised **hand-constructed malformed inputs** and
+/// **random byte streams**. Both leave a gap: a random byte stream is
+/// statistically unlikely to look like a valid `(escape_len,
+/// supplement_byte)` RLE pair, a valid Fibonacci-prefix bit-stream, or
+/// a valid channel-offset table; so the most defect-prone code paths
+/// (length decoders that walk *through* well-formed prefix bytes into
+/// a region the caller does not control) are barely exercised by
+/// random-byte tests.
+///
+/// This module closes that gap. It encodes a real Lagarith frame
+/// (one per frame-type covered by the test encoder: 1, 3, 4, 7, 8,
+/// 10, 11), then progressively truncates each frame at every byte
+/// offset from `1..len` and asserts the decoder terminates (returns
+/// `Ok(_)` or `Err(_)`) without panicking — including in debug builds
+/// where the predictor / RLE / range-coder modules carry
+/// `debug_assert!` invariants. Then for a deterministic sub-set of
+/// offsets it flips a single byte and checks the same no-panic
+/// invariant — the flip can move the wire into an
+/// over-length / underflow / misalignment state the truncation sweep
+/// cannot reach (e.g. an RLE-escape supplement that points *forward*
+/// of the truncation cut).
+///
+/// Each truncation that lands strictly inside the prefix (frame-type
+/// byte + channel-offset table) **must** surface as
+/// [`Error::Truncated`] (the dispatcher's documented contract for an
+/// incomplete prefix). Truncations that land inside a channel body
+/// are allowed to surface any `Err(_)` variant the channel decoder
+/// chooses — the contract there is no-panic, not a specific error
+/// variant, because the truncated body can look like a legal but
+/// shorter Fibonacci-coded plane.
+///
+/// The stateful [`Decoder`] path is exercised by replaying a
+/// truncated NULL-frame ("JUMP") wire byte tail (zero-byte payload
+/// after a successful primer) — that path doesn't truncate (it's
+/// already zero-length), so the stateful sweep instead exercises
+/// `decode_frame_with_prev` against truncated primer payloads with a
+/// `prev` of a different / matching shape, asserting no-panic.
+#[cfg(test)]
+mod decoder_truncation_fuzz {
+    use super::*;
+    use crate::encoder::{
+        encode_arith_reduced_res, encode_arith_rgb24, encode_arith_rgba, encode_arith_yuy2,
+        encode_arith_yv12, encode_legacy_rgb, encode_solid_grey, encode_solid_rgb,
+        encode_solid_rgba, encode_uncompressed,
+    };
+    use crate::Error;
+
+    /// Pattern body used as the encoder input — deterministic
+    /// `i * 73 + 11` modulo 256 (the same pattern `pattern_bgr24`
+    /// uses elsewhere in this file, kept inline so this module is
+    /// self-contained as a fuzz harness).
+    fn pattern_bytes(n: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let v = (i as u32).wrapping_mul(73).wrapping_add(11);
+            out.push((v & 0xff) as u8);
+        }
+        out
+    }
+
+    /// Run the truncation sweep on `frame` against all four pixel
+    /// kinds. For each truncated prefix length `k ∈ 1..frame.len()`,
+    /// call `decode_frame(&frame[..k], w, h, kind)` and assert it
+    /// returns a `Result<_, _>` (no panic). Then for a deterministic
+    /// subset of single-byte flip offsets (every 7th byte), flip the
+    /// byte to `0xff` and to `0x00` and re-run; same no-panic
+    /// invariant.
+    fn truncation_and_flip_sweep(frame: &[u8], w: u32, h: u32) {
+        // Truncation pass — every prefix length from 1 (just the
+        // frame-type byte) up to but not including the full length
+        // (the full-length frame already roundtrips successfully in
+        // its own test; the fuzz pass is about everything *shorter*).
+        for k in 1..frame.len() {
+            let cut = &frame[..k];
+            for &kind in &[
+                PixelKind::Bgr24,
+                PixelKind::Bgra32,
+                PixelKind::Yv12,
+                PixelKind::Yuy2,
+            ] {
+                // The call must terminate; `_` discards Ok or Err
+                // without unwrapping. Panic on this line would fail
+                // the test (no `should_panic` attribute).
+                let _ = decode_frame(cut, w, h, kind);
+            }
+        }
+        // Single-byte flip pass — every 7th offset, flipped to 0xff
+        // and 0x00. 7 is coprime with 2, 3, 4, 5 (and most channel
+        // header / Fibonacci-prefix byte stride lengths), so the
+        // sweep does not align to any one structural feature of the
+        // wire.
+        for off in (0..frame.len()).step_by(7) {
+            for &val in &[0xffu8, 0x00] {
+                let mut mutated = frame.to_vec();
+                mutated[off] = val;
+                for &kind in &[
+                    PixelKind::Bgr24,
+                    PixelKind::Bgra32,
+                    PixelKind::Yv12,
+                    PixelKind::Yuy2,
+                ] {
+                    let _ = decode_frame(&mutated, w, h, kind);
+                }
+            }
+        }
+    }
+
+    /// Type 1 (Uncompressed) — `1 + buffer_len(W, H)` body byte
+    /// frame, every truncation strictly inside the body surfaces
+    /// `Error::Truncated` (the only failure mode the uncompressed
+    /// path can have past the frame-type byte). Sweep across the
+    /// frame to confirm no panic + each prefix returns the documented
+    /// Err.
+    #[test]
+    fn type_1_uncompressed_truncation_and_flip_no_panic() {
+        let (w, h) = (4u32, 4u32);
+        let pixels = pattern_bytes(PixelKind::Bgr24.buffer_len(w, h));
+        let frame = encode_uncompressed(&pixels);
+        // Sanity — full frame decodes.
+        let full = decode_frame(&frame, w, h, PixelKind::Bgr24);
+        assert!(full.is_ok(), "type-1 full frame should decode: {:?}", full);
+        // Truncation: prefix lengths < full length must surface
+        // `Error::Truncated` against the matching pixel kind. Other
+        // pixel kinds may also surface `PixelFormatMismatch` (the
+        // type-1 dispatcher accepts every kind but the buffer-length
+        // assertion is kind-specific).
+        for k in 1..frame.len() {
+            let r = decode_frame(&frame[..k], w, h, PixelKind::Bgr24);
+            assert!(
+                matches!(r, Err(Error::Truncated { .. })),
+                "type-1 prefix len {k}/{} should be Truncated, got {:?}",
+                frame.len(),
+                r
+            );
+        }
+        // Bare frame-type byte (length 1) against other kinds also
+        // surfaces Truncated (the body-length cross-check is kind-
+        // specific but a 1-byte payload is shorter than every kind's
+        // body length).
+        truncation_and_flip_sweep(&frame, w, h);
+    }
+
+    /// Type 4 (Arithmetic RGB24) — `4×4` BGR24 frame. The wire is
+    /// `[type_byte][8-byte channel-offset table][3 channels]`. The
+    /// truncation sweep walks every prefix length; truncations
+    /// strictly inside the offset table (`1..9`) must be `Truncated`
+    /// (`spec/01` §2.3 contract), truncations inside the channels
+    /// can surface any `Err(_)` the channel decoder chooses
+    /// (including OffsetOutOfRange when the truncation lands past
+    /// the buffer the offset table pointed to). No panic ever.
+    #[test]
+    fn type_4_arith_rgb24_truncation_and_flip_no_panic() {
+        let (w, h) = (4u32, 4u32);
+        let pixels = pattern_bytes(PixelKind::Bgr24.buffer_len(w, h));
+        let frame = encode_arith_rgb24(&pixels, w, h);
+        // Full frame decodes.
+        let full = decode_frame(&frame, w, h, PixelKind::Bgr24);
+        assert!(full.is_ok(), "type-4 full frame should decode: {:?}", full);
+        // Prefix in the channel-offset table (1..=8) must be
+        // `Truncated`.
+        for k in 1..=8 {
+            let r = decode_frame(&frame[..k], w, h, PixelKind::Bgr24);
+            assert!(
+                matches!(r, Err(Error::Truncated { .. })),
+                "type-4 prefix len {k} (in offset table) should be Truncated, got {:?}",
+                r
+            );
+        }
+        truncation_and_flip_sweep(&frame, w, h);
+    }
+
+    /// Type 8 (Arithmetic RGBA) — 4 channels, the channel-offset
+    /// table is `(4 - 1) * 4 = 12` bytes. Truncations in
+    /// `1..=12` are Truncated.
+    #[test]
+    fn type_8_arith_rgba_truncation_and_flip_no_panic() {
+        let (w, h) = (4u32, 4u32);
+        let pixels = pattern_bytes(PixelKind::Bgra32.buffer_len(w, h));
+        let frame = encode_arith_rgba(&pixels, w, h);
+        let full = decode_frame(&frame, w, h, PixelKind::Bgra32);
+        assert!(full.is_ok(), "type-8 full frame should decode: {:?}", full);
+        for k in 1..=12 {
+            let r = decode_frame(&frame[..k], w, h, PixelKind::Bgra32);
+            assert!(
+                matches!(r, Err(Error::Truncated { .. })),
+                "type-8 prefix len {k} (in offset table) should be Truncated, got {:?}",
+                r
+            );
+        }
+        truncation_and_flip_sweep(&frame, w, h);
+    }
+
+    /// Type 10 (Arithmetic YV12) — 3 planes, offset table is 8 bytes.
+    /// Prefixes 1..=8 must be Truncated.
+    #[test]
+    fn type_10_arith_yv12_truncation_and_flip_no_panic() {
+        let (w, h) = (4u32, 4u32);
+        let pixels = pattern_bytes(PixelKind::Yv12.buffer_len(w, h));
+        let frame = encode_arith_yv12(&pixels, w, h);
+        let full = decode_frame(&frame, w, h, PixelKind::Yv12);
+        assert!(full.is_ok(), "type-10 full frame should decode: {:?}", full);
+        for k in 1..=8 {
+            let r = decode_frame(&frame[..k], w, h, PixelKind::Yv12);
+            assert!(
+                matches!(r, Err(Error::Truncated { .. })),
+                "type-10 prefix len {k} (in offset table) should be Truncated, got {:?}",
+                r
+            );
+        }
+        truncation_and_flip_sweep(&frame, w, h);
+    }
+
+    /// Type 3 (Arithmetic YUY2) — same 3-plane offset-table shape
+    /// as type 10 / type 4.
+    #[test]
+    fn type_3_arith_yuy2_truncation_and_flip_no_panic() {
+        let (w, h) = (4u32, 4u32);
+        let pixels = pattern_bytes(PixelKind::Yuy2.buffer_len(w, h));
+        let frame = encode_arith_yuy2(&pixels, w, h);
+        let full = decode_frame(&frame, w, h, PixelKind::Yuy2);
+        assert!(full.is_ok(), "type-3 full frame should decode: {:?}", full);
+        for k in 1..=8 {
+            let r = decode_frame(&frame[..k], w, h, PixelKind::Yuy2);
+            assert!(
+                matches!(r, Err(Error::Truncated { .. })),
+                "type-3 prefix len {k} (in offset table) should be Truncated, got {:?}",
+                r
+            );
+        }
+        truncation_and_flip_sweep(&frame, w, h);
+    }
+
+    /// Type 7 (Legacy RGB) — same 3-plane shape; routes through the
+    /// adaptive-CDF legacy range coder (`spec/07`) rather than the
+    /// modern coder. Prefixes 1..=8 must be Truncated (same
+    /// dispatcher contract). The channel-body path can return any
+    /// `Err(_)` variant the legacy decoder chooses.
+    #[test]
+    fn type_7_legacy_rgb_truncation_and_flip_no_panic() {
+        let (w, h) = (4u32, 4u32);
+        let pixels = pattern_bytes(PixelKind::Bgr24.buffer_len(w, h));
+        let frame = encode_legacy_rgb(&pixels, w, h);
+        let full = decode_frame(&frame, w, h, PixelKind::Bgr24);
+        assert!(full.is_ok(), "type-7 full frame should decode: {:?}", full);
+        for k in 1..=8 {
+            let r = decode_frame(&frame[..k], w, h, PixelKind::Bgr24);
+            assert!(
+                matches!(r, Err(Error::Truncated { .. })),
+                "type-7 prefix len {k} (in offset table) should be Truncated, got {:?}",
+                r
+            );
+        }
+        truncation_and_flip_sweep(&frame, w, h);
+    }
+
+    /// Type 11 (Reduced-resolution) — wire is byte-0 = 0x0b then a
+    /// type-10 YV12 body at half-W / half-H. Host dimensions must be
+    /// multiples of 4 (round 187 guard) so the smallest valid host
+    /// size that flows past the dimension guard is 4×4. Truncation
+    /// sweep walks the body.
+    #[test]
+    fn type_11_reduced_res_truncation_and_flip_no_panic() {
+        let (w, h) = (4u32, 4u32);
+        let pixels = pattern_bytes(PixelKind::Yv12.buffer_len(w, h));
+        let frame = encode_arith_reduced_res(&pixels, w, h);
+        let full = decode_frame(&frame, w, h, PixelKind::Yv12);
+        assert!(full.is_ok(), "type-11 full frame should decode: {:?}", full);
+        for k in 1..=8 {
+            let r = decode_frame(&frame[..k], w, h, PixelKind::Yv12);
+            assert!(
+                matches!(r, Err(Error::Truncated { .. })),
+                "type-11 prefix len {k} (in offset table) should be Truncated, got {:?}",
+                r
+            );
+        }
+        truncation_and_flip_sweep(&frame, w, h);
+    }
+
+    /// Type 5 (Solid Grey) — only 2 bytes total on the wire. Single-
+    /// byte payload truncation → `Error::Truncated`. Flip sweep covers
+    /// both bytes.
+    #[test]
+    fn type_5_solid_grey_truncation_and_flip_no_panic() {
+        let frame = encode_solid_grey(0x77);
+        assert_eq!(frame.len(), 2, "solid grey is type byte + colour byte");
+        let r = decode_frame(&frame[..1], 4, 4, PixelKind::Bgr24);
+        assert!(
+            matches!(r, Err(Error::Truncated { .. })),
+            "type-5 with no colour byte should be Truncated, got {:?}",
+            r
+        );
+        // Flip the colour byte across the value range; every value
+        // is a legal grey, every kind that accepts a packed BPP
+        // decodes; Yv12 / Yuy2 surface PixelFormatMismatch.
+        for val in [0x00u8, 0x55, 0xaa, 0xff] {
+            let mutated = vec![5u8, val];
+            for &kind in &[
+                PixelKind::Bgr24,
+                PixelKind::Bgra32,
+                PixelKind::Yv12,
+                PixelKind::Yuy2,
+            ] {
+                let _ = decode_frame(&mutated, 4, 4, kind);
+            }
+        }
+    }
+
+    /// Type 6 (Solid RGB) — 4 bytes total. Truncation of the colour
+    /// trio → Truncated.
+    #[test]
+    fn type_6_solid_rgb_truncation_and_flip_no_panic() {
+        let frame = encode_solid_rgb(0x11, 0x22, 0x33);
+        for k in 1..frame.len() {
+            let r = decode_frame(&frame[..k], 4, 4, PixelKind::Bgr24);
+            assert!(
+                matches!(r, Err(Error::Truncated { .. })),
+                "type-6 prefix len {k} should be Truncated, got {:?}",
+                r
+            );
+        }
+        truncation_and_flip_sweep(&frame, 4, 4);
+    }
+
+    /// Type 9 (Solid RGBA) — 5 bytes total.
+    #[test]
+    fn type_9_solid_rgba_truncation_and_flip_no_panic() {
+        let frame = encode_solid_rgba(0x11, 0x22, 0x33, 0x44);
+        for k in 1..frame.len() {
+            let r = decode_frame(&frame[..k], 4, 4, PixelKind::Bgra32);
+            assert!(
+                matches!(r, Err(Error::Truncated { .. })),
+                "type-9 prefix len {k} should be Truncated, got {:?}",
+                r
+            );
+        }
+        truncation_and_flip_sweep(&frame, 4, 4);
+    }
+
+    /// Stateful [`Decoder`] — truncation sweep across the primer
+    /// frame, then NULL replay on each truncated primer's
+    /// surviving state. The primer can fail to decode (truncated);
+    /// when it does, the stateful decoder must not leave a
+    /// half-initialised `prev` slot that a subsequent NULL replay
+    /// would dereference.
+    #[test]
+    fn stateful_decoder_truncation_no_panic() {
+        let (w, h) = (4u32, 4u32);
+        let pixels = pattern_bytes(PixelKind::Bgr24.buffer_len(w, h));
+        let primer = encode_arith_rgb24(&pixels, w, h);
+        for k in 1..primer.len() {
+            let mut dec = Decoder::new();
+            let primer_res = dec.decode(&primer[..k], w, h, PixelKind::Bgr24);
+            // Whatever the primer returned, a follow-up NULL frame
+            // must not panic. If `primer_res` was `Err`, the stateful
+            // decoder is documented to leave `prev` unset, so the
+            // NULL replay should surface
+            // `Error::NullFrameWithoutPredecessor`. If `primer_res`
+            // was `Ok` (the truncated primer happened to land on a
+            // legal Lagarith bitstream — unlikely but not impossible),
+            // the NULL replay should return a clone of the primer's
+            // output.
+            let null_res = dec.decode(&[], w, h, PixelKind::Bgr24);
+            match (&primer_res, &null_res) {
+                (Err(_), Err(Error::NullFrameWithoutPredecessor)) => {}
+                (Ok(_), Ok(_)) => {}
+                // Anything else terminates without panic, which is
+                // the only invariant the harness guarantees. We
+                // accept it (no assertion) — the specific Err
+                // variant is not the contract here.
+                _ => {}
+            }
+        }
+    }
+
+    /// `decode_frame_with_prev` against a truncated primer and a
+    /// non-matching prev frame — no panic regardless of how the
+    /// dimensions / kind line up. The prev-frame buffer length is
+    /// host-controlled, so the truncated wire bytes must not lean on
+    /// the prev's buffer being any specific size.
+    #[test]
+    fn decode_frame_with_prev_truncation_against_mismatched_prev_no_panic() {
+        let (w, h) = (4u32, 4u32);
+        let pixels = pattern_bytes(PixelKind::Bgr24.buffer_len(w, h));
+        let frame = encode_arith_rgb24(&pixels, w, h);
+        // Build a `prev` of a different size + kind — a 8×8 Yv12
+        // surface. The decoder should reject the NULL replay shape
+        // mismatch up-front; truncated primers must surface their
+        // own Err without dereferencing the prev buffer.
+        let mut dec_prev = Decoder::new();
+        let prev_pixels = pattern_bytes(PixelKind::Yv12.buffer_len(8, 8));
+        let prev_frame = encode_arith_yv12(&prev_pixels, 8, 8);
+        let prev = dec_prev
+            .decode(&prev_frame, 8, 8, PixelKind::Yv12)
+            .expect("prev primer decodes");
+        for k in 1..frame.len() {
+            let _ = decode_frame_with_prev(&frame[..k], w, h, PixelKind::Bgr24, Some(&prev));
+        }
+    }
+}

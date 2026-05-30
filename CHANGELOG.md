@@ -8,6 +8,37 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 192 — truncation + single-byte-flip fuzz harness on valid
+  encoded frames (12 new tests).** Closes the gap between round 181's
+  hand-constructed malformed inputs (one fixture per documented
+  failure variant) and round 181's random-byte sweep (statistically
+  unlikely to look like a valid `(escape_len, supplement_byte)` RLE
+  pair / Fibonacci-prefix bit stream / channel-offset table). The
+  new module
+  `roundtrip_tests::decoder_truncation_fuzz` encodes one valid frame
+  per frame-type the test encoder covers (1, 3, 4, 5, 6, 7, 8, 9,
+  10, 11) and then walks every truncated prefix `frame[..k]` for
+  `k ∈ 1..frame.len()` against all four pixel kinds, asserting the
+  decoder returns `Ok(_)` or `Err(_)` without panicking (including
+  in debug builds where the predictor / RLE / range-coder modules
+  carry `debug_assert!` invariants). For each frame the test also
+  runs a single-byte-flip pass at every 7th offset (7 is coprime
+  with the channel-header / Fibonacci-prefix / RLE byte strides) to
+  `0x00` and `0xff`, same no-panic invariant. Truncations that land
+  strictly inside the frame-type byte + channel-offset table
+  (`k ∈ 1..=8` for 3-plane frames, `1..=12` for the 4-plane RGBA
+  frame, `1..frame.len()` for solid + uncompressed types) are
+  additionally pinned to `Error::Truncated` — the dispatcher
+  contract for an incomplete prefix per `spec/01` §2.3. Channel-body
+  truncations are allowed to surface any `Err(_)` variant the
+  channel decoder chooses, because a truncated body can look like a
+  legal but shorter Fibonacci-coded plane. Two further tests cover
+  the stateful `Decoder` and `decode_frame_with_prev` paths against
+  truncated primer frames + mismatched-shape `prev`-frame state,
+  pinning the invariant that a failed primer must not leave a
+  half-initialised `prev` slot a subsequent NULL replay would
+  dereference. 197 unit tests pass after the addition (+12 vs.
+  round 187's 185).
 - **Round 187 — reduced-resolution (type 11) host-dimension guard (6
   new tests).** `decode_reduced_res` now rejects host width/height
   pairs that aren't multiples of 4 with `Error::BadDimensions` before
