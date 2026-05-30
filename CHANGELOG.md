@@ -6,6 +6,37 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.1](https://github.com/OxideAV/oxideav-lagarith/releases/tag/v0.0.1) - 2026-05-30
+
+### Other
+
+- round 192 — truncation + single-byte-flip fuzz harness on valid encoded frames
+- round 187 — reduced-resolution (type 11) host-dimension guard
+- round 181 — defensive harness for malformed-input no-panic invariants
+- round 174 — per-frame-type header-form selector flip
+- round 15 — legacy-fork per-channel header-form selection
+- round 14 — per-channel header-form selection across all 8 wire forms
+- round 13 — modern probability-model write path: q>=1 frequency rescale
+- round 12 — encoder spec/02 §6.3 final-flush FF-chain bulk-fill
+- round 127 — extend ffmpeg pin set to 7 pow2 sizes + pattern-sensitivity characterisation
+- round 124 — modern RGB(A) predictor Rule B + ffmpeg pins
+- update is_rare_symbol_cluster doc for Strategy F
+- round 96 — pair-packed 513-entry CDF decode (Strategy F)
+- round 11 — encoder-side spec/02 §5 Step-C freqs[] cache
+- round 10 — encoder-side spec/02 §5 Step-B fast path + cache Option→bool refactor
+- round 9 — encoder-side spec/02 §5 Step-A fast path + FF-chain bulk flush
+- round 8 — spec/02 §5 three-way fast path + 2-byte refill window
+- round-7 test count + decoder-side defensive harness mention
+- Round 7: type-7 decoder defensive harness (audit/12 §7.1)
+- Round 6: Strategy E encoder integration (audit/12 §7.1)
+- Round 5: type 7 Rule B predictor + RLE-then-Fibonacci channel sub-path
+- Round 4: type 7 (legacy RGB / spec/07 adaptive-CDF range coder)
+- Round 3: YUY2 (type 3), reduced-resolution (type 11), SIMD parity
+- Round 2: YV12 (frame type 10) + stateful NULL-frame replay
+- bundle RLE LUT CSVs into crate to fix CI build
+- Round 1: clean-room rebuild — modern arithmetic-coded RGB family decoder
+- Round 0 — clean-room rebuild scaffold (orphan master)
+
 ### Added
 
 - **Round 192 — truncation + single-byte-flip fuzz harness on valid
