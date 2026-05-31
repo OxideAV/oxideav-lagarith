@@ -6,6 +6,16 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- round 198 — deeper channel-body fuzz: single-bit XOR, multi-byte burst
+  flip (`0xff` / `0x00` / `0x55` / `0xaa`, N ∈ {2,3,4}), and
+  insertion/deletion shift sweeps on valid 8×8 encoded frames across
+  types 3 / 4 / 7 / 8 / 10 / 11. Targets the channel-body decoders
+  (Fibonacci prefix, modern range-coder normalisation, legacy
+  adaptive-CDF) at single-bit granularity below round 192's
+  byte-extremes fuzz; same no-panic invariant.
+
 ## [0.0.1](https://github.com/OxideAV/oxideav-lagarith/releases/tag/v0.0.1) - 2026-05-30
 
 ### Other

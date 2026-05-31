@@ -2886,3 +2886,303 @@ mod decoder_truncation_fuzz {
         }
     }
 }
+
+/// Deeper-coverage no-panic fuzz harness exercising the channel-body
+/// decoders (modern range coder + Fibonacci-prefix decoder + RLE
+/// expansion + legacy adaptive-CDF coder) at a frame size large enough
+/// that the channel body is the dominant byte budget.
+///
+/// Round 192's `decoder_truncation_fuzz` module is `4×4`-sized and
+/// only mutates with two values (`0x00` / `0xff`) at one offset at a
+/// time. That sweep is sound for the dispatcher + offset-table layer
+/// but barely reaches the per-channel body decoders — at `4×4` the
+/// body is on the order of 5-20 bytes per plane, and `0x00` / `0xff`
+/// only test "all bits cleared" / "all bits set". Channel bodies hold
+/// the modern range-coder framing (`spec/02`), the MSB-first
+/// Fibonacci-prefix bit stream (`spec/04`), the residual zero-run
+/// escape (`spec/05`), and the legacy adaptive-CDF coder (`spec/07`);
+/// off-by-one bit-level bugs in any of these would slip a single-byte
+/// flip sweep.
+///
+/// This module covers the gap with three complementary axes:
+///
+/// 1. **Single-bit XOR fuzz** at `8×8`: flips one bit at a time across
+///    every body byte and every bit position `1 << b` for `b ∈ 0..8`.
+///    Strictly stronger than the `0x00` / `0xff` byte writes in
+///    `decoder_truncation_fuzz` (which only test the two extremes of
+///    bit-pattern space); single-bit flips locate the MSB-first
+///    Fibonacci prefix decoder and the range-coder normalisation loop
+///    in the per-bit shift count.
+/// 2. **Burst flip fuzz** at `8×8`: replaces `N` consecutive body
+///    bytes (N ∈ {2, 3, 4}) with each of `0xff` / `0x00` / `0x55` /
+///    `0xaa`. The 0x55 / 0xaa values were missing from r192's two-
+///    value vocabulary; multi-byte bursts find Fibonacci-prefix
+///    decoders that walk through a well-formed length byte into a
+///    region the burst has corrupted.
+/// 3. **Insertion + deletion fuzz** at `8×8`: shifts the channel-body
+///    region by ±1 byte (deleting a body byte, or inserting a `0x00`
+///    body byte) at deterministic offsets. This catches decoders that
+///    assume aligned reads from the wire — the modern range coder's
+///    4-byte priming and the Fibonacci prefix's bit-granular reads
+///    have different alignment exposure surfaces.
+///
+/// All three axes assert the same invariant the rest of the
+/// decoder_*_fuzz modules assert: every decode call must terminate
+/// with `Ok(_)` or `Err(_)`; no panic, no infinite loop. CI runs
+/// the same default-`bench`-off test profile so the harness is
+/// shaped to complete inside the workspace `cargo test` budget on a
+/// laptop (≪ 1 s combined across all axis-tests).
+#[cfg(test)]
+mod decoder_deep_fuzz {
+    use super::*;
+    use crate::encoder::{
+        encode_arith_reduced_res, encode_arith_rgb24, encode_arith_rgba, encode_arith_yuy2,
+        encode_arith_yv12, encode_legacy_rgb,
+    };
+
+    /// `8×8` body pattern — same `i * 73 + 11` LCG-ish step used by
+    /// the rest of the file (kept inline for module self-containment).
+    fn body_bytes(n: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let v = (i as u32).wrapping_mul(73).wrapping_add(11);
+            out.push((v & 0xff) as u8);
+        }
+        out
+    }
+
+    /// Compute the byte offset where the channel-body region starts.
+    /// The encoded frame layout is:
+    /// ```text
+    /// [byte 0       ] frame type
+    /// [bytes 1..N   ] (n_channels - 1) * 4 byte channel-offset table
+    /// [bytes N..end ] N concatenated channels' worth of body bytes
+    /// ```
+    /// where `N` is `n_channels - 1`. For the modern RGB(A) / YUY2 /
+    /// YV12 frames there is always at least one channel body; for
+    /// type 11 (reduced-res) the wire layout is `[0x0b][type-10 body]`
+    /// so the body starts at byte 1.
+    fn body_start_offset(frame_type: u8) -> usize {
+        match frame_type {
+            // Solid / Uncompressed: body is the literal byte stream
+            // right after the type byte.
+            1 | 5 | 6 | 9 => 1,
+            // Type 11 wraps a type-10 frame whose own offset table
+            // starts at +1; for the deep-fuzz purposes "the body" is
+            // every byte the host decoder must read past the type
+            // byte — so we start at 1 here too and rely on the
+            // truncation tests to cover the inner offset table.
+            11 => 1,
+            // 3 channels: 8-byte offset table.
+            3 | 4 | 7 | 10 => 1 + 8,
+            // 4 channels: 12-byte offset table.
+            8 => 1 + 12,
+            _ => 1,
+        }
+    }
+
+    /// Single-bit XOR sweep across the channel-body region of a valid
+    /// frame. For every body offset, flip one bit at a time at each
+    /// of the 8 bit positions; assert no panic on each decode.
+    ///
+    /// At `8×8` the body is on the order of 50-100 bytes; the inner
+    /// loop is `body_len × 8 × n_kinds` ≈ 100 × 8 × 4 = 3200 decode
+    /// calls per frame type. Quick to run, locates Fibonacci prefix
+    /// and range-coder shift-count off-by-ones the byte-extremes
+    /// sweep is blind to.
+    fn single_bit_xor_body_sweep(frame: &[u8], w: u32, h: u32, frame_type: u8) {
+        let body_start = body_start_offset(frame_type);
+        // No body to flip — solid types are 2..=5 bytes total, the
+        // truncation harness already covers them; skip.
+        if body_start >= frame.len() {
+            return;
+        }
+        for off in body_start..frame.len() {
+            for bit in 0..8u8 {
+                let mut mutated = frame.to_vec();
+                mutated[off] ^= 1 << bit;
+                for &kind in &[
+                    PixelKind::Bgr24,
+                    PixelKind::Bgra32,
+                    PixelKind::Yv12,
+                    PixelKind::Yuy2,
+                ] {
+                    // The decode must terminate; we don't pin
+                    // `Ok` vs specific `Err` — random bit flips
+                    // create most-of-the-time-invalid bitstreams
+                    // but occasionally land on a legal alternate
+                    // wire form, and the contract is "no panic".
+                    let _ = decode_frame(&mutated, w, h, kind);
+                }
+            }
+        }
+    }
+
+    /// Burst-flip sweep: replace `burst_len` consecutive body bytes
+    /// with `fill` and assert no panic. Burst lengths up to 4 reach
+    /// multi-byte Fibonacci-prefix length decoders and the range
+    /// coder's 4-byte prime/refill window.
+    fn burst_flip_body_sweep(frame: &[u8], w: u32, h: u32, frame_type: u8) {
+        let body_start = body_start_offset(frame_type);
+        if body_start + 4 > frame.len() {
+            return;
+        }
+        // Stride 5 so 8 / 16 / 32 / 64 byte bodies all hit multiple
+        // distinct offsets without sweep blowup; the four fill values
+        // span the bit-pattern extremes (all-zero / all-one) plus the
+        // two alternating-bit patterns (`0x55` / `0xaa`) that any
+        // single-bit-flip sweep also exercises but here together as
+        // a contiguous burst.
+        for off in (body_start..frame.len().saturating_sub(4)).step_by(5) {
+            for &burst_len in &[2usize, 3, 4] {
+                if off + burst_len > frame.len() {
+                    break;
+                }
+                for &fill in &[0xffu8, 0x00, 0x55, 0xaa] {
+                    let mut mutated = frame.to_vec();
+                    for byte in mutated.iter_mut().skip(off).take(burst_len) {
+                        *byte = fill;
+                    }
+                    for &kind in &[
+                        PixelKind::Bgr24,
+                        PixelKind::Bgra32,
+                        PixelKind::Yv12,
+                        PixelKind::Yuy2,
+                    ] {
+                        let _ = decode_frame(&mutated, w, h, kind);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Insertion / deletion fuzz: shift the channel-body region by
+    /// `±1` byte at deterministic offsets. This tests decoders that
+    /// implicitly assume aligned reads (the modern range coder's
+    /// 4-byte priming + 1-byte refill, and the Fibonacci prefix's
+    /// bit-granular decode that crosses byte boundaries).
+    fn shift_body_sweep(frame: &[u8], w: u32, h: u32, frame_type: u8) {
+        let body_start = body_start_offset(frame_type);
+        if body_start >= frame.len() {
+            return;
+        }
+        for off in (body_start..frame.len()).step_by(11) {
+            // Delete one body byte at `off`.
+            let mut shorter = frame.to_vec();
+            shorter.remove(off);
+            // Insert one zero body byte at `off`.
+            let mut longer = frame.to_vec();
+            longer.insert(off, 0x00);
+            for variant in &[shorter, longer] {
+                for &kind in &[
+                    PixelKind::Bgr24,
+                    PixelKind::Bgra32,
+                    PixelKind::Yv12,
+                    PixelKind::Yuy2,
+                ] {
+                    let _ = decode_frame(variant, w, h, kind);
+                }
+            }
+        }
+    }
+
+    /// Type 4 (Arithmetic RGB24) — 8×8 BGR24, 3 channels, 8-byte
+    /// offset table. All three fuzz axes against the valid frame.
+    #[test]
+    fn type_4_arith_rgb24_deep_fuzz_no_panic() {
+        let (w, h) = (8u32, 8u32);
+        let pixels = body_bytes(PixelKind::Bgr24.buffer_len(w, h));
+        let frame = encode_arith_rgb24(&pixels, w, h);
+        assert!(
+            decode_frame(&frame, w, h, PixelKind::Bgr24).is_ok(),
+            "type-4 8x8 full frame should decode"
+        );
+        single_bit_xor_body_sweep(&frame, w, h, 4);
+        burst_flip_body_sweep(&frame, w, h, 4);
+        shift_body_sweep(&frame, w, h, 4);
+    }
+
+    /// Type 8 (Arithmetic RGBA) — 8×8, 4 channels, 12-byte offset
+    /// table. Exercises the alpha-plane channel-body decoder in
+    /// addition to the RGB planes.
+    #[test]
+    fn type_8_arith_rgba_deep_fuzz_no_panic() {
+        let (w, h) = (8u32, 8u32);
+        let pixels = body_bytes(PixelKind::Bgra32.buffer_len(w, h));
+        let frame = encode_arith_rgba(&pixels, w, h);
+        assert!(
+            decode_frame(&frame, w, h, PixelKind::Bgra32).is_ok(),
+            "type-8 8x8 full frame should decode"
+        );
+        single_bit_xor_body_sweep(&frame, w, h, 8);
+        burst_flip_body_sweep(&frame, w, h, 8);
+        shift_body_sweep(&frame, w, h, 8);
+    }
+
+    /// Type 10 (Arithmetic YV12) — 8×8, 3 planes (Y, V, U). The
+    /// chroma planes are 4×4 so the Y plane dominates the body.
+    #[test]
+    fn type_10_arith_yv12_deep_fuzz_no_panic() {
+        let (w, h) = (8u32, 8u32);
+        let pixels = body_bytes(PixelKind::Yv12.buffer_len(w, h));
+        let frame = encode_arith_yv12(&pixels, w, h);
+        assert!(
+            decode_frame(&frame, w, h, PixelKind::Yv12).is_ok(),
+            "type-10 8x8 full frame should decode"
+        );
+        single_bit_xor_body_sweep(&frame, w, h, 10);
+        burst_flip_body_sweep(&frame, w, h, 10);
+        shift_body_sweep(&frame, w, h, 10);
+    }
+
+    /// Type 3 (Arithmetic YUY2) — 8×8, 3 planes (Y, U, V) extracted
+    /// from packed `Y U Y V`. Same shape as type 10 / 4 but the
+    /// packed→planar dispatcher differs.
+    #[test]
+    fn type_3_arith_yuy2_deep_fuzz_no_panic() {
+        let (w, h) = (8u32, 8u32);
+        let pixels = body_bytes(PixelKind::Yuy2.buffer_len(w, h));
+        let frame = encode_arith_yuy2(&pixels, w, h);
+        assert!(
+            decode_frame(&frame, w, h, PixelKind::Yuy2).is_ok(),
+            "type-3 8x8 full frame should decode"
+        );
+        single_bit_xor_body_sweep(&frame, w, h, 3);
+        burst_flip_body_sweep(&frame, w, h, 3);
+        shift_body_sweep(&frame, w, h, 3);
+    }
+
+    /// Type 7 (Legacy RGB) — 8×8, routes through the adaptive-CDF
+    /// legacy range coder (`spec/07`) rather than the modern coder.
+    /// Different entropy path, different bit-level surfaces.
+    #[test]
+    fn type_7_legacy_rgb_deep_fuzz_no_panic() {
+        let (w, h) = (8u32, 8u32);
+        let pixels = body_bytes(PixelKind::Bgr24.buffer_len(w, h));
+        let frame = encode_legacy_rgb(&pixels, w, h);
+        assert!(
+            decode_frame(&frame, w, h, PixelKind::Bgr24).is_ok(),
+            "type-7 8x8 full frame should decode"
+        );
+        single_bit_xor_body_sweep(&frame, w, h, 7);
+        burst_flip_body_sweep(&frame, w, h, 7);
+        shift_body_sweep(&frame, w, h, 7);
+    }
+
+    /// Type 11 (Reduced-resolution) — 8×8 host frame whose body is a
+    /// type-10 YV12 4×4 sub-frame. Host dimensions must be a multiple
+    /// of 4 per round 187's guard.
+    #[test]
+    fn type_11_reduced_res_deep_fuzz_no_panic() {
+        let (w, h) = (8u32, 8u32);
+        let pixels = body_bytes(PixelKind::Yv12.buffer_len(w, h));
+        let frame = encode_arith_reduced_res(&pixels, w, h);
+        assert!(
+            decode_frame(&frame, w, h, PixelKind::Yv12).is_ok(),
+            "type-11 8x8 full frame should decode"
+        );
+        single_bit_xor_body_sweep(&frame, w, h, 11);
+        burst_flip_body_sweep(&frame, w, h, 11);
+        shift_body_sweep(&frame, w, h, 11);
+    }
+}

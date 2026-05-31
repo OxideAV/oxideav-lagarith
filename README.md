@@ -373,7 +373,7 @@ type-7 stream still awaits a fixture oracle
 
 ## Tests
 
-204 unit + integration tests cover the range coder, Fibonacci
+210 unit + integration tests cover the range coder, Fibonacci
 prefix, RLE escape, predictor + decorrelation, channel-header
 dispatcher, the channel-header `0x01..=0x03` arithmetic-with-RLE
 path and the `0x05..=0x07` raw-RLE path, an end-to-end encode →
@@ -452,8 +452,27 @@ does not align to any one structural feature). The stateful
 against truncated primers + a mismatched-shape `prev`-frame,
 pinning the invariant that a failed primer must not leave a
 half-initialised `prev` slot a subsequent NULL replay would
-dereference. 204 unit + integration tests pass after the
-addition.
+dereference. Round 198 adds a **deeper channel-body fuzz**
+(6 new tests, module `decoder_deep_fuzz`) layered on top of
+round 192's prefix-sweep: at `8×8` (where the channel body
+dominates the byte budget — round 192's `4×4` frames bottom out
+at ~5-20 body bytes per plane) every body offset is single-bit-
+XOR-flipped at each of the 8 bit positions, then burst-flipped
+with `N ∈ {2,3,4}` consecutive bytes set to one of `0xff` /
+`0x00` / `0x55` / `0xaa` (the alternating-bit fills are new vs.
+r192's two-extreme `0x00` / `0xff` vocabulary), then shifted by
+±1 body byte (delete or insert a `0x00`) at every 11th offset.
+The bit-flip axis probes the MSB-first Fibonacci-prefix decoder
+(`spec/04`) and the modern range coder's normalisation loop
+(`spec/02` §5) at single-bit-granularity that two-value byte
+sweeps are blind to; the burst axis reaches multi-byte length
+decoders that walk through well-formed prefixes into the
+corrupted region; the shift axis tests decoders that implicitly
+assume aligned reads (range coder 4-byte priming, Fibonacci
+prefix's bit-granular reads crossing byte boundaries). Covers
+frame types 3 / 4 / 7 / 8 / 10 / 11. Same no-panic invariant
+the round-181 / 192 sweeps assert; 210 unit + integration tests
+pass after the addition.
 
 ### SIMD-vs-scalar predictor (`spec/06` §3.2)
 
