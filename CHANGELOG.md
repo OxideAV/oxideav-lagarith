@@ -8,6 +8,25 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- round 204 — randomised encoder→decoder self-roundtrip property
+  suite (9 new tests, module `encoder_random_roundtrip_property`).
+  Every modern arithmetic family (`encode_arith_rgb24` /
+  `encode_arith_rgba` / `encode_arith_yv12` / `encode_arith_yuy2`)
+  plus the legacy type-7 path (`encode_legacy_rgb`) is driven with
+  deterministic LCG-seeded random pixel buffers across 3 seeds × 4
+  representative `(W, H)` pairs per family that span both selector
+  branches (RGB24 `width % 4 == 0` vs. unaligned; YUY2 / YV12
+  chroma sub-sampling alignment), plus a wider 8-seed cross-sweep
+  at 8×8 for each modern type. Each test asserts strict byte
+  equality between input pixel buffer and decoded `Image::pixels` —
+  a stronger correctness pin than the existing fixed-pattern
+  roundtrip fixtures (which use a single `i * 73 + 11` gradient
+  and would miss encoder fast-path asymmetries that fire only on
+  rare residual distributions). Reduced-resolution type 11 is
+  excluded by construction (2× nearest-neighbour downsample →
+  upsample is lossy; only the fixed-point round-trips, pinned by
+  `reduced_res_roundtrip_*`). 219 unit + integration tests pass
+  after the addition (+9 vs. round 198's 210).
 - round 198 — deeper channel-body fuzz: single-bit XOR, multi-byte burst
   flip (`0xff` / `0x00` / `0x55` / `0xaa`, N ∈ {2,3,4}), and
   insertion/deletion shift sweeps on valid 8×8 encoded frames across

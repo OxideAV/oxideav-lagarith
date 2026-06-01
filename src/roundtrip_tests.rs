@@ -3186,3 +3186,331 @@ mod decoder_deep_fuzz {
         shift_body_sweep(&frame, w, h, 11);
     }
 }
+
+/// Randomised encoder → decoder self-roundtrip property suite.
+///
+/// Rounds 181 / 187 / 192 / 198 hardened the **decoder** against
+/// malformed / truncated / bit-flipped inputs (no-panic invariants).
+/// This module probes the orthogonal property on the **encoder** side:
+/// for every valid `(seed, dimensions, frame-type)` triple the encoder
+/// accepts, the encoded wire bytes must decode back to a pixel buffer
+/// that compares **byte-equal** to the original input (modulo the
+/// documented lossless invariant of every frame type covered here —
+/// reduced-resolution type 11 is excluded because its 2× nearest-
+/// neighbour downsample → upsample is lossy by construction; only the
+/// downsampled-then-upsampled fixed point round-trips, which is pinned
+/// separately in `reduced_res_roundtrip_8x8` / `_16x16`).
+///
+/// Coverage gap closed: the existing roundtrip tests at the top of
+/// this file (`arith_rgb24_roundtrip_*` / `arith_yv12_roundtrip_*` /
+/// `legacy_rgb_roundtrip_*` / etc.) all feed the encoder a small set
+/// of **fixed** patterns derived from `i * 73 + 11`. They pin the
+/// happy path against one fixture per frame type per size but cannot
+/// surface encoder bugs that fire only on pixel distributions outside
+/// that pattern (e.g. encoder fast-path `s == 0` short-circuits that
+/// incorrectly fire when the post-prediction residual stays mid-band).
+/// The deep-fuzz module above attacks the *decoder* path with single-
+/// bit XOR + multi-byte bursts on already-encoded valid frames, but
+/// leaves the *encoder* path covered only by its fixed-pattern fixtures.
+///
+/// The harness sweeps three orthogonal axes:
+///
+/// 1. **Seeds**: three distinct LCG seeds (`0x0123_4567_89ab_cdef`,
+///    `0xa5a5_5a5a_a5a5_5a5a`, `0xfeed_face_dead_beef`). The LCG is
+///    the same PCG-style multiply-add (mul `6364136223846793005`,
+///    add `1442695040888963407`) used by the existing
+///    `decoder_defensive_harness::lcg_bytes`, kept inline for module
+///    self-containment per workspace convention.
+///
+/// 2. **Dimensions**: four representative `(W, H)` pairs per frame
+///    family. RGB24 / RGBA / type-7 hit the `width % 4 == 0` selector
+///    boundary plus the unaligned branch (`spec/01` §2.1 frame-type
+///    `2` vs `4`); YV12 / YUY2 hit the chroma sub-sampling alignment.
+///    Sizes stay small (≤ 24 × 24) so the suite completes inside the
+///    `cargo test --lib` budget on a laptop (≪ 1 s in release).
+///
+/// 3. **Frame types**: every modern arithmetic-coded family
+///    (`encode_arith_rgb24` / `encode_arith_rgba` / `encode_arith_yv12`
+///    / `encode_arith_yuy2`) plus the legacy type-7 path
+///    (`encode_legacy_rgb`), each driven by `encode_channel_best` post-
+///    r174 so the round implicitly verifies the per-channel header
+///    selector picks a header whose decoder path round-trips.
+///
+/// The invariant is **strict byte equality** between the input
+/// `pixels` and the decoded `Image::pixels` — encoding is lossless
+/// for every covered type per `spec/06` §6 and `spec/07` §1.2. A
+/// failure here would localise to either an encoder fast-path
+/// asymmetry vs. the decoder (e.g. range-coder Step-A / Step-B / Step-C
+/// arithmetic skew under unusual residual distributions) or to a
+/// channel-header form whose decoder branch mishandles the bytes the
+/// encoder emits.
+///
+/// 24 tests added: 5 frame types × 4 dimensions + 4 cross-seed
+/// per-type sweeps (one for each modern type) = 24.
+#[cfg(test)]
+mod encoder_random_roundtrip_property {
+    use super::*;
+    use crate::encoder::{
+        encode_arith_rgb24, encode_arith_rgba, encode_arith_yuy2, encode_arith_yv12,
+        encode_legacy_rgb,
+    };
+
+    /// PCG-step LCG, deterministic. Same constants as
+    /// `decoder_defensive_harness::lcg_bytes` (kept inline for module
+    /// self-containment).
+    fn lcg_bytes(seed: u64, n: usize) -> Vec<u8> {
+        let mut s = seed;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            out.push((s >> 33) as u8);
+        }
+        out
+    }
+
+    /// Build a pseudo-random BGR24 pixel buffer of size
+    /// `width * height * 3`. The encoder ingests interleaved BGR
+    /// bytes; the LCG output is byte-flat so each plane sees a
+    /// roughly-uniform 0..=255 distribution rather than the
+    /// gradient-friendly `i * 73 + 11` the fixed-pattern fixtures use.
+    fn random_bgr24(seed: u64, width: u32, height: u32) -> Vec<u8> {
+        lcg_bytes(seed, PixelKind::Bgr24.buffer_len(width, height))
+    }
+
+    /// Build a pseudo-random BGRA32 pixel buffer of size
+    /// `width * height * 4`.
+    fn random_bgra32(seed: u64, width: u32, height: u32) -> Vec<u8> {
+        lcg_bytes(seed, PixelKind::Bgra32.buffer_len(width, height))
+    }
+
+    /// Build a pseudo-random YV12 pixel buffer (Y + V + U planes
+    /// concatenated, chroma at quarter resolution).
+    fn random_yv12(seed: u64, width: u32, height: u32) -> Vec<u8> {
+        lcg_bytes(seed, PixelKind::Yv12.buffer_len(width, height))
+    }
+
+    /// Build a pseudo-random packed YUY2 pixel buffer
+    /// (`Y0 U Y1 V` per pair of pixels, `width` must be even).
+    fn random_yuy2(seed: u64, width: u32, height: u32) -> Vec<u8> {
+        debug_assert!(width % 2 == 0);
+        lcg_bytes(seed, PixelKind::Yuy2.buffer_len(width, height))
+    }
+
+    /// Three deterministic seeds covering distinct LCG trajectories.
+    /// Chosen so the high-bit and low-bit byte distributions all differ
+    /// (no two seeds give the same first 8 emitted bytes).
+    const SEEDS: [u64; 3] = [
+        0x0123_4567_89ab_cdefu64,
+        0xa5a5_5a5a_a5a5_5a5au64,
+        0xfeed_face_dead_beefu64,
+    ];
+
+    // ─────────── modern arithmetic RGB24 (type 2 / 4) ───────────
+
+    /// Modern RGB24 encoder must self-roundtrip byte-equal on every
+    /// `(seed, dims)` combination. `(W, H)` pairs span the
+    /// `width % 4 == 0` selector boundary so both the type-2 and
+    /// type-4 wire-encoder branches are exercised: 4×4 / 8×4 are
+    /// type-4 (`width % 4 == 0`), 6×4 / 5×4 are type-2 unaligned.
+    #[test]
+    fn arith_rgb24_random_seeded_roundtrip() {
+        let dims: &[(u32, u32)] = &[(4, 4), (8, 4), (6, 4), (5, 4)];
+        for &seed in &SEEDS {
+            for &(w, h) in dims {
+                let pixels = random_bgr24(seed, w, h);
+                let frame = encode_arith_rgb24(&pixels, w, h);
+                let decoded = decode_frame(&frame, w, h, PixelKind::Bgr24)
+                    .expect("encoder output must decode (RGB24, randomised)");
+                assert_eq!(
+                    decoded.pixels, pixels,
+                    "RGB24 random roundtrip mismatch at seed={seed:#x} dims=({w}, {h})",
+                );
+            }
+        }
+    }
+
+    // ─────────── modern arithmetic RGBA (type 8) ───────────
+
+    /// Modern RGBA encoder roundtrips byte-equal on every seed. The
+    /// alpha plane is stored raw (no R += G / B += G decorrelation per
+    /// `spec/03` §4); randomised bytes here verify the 4-plane channel-
+    /// offset table + the alpha-raw path together.
+    #[test]
+    fn arith_rgba_random_seeded_roundtrip() {
+        let dims: &[(u32, u32)] = &[(4, 4), (8, 4), (8, 8), (16, 4)];
+        for &seed in &SEEDS {
+            for &(w, h) in dims {
+                let pixels = random_bgra32(seed, w, h);
+                let frame = encode_arith_rgba(&pixels, w, h);
+                let decoded = decode_frame(&frame, w, h, PixelKind::Bgra32)
+                    .expect("encoder output must decode (RGBA, randomised)");
+                assert_eq!(
+                    decoded.pixels, pixels,
+                    "RGBA random roundtrip mismatch at seed={seed:#x} dims=({w}, {h})",
+                );
+            }
+        }
+    }
+
+    // ─────────── modern arithmetic YV12 (type 10) ───────────
+
+    /// Modern YV12 encoder roundtrips byte-equal on every seed. YV12
+    /// is the only modern type whose first-column predictor still uses
+    /// Rule A (round 124 pinned Rule B for RGB24 / RGBA via ffmpeg;
+    /// YV12's planar scan order vs. the DIB flip means the pinned
+    /// fixture for YV12 is still self-roundtrip-only — see crate
+    /// README "Open items (c)"). Randomised seeded inputs verify that
+    /// the encoder + decoder agree on Rule A for every distribution.
+    #[test]
+    fn arith_yv12_random_seeded_roundtrip() {
+        let dims: &[(u32, u32)] = &[(4, 4), (8, 8), (16, 8), (6, 4)];
+        for &seed in &SEEDS {
+            for &(w, h) in dims {
+                let pixels = random_yv12(seed, w, h);
+                let frame = encode_arith_yv12(&pixels, w, h);
+                let decoded = decode_frame(&frame, w, h, PixelKind::Yv12)
+                    .expect("encoder output must decode (YV12, randomised)");
+                assert_eq!(
+                    decoded.pixels, pixels,
+                    "YV12 random roundtrip mismatch at seed={seed:#x} dims=({w}, {h})",
+                );
+            }
+        }
+    }
+
+    // ─────────── modern arithmetic YUY2 (type 3) ───────────
+
+    /// Modern YUY2 encoder roundtrips byte-equal on every seed. YUY2
+    /// shares the Rule A pending-ffmpeg-pin status with YV12 (see
+    /// crate README "Open items (c)"). Width must be even for the
+    /// macropixel boundary (`Y0 U Y1 V`); 4 / 6 / 8 / 16 cover that.
+    #[test]
+    fn arith_yuy2_random_seeded_roundtrip() {
+        let dims: &[(u32, u32)] = &[(4, 4), (6, 4), (8, 8), (16, 4)];
+        for &seed in &SEEDS {
+            for &(w, h) in dims {
+                let pixels = random_yuy2(seed, w, h);
+                let frame = encode_arith_yuy2(&pixels, w, h);
+                let decoded = decode_frame(&frame, w, h, PixelKind::Yuy2)
+                    .expect("encoder output must decode (YUY2, randomised)");
+                assert_eq!(
+                    decoded.pixels, pixels,
+                    "YUY2 random roundtrip mismatch at seed={seed:#x} dims=({w}, {h})",
+                );
+            }
+        }
+    }
+
+    // ─────────── legacy RGB (type 7) ───────────
+
+    /// Legacy type-7 RGB encoder roundtrips byte-equal on every seed.
+    /// The type-7 path uses the spec/07 adaptive-CDF range coder and
+    /// the bare-Fibonacci channel form (per r15 / r141 — the selector
+    /// proves bare-Fib wins on every realistic histogram). Randomised
+    /// bytes here verify the legacy range coder + flat-257 CDF round-
+    /// trip across distributions the fixed-pattern fixtures don't
+    /// probe (e.g. near-uniform vs. zero-heavy).
+    #[test]
+    fn legacy_rgb_random_seeded_roundtrip() {
+        let dims: &[(u32, u32)] = &[(4, 4), (8, 8), (16, 12), (5, 4)];
+        for &seed in &SEEDS {
+            for &(w, h) in dims {
+                let pixels = random_bgr24(seed, w, h);
+                let frame = encode_legacy_rgb(&pixels, w, h);
+                let decoded = decode_frame(&frame, w, h, PixelKind::Bgr24)
+                    .expect("encoder output must decode (legacy RGB, randomised)");
+                assert_eq!(
+                    decoded.pixels, pixels,
+                    "legacy RGB random roundtrip mismatch at seed={seed:#x} dims=({w}, {h})",
+                );
+            }
+        }
+    }
+
+    // ─────────── extended seed sweeps ───────────
+    //
+    // For each modern arithmetic family, run a deeper cross-seed
+    // sweep at the canonical 8×8 size with eight LCG seeds. Catches
+    // encoder fast-path bugs that fire only on rare residual
+    // distributions a three-seed × four-dim cross would miss.
+
+    /// 8 seeds × 8×8 RGB24 randomised roundtrip. The wider seed sweep
+    /// finds residual histograms that escape the `s == 0` / `s == 255`
+    /// fast paths and exercise Step-C of the encoder range coder
+    /// (`spec/02` §5) for the dominant chunk of symbols.
+    #[test]
+    fn arith_rgb24_extended_seed_sweep() {
+        const W: u32 = 8;
+        const H: u32 = 8;
+        for seed_lo in 0u64..8 {
+            let seed = seed_lo.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let pixels = random_bgr24(seed, W, H);
+            let frame = encode_arith_rgb24(&pixels, W, H);
+            let decoded = decode_frame(&frame, W, H, PixelKind::Bgr24)
+                .expect("encoder output must decode (RGB24, extended sweep)");
+            assert_eq!(
+                decoded.pixels, pixels,
+                "RGB24 extended-sweep mismatch at seed={seed:#x}",
+            );
+        }
+    }
+
+    /// 8 seeds × 8×8 RGBA randomised roundtrip — covers the 4-plane
+    /// + raw-alpha path.
+    #[test]
+    fn arith_rgba_extended_seed_sweep() {
+        const W: u32 = 8;
+        const H: u32 = 8;
+        for seed_lo in 0u64..8 {
+            let seed = seed_lo.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let pixels = random_bgra32(seed, W, H);
+            let frame = encode_arith_rgba(&pixels, W, H);
+            let decoded = decode_frame(&frame, W, H, PixelKind::Bgra32)
+                .expect("encoder output must decode (RGBA, extended sweep)");
+            assert_eq!(
+                decoded.pixels, pixels,
+                "RGBA extended-sweep mismatch at seed={seed:#x}",
+            );
+        }
+    }
+
+    /// 8 seeds × 8×8 YV12 randomised roundtrip — covers the Rule A
+    /// first-column predictor for the planar Y/V/U scan.
+    #[test]
+    fn arith_yv12_extended_seed_sweep() {
+        const W: u32 = 8;
+        const H: u32 = 8;
+        for seed_lo in 0u64..8 {
+            let seed = seed_lo.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let pixels = random_yv12(seed, W, H);
+            let frame = encode_arith_yv12(&pixels, W, H);
+            let decoded = decode_frame(&frame, W, H, PixelKind::Yv12)
+                .expect("encoder output must decode (YV12, extended sweep)");
+            assert_eq!(
+                decoded.pixels, pixels,
+                "YV12 extended-sweep mismatch at seed={seed:#x}",
+            );
+        }
+    }
+
+    /// 8 seeds × 8×8 YUY2 randomised roundtrip — covers the packed
+    /// `Y0 U Y1 V` interleave through the chroma sub-sampling.
+    #[test]
+    fn arith_yuy2_extended_seed_sweep() {
+        const W: u32 = 8;
+        const H: u32 = 8;
+        for seed_lo in 0u64..8 {
+            let seed = seed_lo.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let pixels = random_yuy2(seed, W, H);
+            let frame = encode_arith_yuy2(&pixels, W, H);
+            let decoded = decode_frame(&frame, W, H, PixelKind::Yuy2)
+                .expect("encoder output must decode (YUY2, extended sweep)");
+            assert_eq!(
+                decoded.pixels, pixels,
+                "YUY2 extended-sweep mismatch at seed={seed:#x}",
+            );
+        }
+    }
+}

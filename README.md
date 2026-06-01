@@ -373,7 +373,7 @@ type-7 stream still awaits a fixture oracle
 
 ## Tests
 
-210 unit + integration tests cover the range coder, Fibonacci
+219 unit + integration tests cover the range coder, Fibonacci
 prefix, RLE escape, predictor + decorrelation, channel-header
 dispatcher, the channel-header `0x01..=0x03` arithmetic-with-RLE
 path and the `0x05..=0x07` raw-RLE path, an end-to-end encode →
@@ -472,7 +472,28 @@ assume aligned reads (range coder 4-byte priming, Fibonacci
 prefix's bit-granular reads crossing byte boundaries). Covers
 frame types 3 / 4 / 7 / 8 / 10 / 11. Same no-panic invariant
 the round-181 / 192 sweeps assert; 210 unit + integration tests
-pass after the addition.
+pass after the addition. Round 204 adds a **randomised
+encoder→decoder self-roundtrip property suite** (9 new tests,
+module `encoder_random_roundtrip_property`) — the orthogonal
+strict-byte-equality invariant on the encoder side. Every modern
+arithmetic family (`encode_arith_rgb24` / `encode_arith_rgba` /
+`encode_arith_yv12` / `encode_arith_yuy2`) plus the legacy
+type-7 path (`encode_legacy_rgb`) is driven with deterministic
+LCG-seeded random pixel buffers across 3 seeds × 4 representative
+`(W, H)` pairs per family, plus a wider 8-seed cross-sweep at the
+canonical 8×8 size for each modern type. The four `(W, H)` pairs
+per family span both selector branches (RGB24 `width % 4 == 0`
+vs. unaligned; YUY2 / YV12 chroma sub-sampling alignment). Each
+test asserts strict byte equality between the input pixel buffer
+and the decoded `Image::pixels` — a stronger correctness pin than
+the existing fixed-pattern roundtrip fixtures (which use a single
+`i * 73 + 11` gradient and would miss encoder fast-path
+asymmetries that fire only on rare residual distributions —
+`spec/02` §5 Step-A `s == 0` and Step-B `s == 255` short-circuits
+in particular). Reduced-resolution type 11 is excluded by
+construction (its 2× downsample → upsample is lossy; only the
+fixed-point round-trips, pinned by `reduced_res_roundtrip_*`).
+219 unit + integration tests pass after the addition.
 
 ### SIMD-vs-scalar predictor (`spec/06` §3.2)
 
