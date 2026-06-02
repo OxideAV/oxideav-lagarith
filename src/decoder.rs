@@ -316,6 +316,15 @@ fn decode_arith_rgb(
     height: u32,
     pixel_kind: PixelKind,
 ) -> Result<DecodedFrame> {
+    // Early pixel-kind validation — fail before decoding any channel
+    // bytes when the host asks for a planar buffer for a packed
+    // arithmetic-RGB frame. Same `packed_bpp().ok_or` shape as the
+    // post-decode guard kept at the pack site (which now becomes a
+    // structural no-op for the BGR / BGRA pack loop), but moved
+    // before the three Fibonacci + range-coder + predictor passes.
+    let bpp = pixel_kind.packed_bpp().ok_or(Error::PixelFormatMismatch {
+        frame_type: payload[0],
+    })?;
     let n_pixels = width as usize * height as usize;
     let slices = split_channels(payload, 3)?;
     // `spec/01` §2.3 + `spec/03` §3.2 audit clarification: the wiki
@@ -363,9 +372,6 @@ fn decode_arith_rgb(
     // is unchanged.
     cross_plane_decorrelate_rgb(&mut plane_b, &plane_g, &mut plane_r);
 
-    let bpp = pixel_kind.packed_bpp().ok_or(Error::PixelFormatMismatch {
-        frame_type: payload[0],
-    })?;
     let mut pixels = Vec::with_capacity(n_pixels * bpp);
     for i in 0..n_pixels {
         match pixel_kind {
@@ -381,7 +387,7 @@ fn decode_arith_rgb(
                 pixels.push(0xff);
             }
             PixelKind::Yv12 | PixelKind::Yuy2 => {
-                unreachable!("guarded by packed_bpp() above")
+                unreachable!("guarded by early packed_bpp() above")
             }
         }
     }
@@ -399,12 +405,42 @@ fn decode_arith_rgba(
     height: u32,
     pixel_kind: PixelKind,
 ) -> Result<DecodedFrame> {
+    // Validate the host pixel-kind tier up-front. If the host asked
+    // for a YV12 / YUY2 buffer for an RGBA-coded frame, fail before
+    // doing any channel-decode work — the alternative (decode all
+    // four planes then error in the pack loop) wastes the bulk of the
+    // CPU time on input the caller already mis-configured.
+    let bpp = pixel_kind.packed_bpp().ok_or(Error::PixelFormatMismatch {
+        frame_type: payload[0],
+    })?;
     let n_pixels = width as usize * height as usize;
     let slices = split_channels(payload, 4)?;
     let mut plane_b = decode_channel(slices[0], n_pixels)?; // wire R -> output +0 = B
     let mut plane_g = decode_channel(slices[1], n_pixels)?;
     let mut plane_r = decode_channel(slices[2], n_pixels)?; // wire B -> output +2 = R
-    let mut plane_a = decode_channel(slices[3], n_pixels)?;
+                                                            // **Lazy alpha decode** (round 211). The alpha plane has no
+                                                            // cross-plane decorrelation interaction (`spec/03` §4.3 — alpha
+                                                            // is stored raw) and is only read at the final pack step for
+                                                            // `PixelKind::Bgra32`. When the host asked for `Bgr24` the alpha
+                                                            // bytes are discarded, so we skip the entire fourth-channel
+                                                            // dispatch (Fibonacci probability prefix + modern range coder +
+                                                            // optional RLE expansion + predictor inverse) for that case.
+                                                            // Spec-grounded: spec/03 §4.3's "alpha plane is unchanged" plus
+                                                            // spec/04 §5 item 5's "channels are compressed independently"
+                                                            // guarantee independence — discarding the alpha slice carries no
+                                                            // side-effect on the other three planes.
+    let plane_a_opt = if matches!(pixel_kind, PixelKind::Bgra32) {
+        let mut plane_a = decode_channel(slices[3], n_pixels)?;
+        apply_plane_inverse_with_rule(
+            &mut plane_a,
+            width as usize,
+            height as usize,
+            FirstColRule::B,
+        );
+        Some(plane_a)
+    } else {
+        None
+    };
 
     // **Rule B** first-column-of-row predictor — ffmpeg-confirmed for
     // the modern RGBA arithmetic path; see `decode_arith_rgb`.
@@ -426,20 +462,11 @@ fn decode_arith_rgba(
         height as usize,
         FirstColRule::B,
     );
-    apply_plane_inverse_with_rule(
-        &mut plane_a,
-        width as usize,
-        height as usize,
-        FirstColRule::B,
-    );
 
     cross_plane_decorrelate_rgb(&mut plane_b, &plane_g, &mut plane_r);
     // Alpha plane has no cross-plane decorrelation per `spec/03`
     // §4.3.
 
-    let bpp = pixel_kind.packed_bpp().ok_or(Error::PixelFormatMismatch {
-        frame_type: payload[0],
-    })?;
     let mut pixels = Vec::with_capacity(n_pixels * bpp);
     for i in 0..n_pixels {
         match pixel_kind {
@@ -452,7 +479,14 @@ fn decode_arith_rgba(
                 pixels.push(plane_b[i]);
                 pixels.push(plane_g[i]);
                 pixels.push(plane_r[i]);
-                pixels.push(plane_a[i]);
+                // Bgra32 dispatch initialised `plane_a_opt` above; the
+                // `expect` here is structurally guaranteed by the
+                // `matches!` guard at decode time.
+                pixels.push(
+                    plane_a_opt
+                        .as_ref()
+                        .expect("Bgra32 path always decodes alpha")[i],
+                );
             }
             PixelKind::Yv12 | PixelKind::Yuy2 => {
                 unreachable!("guarded by packed_bpp() above")
@@ -746,6 +780,13 @@ fn decode_legacy_rgb(
     height: u32,
     pixel_kind: PixelKind,
 ) -> Result<DecodedFrame> {
+    // Same early-validate pattern as `decode_arith_rgb` (round 211):
+    // a Yv12 / Yuy2 host buffer for a legacy-RGB frame is a host-
+    // integration error; fail before the three legacy range-coder
+    // decodes which are the dominant cost of this path.
+    let bpp = pixel_kind.packed_bpp().ok_or(Error::PixelFormatMismatch {
+        frame_type: payload[0],
+    })?;
     let n_pixels = width as usize * height as usize;
     let slices = split_channels(payload, 3)?;
     // Same plane-order convention as types 2 / 4: wire R -> output
@@ -780,9 +821,6 @@ fn decode_legacy_rgb(
 
     cross_plane_decorrelate_rgb(&mut plane_b, &plane_g, &mut plane_r);
 
-    let bpp = pixel_kind.packed_bpp().ok_or(Error::PixelFormatMismatch {
-        frame_type: payload[0],
-    })?;
     let mut pixels = Vec::with_capacity(n_pixels * bpp);
     for i in 0..n_pixels {
         match pixel_kind {
@@ -798,7 +836,7 @@ fn decode_legacy_rgb(
                 pixels.push(0xff);
             }
             PixelKind::Yv12 | PixelKind::Yuy2 => {
-                unreachable!("guarded by packed_bpp() above")
+                unreachable!("guarded by early packed_bpp() above")
             }
         }
     }

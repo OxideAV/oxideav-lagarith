@@ -8,6 +8,29 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- round 211 — lazy alpha-plane decode in `decode_arith_rgba` for the
+  `PixelKind::Bgr24` host buffer, plus early pixel-kind validation
+  on the modern `decode_arith_rgb` / `decode_arith_rgba` and legacy
+  `decode_legacy_rgb` paths. Spec-grounded by `spec/03` §4.3 ("alpha
+  plane has no cross-plane decorrelation interaction") combined with
+  `spec/04` §5 item 5 ("channels are compressed independently"): when
+  the host requests `Bgr24` for a type-8 RGBA frame the alpha bytes
+  are discarded at the pack step regardless, so the decoder now
+  skips the entire fourth-channel dispatch (Fibonacci probability
+  prefix + modern range coder + optional RLE expansion + predictor
+  inverse) for that case. The pre-existing `packed_bpp().ok_or`
+  pixel-kind guard moves from the post-decode pack site to the
+  function entry, so a `Yv12` / `Yuy2` host buffer for an RGB-family
+  frame surfaces `PixelFormatMismatch` before any per-channel
+  arithmetic decode work (was: after 3 / 4 full plane decodes). 3
+  new tests (`arith_rgba_bgr24_matches_bgra32_bgr_portion`,
+  `arith_rgba_bgr24_skips_alpha_plane_decode`,
+  `arith_rgb_family_early_rejects_planar_pixel_kind`) pin the
+  behaviour from both directions: the BGR portion must match the
+  BGR-of-Bgra32 byte-for-byte; a frame whose only corruption is in
+  the alpha channel body must decode cleanly as Bgr24 and surface
+  `BadChannelHeader` as Bgra32. 215 lib + 7 ffmpeg pin tests pass
+  (+3 vs. round 204's 212).
 - round 204 — randomised encoder→decoder self-roundtrip property
   suite (9 new tests, module `encoder_random_roundtrip_property`).
   Every modern arithmetic family (`encode_arith_rgb24` /

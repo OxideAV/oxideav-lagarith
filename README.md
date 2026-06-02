@@ -16,7 +16,16 @@ power-of-two pixel sizes (RGB24 4×4 / 8×8 / 8×16 / 16×16 and RGBA
 4×4 / 8×8 / 16×16), characterises the residual **pattern-sensitive
 divergence** that survives the pow2 selection, and attributes it to
 the un-disassembled probability-loader at `lagarith.dll!0x180001050`
-(see `tests/ffmpeg_pins.rs` module docs).**
+(see `tests/ffmpeg_pins.rs` module docs).
+Round 211 — **lazy alpha-plane decode**: `decode_arith_rgba` now
+skips the fourth-channel arithmetic body (Fibonacci prefix + modern
+range coder + RLE + predictor) when the host buffer is `Bgr24`,
+spec-grounded by `spec/03` §4.3 (no cross-plane decorrelation for
+alpha) + `spec/04` §5 item 5 (channels compressed independently).
+Pixel-kind validation also moves to function entry on the modern and
+legacy RGB families, so `Yv12` / `Yuy2` host buffers for RGB-coded
+frames now surface `PixelFormatMismatch` before any per-channel
+decode work (3 new tests pin both halves of the contract).**
 This `master` branch is the clean-room rebuild against the
 strict-isolation cleanroom workspace at
 [`docs/video/lagarith/`](https://github.com/OxideAV/docs/tree/master/video/lagarith).

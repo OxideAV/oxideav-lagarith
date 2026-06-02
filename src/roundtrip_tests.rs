@@ -186,6 +186,136 @@ fn arith_rgba_roundtrip_larger() {
     assert_eq!(dec.pixels, pixels);
 }
 
+// ───────── Round 211: RGBA → Bgr24 lazy-alpha decode + early
+// pixel-kind validation on the modern arithmetic-RGB family ─────────
+//
+// Per `spec/03` §4.3 the alpha plane has no cross-plane decorrelation
+// interaction with the other three planes; per `spec/04` §5 item 5
+// "channels are compressed independently". Both together let the
+// decoder skip the entire fourth-channel arithmetic body (Fibonacci
+// freq table + range coder + optional RLE expansion + predictor
+// inverse) when the host requested `PixelKind::Bgr24` for an RGBA
+// (type 8) frame, since the alpha bytes are discarded at the pack
+// step regardless. The two tests below pin that:
+//
+// 1. The BGR portion of an RGBA → Bgr24 decode matches the BGR
+//    portion of the same frame decoded as Bgra32 byte-for-byte.
+// 2. A deliberately-corrupted alpha plane (channel-header byte set to
+//    an unknown value that would normally return BadChannelHeader)
+//    does NOT break a Bgr24 decode of the same frame — confirming the
+//    alpha-decode path is genuinely skipped, not just discarded after
+//    decode.
+
+#[test]
+fn arith_rgba_bgr24_matches_bgra32_bgr_portion() {
+    // Build an RGBA frame whose alpha plane carries real signal (so
+    // it would unambiguously affect a strict-equality comparison if
+    // any decoder path mixed it into the BGR bytes).
+    let (w, h) = (8, 6);
+    let pixels = pattern_bgra32(w, h);
+    let frame = encode_arith_rgba(&pixels, w, h);
+
+    let dec_bgra32 = decode_frame(&frame, w, h, PixelKind::Bgra32).unwrap();
+    let dec_bgr24 = decode_frame(&frame, w, h, PixelKind::Bgr24).unwrap();
+    assert_eq!(dec_bgr24.pixels.len(), (w * h * 3) as usize);
+    assert_eq!(dec_bgra32.pixels.len(), (w * h * 4) as usize);
+
+    // Strip the alpha bytes from the Bgra32 output and compare.
+    let bgr_portion: Vec<u8> = dec_bgra32
+        .pixels
+        .chunks_exact(4)
+        .flat_map(|p| [p[0], p[1], p[2]])
+        .collect();
+    assert_eq!(
+        dec_bgr24.pixels, bgr_portion,
+        "RGBA-decoded-as-Bgr24 must equal the BGR portion of the same frame decoded as Bgra32",
+    );
+}
+
+#[test]
+fn arith_rgba_bgr24_skips_alpha_plane_decode() {
+    // Build a valid RGBA frame, then corrupt **only** the alpha
+    // channel's body so the alpha decode would surface
+    // BadChannelHeader if run. With round 211's lazy alpha behaviour,
+    // a Bgr24 decode never touches the alpha bytes and must return
+    // the correctly-decoded BGR pixels regardless. A Bgra32 decode of
+    // the same corrupted frame must fail.
+    let (w, h) = (4, 4);
+    let pixels = pattern_bgra32(w, h);
+    let mut frame = encode_arith_rgba(&pixels, w, h);
+
+    // Channel-offset table layout (spec/01 §2.3 for 4-plane RGBA):
+    // byte 0 = type byte (0x08), bytes 1..5 = G offset (u32 LE),
+    // bytes 5..9 = B offset, bytes 9..13 = A offset. The A channel
+    // starts at the byte indexed by the third u32.
+    assert_eq!(frame[0], 8);
+    let a_off = u32::from_le_bytes([frame[9], frame[10], frame[11], frame[12]]) as usize;
+    assert!(
+        a_off < frame.len(),
+        "A-channel offset must land inside the frame ({a_off} < {})",
+        frame.len()
+    );
+    // Overwrite the alpha channel-header byte with a value the
+    // dispatcher rejects (`0x10` is outside the legal {0x00..0x07,
+    // 0xff} set per spec/03 §2.1 / spec/06 §1.1).
+    frame[a_off] = 0x10;
+
+    // Bgr24 decode must succeed and reproduce the BGR portion.
+    let dec_bgr24 = decode_frame(&frame, w, h, PixelKind::Bgr24).expect(
+        "Bgr24 decode must skip the alpha channel and succeed on a frame whose only \
+            corruption sits in the alpha body",
+    );
+    let expected_bgr: Vec<u8> = pixels
+        .chunks_exact(4)
+        .flat_map(|p| [p[0], p[1], p[2]])
+        .collect();
+    assert_eq!(dec_bgr24.pixels, expected_bgr);
+
+    // Bgra32 decode of the **same** corrupted frame must fail at the
+    // alpha-channel dispatch — pins the negative half of the lazy-
+    // decode pair (so a future regression that decodes alpha
+    // eagerly for Bgr24 would either start failing the test above or
+    // start succeeding here; both are real-defect signals).
+    let r = decode_frame(&frame, w, h, PixelKind::Bgra32);
+    assert!(
+        matches!(r, Err(crate::Error::BadChannelHeader(0x10))),
+        "Bgra32 decode of a frame with a corrupted alpha-channel header must surface \
+         BadChannelHeader(0x10); got {r:?}",
+    );
+}
+
+#[test]
+fn arith_rgb_family_early_rejects_planar_pixel_kind() {
+    // Round 211 moves the `packed_bpp()` pixel-kind validation to the
+    // top of `decode_arith_rgb` / `decode_arith_rgba` /
+    // `decode_legacy_rgb`. The behavioural contract (return
+    // PixelFormatMismatch when the host asks for a planar buffer for
+    // a packed RGB family frame) is unchanged; the earliness change
+    // is observable only by side-channel (e.g. a corrupt channel
+    // body that would surface BadChannelHeader if reached). Pin the
+    // contract here at the API level so a future refactor can't
+    // silently drop the early-validate guard back to a post-decode
+    // panic / different error variant.
+    for (frame, label) in [
+        (
+            encode_arith_rgb24(&pattern_bgr24(4, 4), 4, 4),
+            "type 4 (rgb24)",
+        ),
+        (
+            encode_arith_rgba(&pattern_bgra32(4, 4), 4, 4),
+            "type 8 (rgba)",
+        ),
+    ] {
+        for kind in [PixelKind::Yv12, PixelKind::Yuy2] {
+            let r = decode_frame(&frame, 4, 4, kind);
+            assert!(
+                matches!(r, Err(crate::Error::PixelFormatMismatch { .. })),
+                "{label} with {kind:?} must surface PixelFormatMismatch; got {r:?}",
+            );
+        }
+    }
+}
+
 #[test]
 fn null_frame_returns_error() {
     let r = decode_frame(&[], 4, 4, PixelKind::Bgr24);
