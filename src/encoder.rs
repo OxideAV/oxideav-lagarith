@@ -1109,6 +1109,91 @@ pub fn encode_arith_rgba(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
     pack_channels(8, &[&ch_b, &ch_g, &ch_r, &ch_a])
 }
 
+// ─── Round 222 — frame-level type-1 (uncompressed) size guard ──────
+//
+// The modern arithmetic frame encoders (`encode_arith_rgb24` /
+// `encode_arith_yv12` / `encode_arith_yuy2` / `encode_arith_rgba`)
+// always emit a header byte + channel-offset table (9 or 13 bytes for
+// the 3- and 4-channel families respectively per `spec/01` §2.3) plus
+// at least the Fibonacci-prefix-plus-arithmetic body of every plane.
+// On inputs whose residuals do not compress — high-entropy / random
+// patterns at small frame sizes — the per-channel `encode_channel_best`
+// selector still routes to a positive-overhead form (the 257-entry
+// Fibonacci freq table alone occupies several dozen bytes), so the
+// emitted wire can exceed the raw pixel buffer.
+//
+// `spec/01` §2.1 defines type 1 ("uncompressed") as
+// `{ byte 0 = 0x01, bytes 1..N = uncompressed pixel data }` — the
+// host pixel buffer with a 1-byte prefix, in the source layout
+// (RGB24 / RGB32 / RGBA / YUY2 / YV12). The decoder dispatches on
+// byte 0, so a type-1 frame is a structurally legal substitute for
+// any type-2/3/4/8/10 frame carrying the same pixels.
+//
+// The wrappers below add a never-larger guarantee at the frame level:
+// each computes both forms and returns the smaller. This mirrors the
+// existing per-channel header-form selector (`encode_channel_best`,
+// `spec/03` §2.1 + `spec/06` §1.7) and the type-7 `encode_legacy_rgb_
+// _best`'s Strategy E fallback (`audit/12` §7.1) one level up. Type 1
+// is decoder-orthogonal — every conformant decoder routes byte 0 = 1
+// to the memcpy helper at `lagarith.dll!0x18000555a` per `spec/01`
+// §2.1 / table at §1 — so the size-based switch cannot regress
+// wire compatibility. The 64-bit proprietary encoder does not produce
+// type 1 in the wild (`spec/01` §3 row 1: "the encoder does **not**
+// produce uncompressed type-1 output in this build"), making this a
+// strict structural improvement over the proprietary's own emission
+// path on inputs where arith overhead exceeds the raw payload.
+
+/// Frame-level **size-based type-1 fallback** wrapping
+/// [`encode_arith_rgb24`]. Returns the shorter of the arithmetic-coded
+/// frame and the equivalent type-1 (uncompressed) frame
+/// (`spec/01` §2.1). Tie-breaks in favour of the arithmetic form (keeps
+/// the existing wire bytes byte-identical when both are equal).
+pub fn encode_arith_rgb24_or_uncompressed(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let arith = encode_arith_rgb24(pixels, width, height);
+    let raw = encode_uncompressed(pixels);
+    if raw.len() < arith.len() {
+        raw
+    } else {
+        arith
+    }
+}
+
+/// Frame-level **size-based type-1 fallback** wrapping
+/// [`encode_arith_yv12`]. See [`encode_arith_rgb24_or_uncompressed`].
+pub fn encode_arith_yv12_or_uncompressed(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let arith = encode_arith_yv12(pixels, width, height);
+    let raw = encode_uncompressed(pixels);
+    if raw.len() < arith.len() {
+        raw
+    } else {
+        arith
+    }
+}
+
+/// Frame-level **size-based type-1 fallback** wrapping
+/// [`encode_arith_yuy2`]. See [`encode_arith_rgb24_or_uncompressed`].
+pub fn encode_arith_yuy2_or_uncompressed(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let arith = encode_arith_yuy2(pixels, width, height);
+    let raw = encode_uncompressed(pixels);
+    if raw.len() < arith.len() {
+        raw
+    } else {
+        arith
+    }
+}
+
+/// Frame-level **size-based type-1 fallback** wrapping
+/// [`encode_arith_rgba`]. See [`encode_arith_rgb24_or_uncompressed`].
+pub fn encode_arith_rgba_or_uncompressed(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let arith = encode_arith_rgba(pixels, width, height);
+    let raw = encode_uncompressed(pixels);
+    if raw.len() < arith.len() {
+        raw
+    } else {
+        arith
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

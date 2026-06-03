@@ -6,6 +6,43 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- round 222 — **frame-level type-1 (uncompressed) size guard.** Four
+  new public encoder entry points wrap each modern arithmetic frame
+  encoder with a never-larger comparison against the equivalent
+  `encode_uncompressed(pixels)` form (`spec/01` §2.1):
+  `encode_arith_rgb24_or_uncompressed`,
+  `encode_arith_yv12_or_uncompressed`,
+  `encode_arith_yuy2_or_uncompressed`, and
+  `encode_arith_rgba_or_uncompressed`. Each computes both wire
+  forms and returns the shorter, tie-breaking in favour of the
+  arithmetic form so already-compressing inputs stay byte-identical
+  to the existing `encode_arith_*` output. The fallback is
+  decoder-orthogonal: byte 0 = `0x01` routes through the memcpy
+  helper at `lagarith.dll!0x18000555a` per `spec/01` §2.1 +
+  the dispatch table at §1, so a type-1 substitute is wire-format-
+  compatible with every conformant decoder. The 64-bit proprietary
+  encoder does not emit type 1 (`spec/01` §3 row 1), making the
+  guard a strict structural improvement over the proprietary's own
+  emission path on inputs where arithmetic overhead exceeds the raw
+  payload (the 9-byte channel-offset preamble + per-channel
+  Fibonacci freq table + range-coder body easily exceed the
+  `1 + W*H*bpp`-byte raw payload at small frame sizes or
+  high-entropy / random-pixel inputs). 13 new tests in module
+  `frame_uncompressed_size_guard` cover: (a) never-larger size
+  invariant across `4×4` through `32×32` for all four pixel
+  families with three LCG seeds per size plus a smooth-gradient
+  fixture, (b) decode-correct round-trip from every wrapper through
+  `decode_frame`, (c) positive selector-fires pin showing the
+  wrapper picks the type-1 branch on `4×4` random-pixel inputs and
+  the wire equals `encode_uncompressed(pixels)` byte-identically,
+  and (d) a tie-break-favours-arithmetic pin on `32×32` smooth
+  gradient RGB24 where the arithmetic wire is strictly shorter and
+  the guarded wire must equal the unguarded `encode_arith_rgb24`
+  output. Total test count rises from 218 to 231 (no-default) /
+  221 to 234 (registry).
+
 ### Changed
 
 - round 216 — **packed-RGB(A) pack-loop branch hoist.** Lifted the

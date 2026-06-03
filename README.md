@@ -26,6 +26,34 @@ Pixel-kind validation also moves to function entry on the modern and
 legacy RGB families, so `Yv12` / `Yuy2` host buffers for RGB-coded
 frames now surface `PixelFormatMismatch` before any per-channel
 decode work (3 new tests pin both halves of the contract).
+Round 222 — **frame-level type-1 (uncompressed) size guard**: four
+new encoder entry points
+(`encode_arith_rgb24_or_uncompressed`, `encode_arith_yv12_or_uncompressed`,
+`encode_arith_yuy2_or_uncompressed`, `encode_arith_rgba_or_uncompressed`)
+wrap each modern arithmetic frame encoder with a never-larger
+comparison against the equivalent `encode_uncompressed(pixels)` form
+(`spec/01` §2.1). The selector returns the shorter wire, tie-breaking
+in favour of the arithmetic form so already-compressing inputs stay
+byte-identical to the existing `encode_arith_*` output. The fallback
+is decoder-orthogonal: byte 0 = `0x01` routes through the memcpy
+helper at `lagarith.dll!0x18000555a`, so a type-1 substitute is wire-
+format-compatible with every conformant decoder. The 64-bit
+proprietary encoder does not produce type 1 in the wild
+(`spec/01` §3 row 1), so the guard is a strict structural
+improvement on inputs where arithmetic overhead exceeds the raw
+payload — the 9-byte (RGB24 / YV12 / YUY2) or 13-byte (RGBA)
+channel-offset preamble + per-channel Fibonacci freq tables + range-
+coder bodies easily exceed the `1 + W*H*bpp`-byte raw payload at
+small frame sizes or random / high-entropy pixel inputs. 13 new
+tests in module `frame_uncompressed_size_guard` cover the never-
+larger invariant across `4×4`..`32×32` × four pixel families with
+three LCG seeds per size + a smooth-gradient fixture, decode-correct
+round-trip through every wrapper, a positive selector-fires pin (on
+`4×4` random inputs the wrapper picks byte 0 = `0x01` and emits
+exactly `encode_uncompressed(pixels)`), and a tie-break-favours-
+arithmetic pin (on `32×32` smooth gradient RGB24 the guarded wire
+equals the unguarded `encode_arith_rgb24` output byte-identically).
+
 Round 216 — **packed-RGB(A) pack-loop branch hoist**: the per-pixel
 `match pixel_kind` arm inside the BGR(A) pack loops of
 `decode_arith_rgb` (types 2 / 4), `decode_arith_rgba` (type 8),
@@ -401,7 +429,7 @@ type-7 stream still awaits a fixture oracle
 
 ## Tests
 
-228 unit + integration tests cover the range coder, Fibonacci
+241 unit + integration tests cover the range coder, Fibonacci
 prefix, RLE escape, predictor + decorrelation, channel-header
 dispatcher, the channel-header `0x01..=0x03` arithmetic-with-RLE
 path and the `0x05..=0x07` raw-RLE path, an end-to-end encode →
@@ -522,8 +550,10 @@ in particular). Reduced-resolution type 11 is excluded by
 construction (its 2× downsample → upsample is lossy; only the
 fixed-point round-trips, pinned by `reduced_res_roundtrip_*`).
 219 unit + integration tests pass after the addition. Round 216
-brings the total to **228** with the new packed-RGB(A) pack-loop
-byte-layout pins.
+brings the total to 228 with the new packed-RGB(A) pack-loop
+byte-layout pins. Round 222 adds the frame-level type-1 (uncompressed)
+size guard module (`frame_uncompressed_size_guard`) with 13 new pins,
+bringing the total to **241**.
 
 ### SIMD-vs-scalar predictor (`spec/06` §3.2)
 

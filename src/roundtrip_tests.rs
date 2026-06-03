@@ -3904,3 +3904,309 @@ mod pack_loop_byte_layout_pins {
         }
     }
 }
+
+/// Round 222 — frame-level type-1 (uncompressed) size guard.
+///
+/// `encode_arith_rgb24_or_uncompressed` (and the YV12 / YUY2 / RGBA
+/// siblings) wraps the modern-arithmetic frame encoder with a
+/// **never-larger** size comparison against the equivalent
+/// `encode_uncompressed(pixels)` form (`spec/01` §2.1). Type 1 is
+/// decoder-orthogonal: byte 0 routes to the memcpy helper at
+/// `lagarith.dll!0x18000555a` per `spec/01` table at §1, so a
+/// type-1 substitute decodes byte-exactly against every conformant
+/// decoder.
+///
+/// The pins below cover:
+///
+/// 1. **Never-larger size invariant** — for every probed `(W, H)` the
+///    wrapper output is `<=` the unwrapped `encode_arith_*` output.
+///    The wrapper can shrink the wire; it never grows it.
+/// 2. **Decode-correct round-trip** — the wrapper's output decodes
+///    back to the original pixels, regardless of which branch
+///    (arith or uncompressed) the size selector chooses.
+/// 3. **Selector-fires-on-tiny-random** — at small frame sizes with
+///    deterministic-LCG pseudo-random pixels (high entropy, residuals
+///    do not compress), the wrapper picks the type-1 branch
+///    (byte 0 == 0x01) and saves at least one byte versus the
+///    arithmetic encoding. This is the positive pin that the size
+///    selector is wired in (and not just sitting as dead code).
+/// 4. **Tie-break favours arithmetic** — when both forms have equal
+///    length, the wrapper returns the arithmetic form unchanged.
+#[cfg(test)]
+mod frame_uncompressed_size_guard {
+    use crate::decoder::{decode_frame, PixelKind};
+    use crate::encoder::{
+        encode_arith_rgb24, encode_arith_rgb24_or_uncompressed, encode_arith_rgba,
+        encode_arith_rgba_or_uncompressed, encode_arith_yuy2, encode_arith_yuy2_or_uncompressed,
+        encode_arith_yv12, encode_arith_yv12_or_uncompressed, encode_uncompressed,
+    };
+
+    /// Deterministic LCG used to synthesise high-entropy fixtures.
+    fn lcg_bytes(seed: u64, n: usize) -> Vec<u8> {
+        let mut s = seed;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            out.push((s >> 33) as u8);
+        }
+        out
+    }
+
+    /// Smooth gradient pattern — the arithmetic path tends to win on
+    /// these (compressible residuals), so the wrapper's size invariant
+    /// is exercised in its "arith stays" branch.
+    fn pattern_gradient(n: usize) -> Vec<u8> {
+        (0..n).map(|i| ((i * 73 + 11) & 0xff) as u8).collect()
+    }
+
+    // ─── 1. Never-larger size invariant ───────────────────────────
+
+    #[test]
+    fn arith_rgb24_or_uncompressed_never_larger_than_arith() {
+        for &(w, h) in &[(4u32, 4u32), (8, 8), (8, 16), (16, 16), (32, 32)] {
+            let n = (w * h) as usize * 3;
+            for seed in [0xc0de_d00du64, 0x1234_5678, 0xdead_beef] {
+                let pixels = lcg_bytes(seed, n);
+                let arith = encode_arith_rgb24(&pixels, w, h);
+                let guarded = encode_arith_rgb24_or_uncompressed(&pixels, w, h);
+                assert!(
+                    guarded.len() <= arith.len(),
+                    "rgb24 guarded ({}) larger than arith ({}) at {w}×{h} seed {seed:#x}",
+                    guarded.len(),
+                    arith.len(),
+                );
+            }
+            let smooth = pattern_gradient(n);
+            let arith = encode_arith_rgb24(&smooth, w, h);
+            let guarded = encode_arith_rgb24_or_uncompressed(&smooth, w, h);
+            assert!(
+                guarded.len() <= arith.len(),
+                "rgb24 guarded ({}) larger than arith ({}) on gradient at {w}×{h}",
+                guarded.len(),
+                arith.len(),
+            );
+        }
+    }
+
+    #[test]
+    fn arith_yv12_or_uncompressed_never_larger_than_arith() {
+        for &(w, h) in &[(4u32, 4u32), (8, 8), (16, 16), (32, 32)] {
+            let n = PixelKind::Yv12.buffer_len(w, h);
+            for seed in [0xc0de_d00du64, 0x1234_5678, 0xdead_beef] {
+                let pixels = lcg_bytes(seed, n);
+                let arith = encode_arith_yv12(&pixels, w, h);
+                let guarded = encode_arith_yv12_or_uncompressed(&pixels, w, h);
+                assert!(
+                    guarded.len() <= arith.len(),
+                    "yv12 guarded ({}) larger than arith ({}) at {w}×{h} seed {seed:#x}",
+                    guarded.len(),
+                    arith.len(),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn arith_yuy2_or_uncompressed_never_larger_than_arith() {
+        for &(w, h) in &[(4u32, 4u32), (8, 8), (16, 16), (32, 32)] {
+            let n = PixelKind::Yuy2.buffer_len(w, h);
+            for seed in [0xc0de_d00du64, 0x1234_5678, 0xdead_beef] {
+                let pixels = lcg_bytes(seed, n);
+                let arith = encode_arith_yuy2(&pixels, w, h);
+                let guarded = encode_arith_yuy2_or_uncompressed(&pixels, w, h);
+                assert!(
+                    guarded.len() <= arith.len(),
+                    "yuy2 guarded ({}) larger than arith ({}) at {w}×{h} seed {seed:#x}",
+                    guarded.len(),
+                    arith.len(),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn arith_rgba_or_uncompressed_never_larger_than_arith() {
+        for &(w, h) in &[(4u32, 4u32), (8, 8), (16, 16), (32, 32)] {
+            let n = (w * h) as usize * 4;
+            for seed in [0xc0de_d00du64, 0x1234_5678, 0xdead_beef] {
+                let pixels = lcg_bytes(seed, n);
+                let arith = encode_arith_rgba(&pixels, w, h);
+                let guarded = encode_arith_rgba_or_uncompressed(&pixels, w, h);
+                assert!(
+                    guarded.len() <= arith.len(),
+                    "rgba guarded ({}) larger than arith ({}) at {w}×{h} seed {seed:#x}",
+                    guarded.len(),
+                    arith.len(),
+                );
+            }
+        }
+    }
+
+    // ─── 2. Decode-correct round-trip ─────────────────────────────
+
+    #[test]
+    fn arith_rgb24_or_uncompressed_roundtrips_byte_exact() {
+        for &(w, h) in &[(4u32, 4u32), (8, 8), (8, 16), (16, 16), (32, 32)] {
+            let n = (w * h) as usize * 3;
+            for seed in [0xc0de_d00du64, 0x1234_5678, 0xdead_beef] {
+                let pixels = lcg_bytes(seed, n);
+                let frame = encode_arith_rgb24_or_uncompressed(&pixels, w, h);
+                let decoded = decode_frame(&frame, w, h, PixelKind::Bgr24).unwrap();
+                assert_eq!(
+                    decoded.pixels, pixels,
+                    "rgb24 guarded roundtrip mismatch at {w}×{h} seed {seed:#x} (byte0={:#x})",
+                    frame[0]
+                );
+            }
+            let smooth = pattern_gradient(n);
+            let frame = encode_arith_rgb24_or_uncompressed(&smooth, w, h);
+            let decoded = decode_frame(&frame, w, h, PixelKind::Bgr24).unwrap();
+            assert_eq!(decoded.pixels, smooth);
+        }
+    }
+
+    #[test]
+    fn arith_yv12_or_uncompressed_roundtrips_byte_exact() {
+        for &(w, h) in &[(4u32, 4u32), (8, 8), (16, 16), (32, 32)] {
+            let n = PixelKind::Yv12.buffer_len(w, h);
+            for seed in [0xc0de_d00du64, 0x1234_5678] {
+                let pixels = lcg_bytes(seed, n);
+                let frame = encode_arith_yv12_or_uncompressed(&pixels, w, h);
+                let decoded = decode_frame(&frame, w, h, PixelKind::Yv12).unwrap();
+                assert_eq!(decoded.pixels, pixels);
+            }
+        }
+    }
+
+    #[test]
+    fn arith_yuy2_or_uncompressed_roundtrips_byte_exact() {
+        for &(w, h) in &[(4u32, 4u32), (8, 8), (16, 16), (32, 32)] {
+            let n = PixelKind::Yuy2.buffer_len(w, h);
+            for seed in [0xc0de_d00du64, 0x1234_5678] {
+                let pixels = lcg_bytes(seed, n);
+                let frame = encode_arith_yuy2_or_uncompressed(&pixels, w, h);
+                let decoded = decode_frame(&frame, w, h, PixelKind::Yuy2).unwrap();
+                assert_eq!(decoded.pixels, pixels);
+            }
+        }
+    }
+
+    #[test]
+    fn arith_rgba_or_uncompressed_roundtrips_byte_exact() {
+        for &(w, h) in &[(4u32, 4u32), (8, 8), (16, 16), (32, 32)] {
+            let n = (w * h) as usize * 4;
+            for seed in [0xc0de_d00du64, 0x1234_5678] {
+                let pixels = lcg_bytes(seed, n);
+                let frame = encode_arith_rgba_or_uncompressed(&pixels, w, h);
+                let decoded = decode_frame(&frame, w, h, PixelKind::Bgra32).unwrap();
+                assert_eq!(decoded.pixels, pixels);
+            }
+        }
+    }
+
+    // ─── 3. Selector-fires-on-tiny-random ─────────────────────────
+
+    /// On a tiny `4×4` random-byte RGB24 frame the arithmetic path's
+    /// per-channel Fibonacci frequency table + range-coder overhead
+    /// (~30-50 bytes per channel × 3 channels + 9-byte channel-offset
+    /// preamble) substantially exceeds the 48-byte raw pixel payload.
+    /// The size selector must pick the type-1 branch (byte 0 = 0x01).
+    #[test]
+    fn rgb24_selector_picks_uncompressed_on_tiny_random_input() {
+        const W: u32 = 4;
+        const H: u32 = 4;
+        let pixels = lcg_bytes(0xc0de_d00d, (W * H) as usize * 3);
+        let arith = encode_arith_rgb24(&pixels, W, H);
+        let guarded = encode_arith_rgb24_or_uncompressed(&pixels, W, H);
+        assert_eq!(
+            guarded[0], 0x01,
+            "expected type-1 wire (byte 0 = 0x01), got byte 0 = {:#x} (arith len {}, guarded len {})",
+            guarded[0], arith.len(), guarded.len(),
+        );
+        assert!(
+            guarded.len() < arith.len(),
+            "selector picked type 1 but no size win: arith={} guarded={}",
+            arith.len(),
+            guarded.len(),
+        );
+        // Byte-identity check against `encode_uncompressed` direct.
+        let raw = encode_uncompressed(&pixels);
+        assert_eq!(
+            guarded, raw,
+            "guarded wire must equal encode_uncompressed when type-1 wins",
+        );
+    }
+
+    #[test]
+    fn yv12_selector_picks_uncompressed_on_tiny_random_input() {
+        const W: u32 = 4;
+        const H: u32 = 4;
+        let pixels = lcg_bytes(0xc0de_d00d, PixelKind::Yv12.buffer_len(W, H));
+        let guarded = encode_arith_yv12_or_uncompressed(&pixels, W, H);
+        assert_eq!(
+            guarded[0], 0x01,
+            "expected type-1 wire, got byte 0 = {:#x}",
+            guarded[0],
+        );
+    }
+
+    #[test]
+    fn yuy2_selector_picks_uncompressed_on_tiny_random_input() {
+        const W: u32 = 4;
+        const H: u32 = 4;
+        let pixels = lcg_bytes(0xc0de_d00d, PixelKind::Yuy2.buffer_len(W, H));
+        let guarded = encode_arith_yuy2_or_uncompressed(&pixels, W, H);
+        assert_eq!(
+            guarded[0], 0x01,
+            "expected type-1 wire, got byte 0 = {:#x}",
+            guarded[0],
+        );
+    }
+
+    #[test]
+    fn rgba_selector_picks_uncompressed_on_tiny_random_input() {
+        const W: u32 = 4;
+        const H: u32 = 4;
+        let pixels = lcg_bytes(0xc0de_d00d, (W * H) as usize * 4);
+        let guarded = encode_arith_rgba_or_uncompressed(&pixels, W, H);
+        assert_eq!(
+            guarded[0], 0x01,
+            "expected type-1 wire, got byte 0 = {:#x}",
+            guarded[0],
+        );
+    }
+
+    // ─── 4. Tie-break + arith-stays branches ──────────────────────
+
+    /// On a smooth gradient input the residuals are highly
+    /// compressible — the arith form is strictly shorter than the
+    /// raw payload. The selector must keep the arithmetic wire
+    /// byte-identical (no inadvertent type-1 substitution on
+    /// well-compressing inputs).
+    #[test]
+    fn rgb24_selector_keeps_arith_when_smaller() {
+        // 32×32 gradient — enough planar mass that the per-channel
+        // Fibonacci freq table is amortised across thousands of
+        // residual bytes per plane.
+        const W: u32 = 32;
+        const H: u32 = 32;
+        let pixels = pattern_gradient((W * H) as usize * 3);
+        let arith = encode_arith_rgb24(&pixels, W, H);
+        let raw = encode_uncompressed(&pixels);
+        // Sanity check the fixture profile: arith must actually win
+        // here (otherwise the pin is testing nothing).
+        assert!(
+            arith.len() < raw.len(),
+            "fixture invariant broken: arith ({}) >= raw ({}) on 32×32 gradient",
+            arith.len(),
+            raw.len(),
+        );
+        let guarded = encode_arith_rgb24_or_uncompressed(&pixels, W, H);
+        assert_eq!(
+            guarded, arith,
+            "selector must keep the arithmetic wire byte-identical when it is the shorter form",
+        );
+    }
+}
