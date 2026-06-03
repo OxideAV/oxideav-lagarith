@@ -8,6 +8,42 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- round 229 — **type-7 (legacy adaptive-CDF RGB) frame-level type-1
+  (uncompressed) size guard.** A fifth `*_or_uncompressed` public
+  encoder entry point — `encode_legacy_rgb_or_uncompressed` — extends
+  the round-222 modern-arithmetic size guard to the legacy fork. The
+  wrapper computes both wire forms (`encode_legacy_rgb` + the
+  equivalent `encode_uncompressed(pixels)` form per `spec/01` §2.1)
+  and returns the shorter, tie-breaking in favour of the legacy form
+  so already-compressing inputs stay byte-identical to the existing
+  `encode_legacy_rgb` output. The Strategy E (`audit/12` §7.1) rare-
+  symbol-cluster diversion already inside `encode_legacy_rgb` is
+  preserved by construction: when it fires, `encode_legacy_rgb`
+  returns a type-1 frame and the size guard's `raw == legacy` tie-
+  breaks to that already-type-1 wire byte-identically. The size guard
+  is the orthogonal **size-based** axis: even on histograms that
+  clear Strategy E's wire-correctness signature, the bare-Fibonacci
+  form's 9-byte channel-offset preamble + per-channel adaptive-CDF
+  prefix + range-coder body can exceed the `1 + W*H*3`-byte raw
+  payload on tiny / high-entropy inputs. The fallback is decoder-
+  orthogonal: byte 0 = `0x01` routes the memcpy helper per
+  `spec/01` §2.1 + the dispatch table at §1, so the type-1
+  substitute decodes byte-exactly against any decoder that accepts
+  type 7. 5 new tests in module `legacy_frame_uncompressed_size_guard`
+  cover: (a) never-larger size invariant across `4×4`..`32×32` with
+  three LCG seeds per size plus a smooth-gradient fixture, (b)
+  decode-correct round-trip through the wrapper, (c) positive
+  selector-fires pin showing `4×4` random input routes to byte
+  0 = `0x01` and the wire equals `encode_uncompressed(pixels)`
+  byte-identically, (d) tie-break-favours-legacy pin on `32×32`
+  smooth gradient where the legacy wire is strictly shorter than
+  the raw payload, and (e) a Strategy E composability pin on a
+  `16×16` rare-symbol-cluster fixture demonstrating that the guard
+  preserves the pre-existing type-1 frame byte-identically (the size
+  guard composes with the wire-correctness diversion rather than
+  masking it). Total test count rises from 231 to 236 (no-default) /
+  234 to 239 (registry).
+
 - round 222 — **frame-level type-1 (uncompressed) size guard.** Four
   new public encoder entry points wrap each modern arithmetic frame
   encoder with a never-larger comparison against the equivalent

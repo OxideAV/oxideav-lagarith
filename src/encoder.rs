@@ -1194,6 +1194,45 @@ pub fn encode_arith_rgba_or_uncompressed(pixels: &[u8], width: u32, height: u32)
     }
 }
 
+/// Frame-level **size-based type-1 fallback** wrapping
+/// [`encode_legacy_rgb`]. Round 229 extension of the round-222
+/// modern-arithmetic guard to the type-7 (legacy adaptive-CDF RGB)
+/// path.
+///
+/// `encode_legacy_rgb` already routes rare-symbol-cluster residuals
+/// to type 1 via Strategy E (`audit/12` §7.1) — that diversion is a
+/// **wire-correctness** decision (the rare-symbol-cluster fixture
+/// class is the one the flat-257-entry CDF and the pair-packed
+/// 513-entry CDF disagree on, per `audit/12` §5..§6). The round-229
+/// guard is the orthogonal **size-based** axis: even when the
+/// residual histograms clear the rare-symbol-cluster signature, the
+/// legacy bare-Fibonacci form still carries a 9-byte channel-offset
+/// preamble plus the per-channel adaptive-CDF prefix and range-coder
+/// body, which on tiny / high-entropy inputs exceeds the
+/// `1 + W*H*3`-byte raw payload.
+///
+/// `spec/01` §2.1 defines type 1 as `{ byte 0 = 0x01, bytes 1..N =
+/// uncompressed pixel data }`. Every conformant decoder dispatches
+/// byte 0 → the memcpy helper (`spec/01` table at §1), so a type-1
+/// substitute decodes byte-exactly against any decoder that accepts
+/// type 7. Returns the shorter of the two forms, tie-breaking in
+/// favour of the legacy form so already-compressing inputs stay
+/// byte-identical to the existing `encode_legacy_rgb` output. The
+/// Strategy E diversion already inside `encode_legacy_rgb` is
+/// preserved by construction: when it fires `encode_legacy_rgb`
+/// returns a type-1 frame (byte 0 = `0x01`), and the size guard
+/// (`raw.len() == legacy.len()`) tie-breaks back to that already-
+/// type-1 wire, byte-identical.
+pub fn encode_legacy_rgb_or_uncompressed(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let legacy = encode_legacy_rgb(pixels, width, height);
+    let raw = encode_uncompressed(pixels);
+    if raw.len() < legacy.len() {
+        raw
+    } else {
+        legacy
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

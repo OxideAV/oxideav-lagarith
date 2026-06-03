@@ -4210,3 +4210,241 @@ mod frame_uncompressed_size_guard {
         );
     }
 }
+
+/// Round 229 — frame-level type-1 (uncompressed) size guard, type-7
+/// (legacy adaptive-CDF RGB) extension.
+///
+/// `encode_legacy_rgb_or_uncompressed` wraps the type-7 legacy
+/// encoder with the same **never-larger** size comparison against
+/// `encode_uncompressed(pixels)` that round 222 introduced for the
+/// modern arithmetic frame encoders (`spec/01` §2.1). Type 7's
+/// existing Strategy E diversion (`audit/12` §7.1) handles the
+/// rare-symbol-cluster wire-correctness gap; the round-229 size
+/// guard is the orthogonal axis: it picks the type-1 substitute
+/// whenever the legacy bare-Fibonacci form's preamble + per-channel
+/// adaptive-CDF prefix + range-coder body exceeds the raw payload.
+///
+/// The pins below mirror the round-222 module structure:
+///
+/// 1. **Never-larger size invariant** — for every probed `(W, H)`
+///    the wrapper output is `<=` the unwrapped `encode_legacy_rgb`
+///    output across deterministic-LCG random fixtures and a smooth
+///    gradient.
+/// 2. **Decode-correct round-trip** — the wrapper's output decodes
+///    back to the original BGR24 pixels regardless of which branch
+///    (legacy or uncompressed) the size selector chooses.
+/// 3. **Selector-fires-on-tiny-random** — at small frame sizes the
+///    wrapper picks the type-1 branch (byte 0 == `0x01`) and saves
+///    at least one byte versus the legacy encoding.
+/// 4. **Tie-break favours legacy** — when both forms have equal
+///    length (or legacy is shorter), the wrapper returns the legacy
+///    form unchanged.
+/// 5. **Strategy E composability** — when Strategy E inside
+///    `encode_legacy_rgb` already returned a type-1 frame, the size
+///    guard tie-breaks back to that frame byte-identically (the
+///    wrapper does not double-emit or mutate the Strategy E output).
+#[cfg(test)]
+mod legacy_frame_uncompressed_size_guard {
+    use crate::decoder::{decode_frame, PixelKind};
+    use crate::encoder::{
+        encode_legacy_rgb, encode_legacy_rgb_or_uncompressed, encode_uncompressed,
+    };
+
+    /// Deterministic LCG used to synthesise high-entropy fixtures.
+    fn lcg_bytes(seed: u64, n: usize) -> Vec<u8> {
+        let mut s = seed;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            out.push((s >> 33) as u8);
+        }
+        out
+    }
+
+    /// Smooth gradient — the legacy encoder's residuals compress
+    /// strongly here, so the wrapper exercises its "legacy stays"
+    /// branch.
+    fn pattern_gradient(n: usize) -> Vec<u8> {
+        (0..n).map(|i| ((i * 73 + 11) & 0xff) as u8).collect()
+    }
+
+    // ─── 1. Never-larger size invariant ───────────────────────────
+
+    #[test]
+    fn legacy_rgb_or_uncompressed_never_larger_than_legacy() {
+        for &(w, h) in &[(4u32, 4u32), (8, 8), (8, 16), (16, 16), (32, 32)] {
+            let n = (w * h) as usize * 3;
+            for seed in [0xc0de_d00du64, 0x1234_5678, 0xdead_beef] {
+                let pixels = lcg_bytes(seed, n);
+                let legacy = encode_legacy_rgb(&pixels, w, h);
+                let guarded = encode_legacy_rgb_or_uncompressed(&pixels, w, h);
+                assert!(
+                    guarded.len() <= legacy.len(),
+                    "legacy guarded ({}) larger than legacy ({}) at {w}×{h} seed {seed:#x}",
+                    guarded.len(),
+                    legacy.len(),
+                );
+            }
+            let smooth = pattern_gradient(n);
+            let legacy = encode_legacy_rgb(&smooth, w, h);
+            let guarded = encode_legacy_rgb_or_uncompressed(&smooth, w, h);
+            assert!(
+                guarded.len() <= legacy.len(),
+                "legacy guarded ({}) larger than legacy ({}) on gradient at {w}×{h}",
+                guarded.len(),
+                legacy.len(),
+            );
+        }
+    }
+
+    // ─── 2. Decode-correct round-trip ─────────────────────────────
+
+    #[test]
+    fn legacy_rgb_or_uncompressed_roundtrips_byte_exact() {
+        for &(w, h) in &[(4u32, 4u32), (8, 8), (8, 16), (16, 16), (32, 32)] {
+            let n = (w * h) as usize * 3;
+            for seed in [0xc0de_d00du64, 0x1234_5678, 0xdead_beef] {
+                let pixels = lcg_bytes(seed, n);
+                let frame = encode_legacy_rgb_or_uncompressed(&pixels, w, h);
+                let decoded = decode_frame(&frame, w, h, PixelKind::Bgr24).unwrap();
+                assert_eq!(
+                    decoded.pixels, pixels,
+                    "legacy guarded roundtrip mismatch at {w}×{h} seed {seed:#x} (byte0={:#x})",
+                    frame[0]
+                );
+            }
+            let smooth = pattern_gradient(n);
+            let frame = encode_legacy_rgb_or_uncompressed(&smooth, w, h);
+            let decoded = decode_frame(&frame, w, h, PixelKind::Bgr24).unwrap();
+            assert_eq!(decoded.pixels, smooth);
+        }
+    }
+
+    // ─── 3. Selector-fires-on-tiny-random ─────────────────────────
+
+    /// On a tiny `4×4` BGR24 random-byte input the legacy bare-
+    /// Fibonacci form's per-channel adaptive-CDF prefix + range-
+    /// coder body × 3 channels + the 9-byte channel-offset preamble
+    /// substantially exceeds the 48-byte raw payload (1 + 4*4*3 = 49
+    /// bytes of type-1 wire). The size guard must pick the type-1
+    /// branch (byte 0 = `0x01`).
+    #[test]
+    fn legacy_selector_picks_uncompressed_on_tiny_random_input() {
+        const W: u32 = 4;
+        const H: u32 = 4;
+        let pixels = lcg_bytes(0xc0de_d00d, (W * H) as usize * 3);
+        let legacy = encode_legacy_rgb(&pixels, W, H);
+        let guarded = encode_legacy_rgb_or_uncompressed(&pixels, W, H);
+        assert_eq!(
+            guarded[0], 0x01,
+            "expected type-1 wire (byte 0 = 0x01), got byte 0 = {:#x} (legacy len {}, guarded len {})",
+            guarded[0], legacy.len(), guarded.len(),
+        );
+        assert!(
+            guarded.len() < legacy.len(),
+            "selector picked type 1 but no size win: legacy={} guarded={}",
+            legacy.len(),
+            guarded.len(),
+        );
+        // Byte-identity check against `encode_uncompressed` direct.
+        let raw = encode_uncompressed(&pixels);
+        assert_eq!(
+            guarded, raw,
+            "guarded wire must equal encode_uncompressed when type-1 wins",
+        );
+    }
+
+    // ─── 4. Tie-break + legacy-stays branches ─────────────────────
+
+    /// On a smooth gradient input the residuals are highly
+    /// compressible — the legacy form is strictly shorter than the
+    /// raw payload. The guard must keep the legacy wire byte-
+    /// identical (no inadvertent type-1 substitution on well-
+    /// compressing inputs).
+    #[test]
+    fn legacy_selector_keeps_legacy_when_smaller() {
+        const W: u32 = 32;
+        const H: u32 = 32;
+        let pixels = pattern_gradient((W * H) as usize * 3);
+        let legacy = encode_legacy_rgb(&pixels, W, H);
+        let raw = encode_uncompressed(&pixels);
+        // Sanity check the fixture profile: legacy must actually
+        // win here (otherwise the pin is testing nothing).
+        assert!(
+            legacy.len() < raw.len(),
+            "fixture invariant broken: legacy ({}) >= raw ({}) on 32×32 gradient",
+            legacy.len(),
+            raw.len(),
+        );
+        let guarded = encode_legacy_rgb_or_uncompressed(&pixels, W, H);
+        assert_eq!(
+            guarded, legacy,
+            "selector must keep the legacy wire byte-identical when it is the shorter form",
+        );
+    }
+
+    // ─── 5. Strategy E composability ──────────────────────────────
+
+    /// When `encode_legacy_rgb` already routes through Strategy E
+    /// (`audit/12 §7.1`) and emits a type-1 frame, the round-229
+    /// size guard must keep that type-1 frame byte-identical: the
+    /// guard's `raw == legacy` tie-breaks to `legacy`, which itself
+    /// is a `encode_uncompressed(pixels)` wire from Strategy E.
+    ///
+    /// The rare-symbol-cluster signature (`is_rare_symbol_cluster`)
+    /// requires `freq[0] >= 0.95 * Σfreq` plus ≥ 3 distinct nonzero
+    /// bins each with `freq ∈ {1, 2}`. The fixture builds residual
+    /// histograms that satisfy this directly in the raw pixel
+    /// domain — for plane B (BGR24 channel 0) the gradient runs
+    /// 95% zeros with a sparse Laplacian tail; the legacy encoder's
+    /// forward predictor leaves the dominant zero mass intact so
+    /// the residual histogram inherits the signature.
+    #[test]
+    fn legacy_guard_preserves_strategy_e_uncompressed_byte_identically() {
+        // 16×16 fixture: 768 BGR24 bytes total. Strategy E wants
+        // freq[0] >= 0.95 * 256 per plane = at least 244 zeros per
+        // plane, with ≥ 3 distinct nonzero bins each freq ∈ {1, 2}.
+        const W: u32 = 16;
+        const H: u32 = 16;
+        let n = (W * H) as usize; // 256 per plane
+        let mut pixels = vec![0u8; n * 3];
+        // Sprinkle three distinct singleton values into each plane
+        // at non-adjacent positions to avoid forming runs the
+        // predictor would collapse to zero. Distinct symbols across
+        // planes so cross-plane decorrelation cannot collapse them
+        // either.
+        for (plane_idx, (a, b, c)) in [(11u8, 23, 47), (13, 29, 53), (17, 31, 59)]
+            .iter()
+            .enumerate()
+        {
+            // Channel order in packed BGR24 is plane 0 = B, 1 = G,
+            // 2 = R. Place singletons at well-separated pixel
+            // positions so the JPEG-LS predictor doesn't smear them
+            // into the zero majority.
+            pixels[3 * 32 + plane_idx] = *a;
+            pixels[3 * 100 + plane_idx] = *b;
+            pixels[3 * 200 + plane_idx] = *c;
+        }
+        let legacy = encode_legacy_rgb(&pixels, W, H);
+        // Strategy E precondition: when it fires, byte 0 == 0x01.
+        // If this assertion fails the fixture no longer probes the
+        // composability path — re-tune so the residual histogram
+        // hits the rare-symbol-cluster signature.
+        assert_eq!(
+            legacy[0], 0x01,
+            "fixture invariant broken: legacy first byte is {:#x}, not 0x01 — Strategy E did not fire",
+            legacy[0],
+        );
+        let guarded = encode_legacy_rgb_or_uncompressed(&pixels, W, H);
+        assert_eq!(
+            guarded, legacy,
+            "size guard must keep the Strategy E type-1 frame byte-identical",
+        );
+        // And the frame still decodes back to the original pixels
+        // (the type-1 path is byte-exact by construction).
+        let decoded = decode_frame(&guarded, W, H, PixelKind::Bgr24).unwrap();
+        assert_eq!(decoded.pixels, pixels);
+    }
+}

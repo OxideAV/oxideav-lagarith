@@ -26,6 +26,35 @@ Pixel-kind validation also moves to function entry on the modern and
 legacy RGB families, so `Yv12` / `Yuy2` host buffers for RGB-coded
 frames now surface `PixelFormatMismatch` before any per-channel
 decode work (3 new tests pin both halves of the contract).
+Round 229 — **type-7 (legacy adaptive-CDF RGB) frame-level type-1
+size guard**: a fifth `*_or_uncompressed` entry point
+(`encode_legacy_rgb_or_uncompressed`) extends the round-222 modern-
+arithmetic guard to the legacy fork. Round 222 already routes the
+modern arithmetic families through a never-larger comparison against
+`encode_uncompressed(pixels)`; round 229 adds the orthogonal axis
+for type 7: even when the type-7 residual histograms clear the
+`audit/12` §7.1 Strategy E (rare-symbol-cluster) wire-correctness
+diversion, the bare-Fibonacci form's 9-byte channel-offset preamble
++ per-channel adaptive-CDF prefix + range-coder body can exceed the
+`1 + W*H*3`-byte raw payload on tiny / high-entropy inputs. The
+selector returns the shorter wire, tie-breaking in favour of the
+legacy form so already-compressing inputs stay byte-identical to
+`encode_legacy_rgb`. The fallback is decoder-orthogonal (`spec/01`
+§2.1 + the dispatch table at §1: byte 0 = `0x01` routes the memcpy
+helper). When `encode_legacy_rgb` itself already returned type 1
+via Strategy E, the tie-break preserves that frame byte-identically
+(the size guard composes cleanly with the wire-correctness diversion
+rather than masking it). 5 new tests in module
+`legacy_frame_uncompressed_size_guard` cover the never-larger
+invariant across `4×4`..`32×32` × three LCG seeds per size + a
+smooth-gradient fixture, decode-correct round-trip through the
+wrapper, a positive selector-fires pin (`4×4` random inputs route
+to byte 0 = `0x01`, byte-identical to `encode_uncompressed`), a
+tie-break-favours-legacy pin (`32×32` smooth gradient), and a
+Strategy E composability pin (a `16×16` rare-symbol-cluster fixture
+shows the guard preserves the pre-existing type-1 frame byte-
+identically).
+
 Round 222 — **frame-level type-1 (uncompressed) size guard**: four
 new encoder entry points
 (`encode_arith_rgb24_or_uncompressed`, `encode_arith_yv12_or_uncompressed`,
@@ -429,7 +458,7 @@ type-7 stream still awaits a fixture oracle
 
 ## Tests
 
-241 unit + integration tests cover the range coder, Fibonacci
+246 unit + integration tests cover the range coder, Fibonacci
 prefix, RLE escape, predictor + decorrelation, channel-header
 dispatcher, the channel-header `0x01..=0x03` arithmetic-with-RLE
 path and the `0x05..=0x07` raw-RLE path, an end-to-end encode →
@@ -553,7 +582,9 @@ fixed-point round-trips, pinned by `reduced_res_roundtrip_*`).
 brings the total to 228 with the new packed-RGB(A) pack-loop
 byte-layout pins. Round 222 adds the frame-level type-1 (uncompressed)
 size guard module (`frame_uncompressed_size_guard`) with 13 new pins,
-bringing the total to **241**.
+bringing the total to 241. Round 229 extends the size guard to type 7
+(`legacy_frame_uncompressed_size_guard`) with 5 new pins, bringing the
+total to **246**.
 
 ### SIMD-vs-scalar predictor (`spec/06` §3.2)
 
