@@ -3644,3 +3644,263 @@ mod encoder_random_roundtrip_property {
         }
     }
 }
+
+/// Round-216 packed-RGB pack-loop pins.
+///
+/// Round 216 hoisted the per-pixel `match pixel_kind` branch out of
+/// the BGR(A) pack loop in `decode_arith_rgb` / `decode_arith_rgba` /
+/// `decode_legacy_rgb` / `decode_solid`. The branch dispatch is once-
+/// per-call rather than once-per-pixel; output byte sequence is
+/// unchanged. These tests pin the byte-level layout invariants the
+/// refactor must preserve so a future hoist that accidentally
+/// reorders B / G / R / A bytes — or that drops the trailing 0xff
+/// alpha on `Bgra32` for an RGB-coded frame — surfaces here rather
+/// than only via the heavier roundtrip suites above.
+#[cfg(test)]
+mod pack_loop_byte_layout_pins {
+    use super::*;
+    use crate::encoder::{
+        encode_arith_rgb24, encode_arith_rgba, encode_arith_yuy2, encode_arith_yv12,
+        encode_legacy_rgb, encode_solid_grey, encode_solid_rgb, encode_solid_rgba,
+    };
+
+    /// Deterministic LCG byte stream; same constants as the other
+    /// fuzz / property modules. Kept inline so the module is
+    /// independent of test-only helpers in siblings.
+    fn lcg_bytes(seed: u64, n: usize) -> Vec<u8> {
+        let mut s = seed;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            out.push((s >> 33) as u8);
+        }
+        out
+    }
+
+    /// `decode_arith_rgb` (types 2 / 4) for a `Bgra32` host buffer must
+    /// emit `B, G, R, 0xff` per pixel. The RGB family carries no alpha
+    /// on the wire (`spec/03` §4 — three planes only), so the alpha
+    /// slot is the opaque-fill constant the round-216 hoist must keep.
+    #[test]
+    fn arith_rgb_bgra32_pack_alpha_is_opaque_constant() {
+        const W: u32 = 8;
+        const H: u32 = 8;
+        let pixels = lcg_bytes(0xa1b2_c3d4, PixelKind::Bgr24.buffer_len(W, H));
+        let frame = encode_arith_rgb24(&pixels, W, H);
+        let decoded = decode_frame(&frame, W, H, PixelKind::Bgra32)
+            .expect("RGB24-coded frame decodes to Bgra32");
+        assert_eq!(decoded.pixels.len(), (W * H * 4) as usize);
+        for px in decoded.pixels.chunks_exact(4) {
+            assert_eq!(
+                px[3], 0xff,
+                "RGB-coded Bgra32 must fill alpha with 0xff (round-216 hoist invariant)",
+            );
+        }
+        // Cross-check the BGR triplets against the Bgr24 decode of the
+        // same frame — both code paths must produce the same B/G/R
+        // bytes once the pack loop is hoisted.
+        let decoded_bgr =
+            decode_frame(&frame, W, H, PixelKind::Bgr24).expect("RGB24 also decodes to Bgr24");
+        for (i, (rgb, rgba)) in decoded_bgr
+            .pixels
+            .chunks_exact(3)
+            .zip(decoded.pixels.chunks_exact(4))
+            .enumerate()
+        {
+            assert_eq!(
+                (rgb[0], rgb[1], rgb[2]),
+                (rgba[0], rgba[1], rgba[2]),
+                "RGB-coded BGR triplet diverges between Bgr24 and Bgra32 at pixel {i}",
+            );
+        }
+    }
+
+    /// `decode_arith_rgba` (type 8) for a `Bgra32` host buffer must
+    /// emit the per-pixel alpha byte the wire actually carries, NOT
+    /// the opaque-fill constant. The round-216 hoist pulls the alpha
+    /// plane out of the per-iteration `match`; a regression that
+    /// re-introduced `0xff` here would still pass any test that
+    /// happened to use an all-0xff input.
+    #[test]
+    fn arith_rgba_bgra32_pack_carries_real_alpha() {
+        const W: u32 = 8;
+        const H: u32 = 8;
+        // Build an RGBA buffer where the alpha plane is a known
+        // non-constant gradient. The encoder maps interleaved
+        // `B, G, R, A` -> four wire planes (`spec/01` §2.3).
+        let mut pixels = vec![0u8; (W * H * 4) as usize];
+        for (i, px) in pixels.chunks_exact_mut(4).enumerate() {
+            px[0] = (i & 0xff) as u8;
+            px[1] = ((i >> 1) & 0xff) as u8;
+            px[2] = ((i >> 2) & 0xff) as u8;
+            // Alpha gradient: 1 + (i * 7) mod 254 -> never 0x00 or
+            // 0xff so a "drop alpha back to opaque" regression fails.
+            px[3] = 1u8.wrapping_add((i as u8).wrapping_mul(7) % 254);
+        }
+        let frame = encode_arith_rgba(&pixels, W, H);
+        let decoded = decode_frame(&frame, W, H, PixelKind::Bgra32)
+            .expect("RGBA-coded frame decodes to Bgra32");
+        assert_eq!(decoded.pixels, pixels, "RGBA Bgra32 pack must round-trip");
+        // Cross-check the dropped-alpha view too: round-211's lazy
+        // alpha decode + round-216 hoist must keep Bgr24 byte-equal
+        // to the BGR triplets of the Bgra32 result.
+        let decoded_bgr =
+            decode_frame(&frame, W, H, PixelKind::Bgr24).expect("RGBA also decodes to Bgr24");
+        assert_eq!(decoded_bgr.pixels.len(), (W * H * 3) as usize);
+        for (i, (bgr, bgra)) in decoded_bgr
+            .pixels
+            .chunks_exact(3)
+            .zip(decoded.pixels.chunks_exact(4))
+            .enumerate()
+        {
+            assert_eq!(
+                (bgr[0], bgr[1], bgr[2]),
+                (bgra[0], bgra[1], bgra[2]),
+                "RGBA-coded BGR triplet diverges between Bgr24 and Bgra32 at pixel {i}",
+            );
+        }
+    }
+
+    /// `decode_legacy_rgb` (type 7) shares the BGR(A) pack shape with
+    /// the modern arithmetic family; the round-216 hoist applies to
+    /// both. Same Bgra32 opaque-alpha pin as the modern path.
+    #[test]
+    fn legacy_rgb_bgra32_pack_alpha_is_opaque_constant() {
+        const W: u32 = 8;
+        const H: u32 = 8;
+        let pixels = lcg_bytes(0xdead_beef_0123_4567, PixelKind::Bgr24.buffer_len(W, H));
+        let frame = encode_legacy_rgb(&pixels, W, H);
+        let decoded = decode_frame(&frame, W, H, PixelKind::Bgra32)
+            .expect("legacy-RGB frame decodes to Bgra32");
+        assert_eq!(decoded.pixels.len(), (W * H * 4) as usize);
+        for px in decoded.pixels.chunks_exact(4) {
+            assert_eq!(
+                px[3], 0xff,
+                "legacy-RGB Bgra32 must fill alpha with 0xff (round-216 hoist invariant)",
+            );
+        }
+        // Cross-check Bgr24 / Bgra32 BGR triplets — same as modern.
+        let decoded_bgr =
+            decode_frame(&frame, W, H, PixelKind::Bgr24).expect("legacy-RGB also decodes to Bgr24");
+        for (i, (bgr, bgra)) in decoded_bgr
+            .pixels
+            .chunks_exact(3)
+            .zip(decoded.pixels.chunks_exact(4))
+            .enumerate()
+        {
+            assert_eq!(
+                (bgr[0], bgr[1], bgr[2]),
+                (bgra[0], bgra[1], bgra[2]),
+                "legacy-RGB BGR triplet diverges between Bgr24 and Bgra32 at pixel {i}",
+            );
+        }
+    }
+
+    /// `decode_solid` (types 5 / 6 / 9) packs a single colour into
+    /// every pixel. The round-216 hoist replaced the per-iteration
+    /// `match` with a `Vec::resize` + chunked-write; pin that every
+    /// pixel still carries the spec/01 §2.2.1 BGR(A) tuple.
+    ///
+    /// - Type 5 (grey) — `Y, Y, Y` triplet across both host kinds.
+    /// - Type 6 (RGB) — `B, G, R` triplet across both host kinds.
+    /// - Type 9 (RGBA) — `B, G, R, A` quadruple on Bgra32; Bgra32 is
+    ///   the only host kind valid here (Bgr24 drops alpha but the
+    ///   encoder still emits the wire alpha, which the decoder
+    ///   discards).
+    #[test]
+    fn solid_frames_pack_loop_byte_layout() {
+        const W: u32 = 8;
+        const H: u32 = 8;
+        const N: usize = (W * H) as usize;
+
+        // Type 5 — grey.
+        let frame5 = encode_solid_grey(0x42);
+        let dec5_24 = decode_frame(&frame5, W, H, PixelKind::Bgr24).expect("solid-grey Bgr24");
+        assert_eq!(dec5_24.pixels.len(), N * 3);
+        for px in dec5_24.pixels.chunks_exact(3) {
+            assert_eq!(px, &[0x42, 0x42, 0x42][..]);
+        }
+        let dec5_32 = decode_frame(&frame5, W, H, PixelKind::Bgra32).expect("solid-grey Bgra32");
+        assert_eq!(dec5_32.pixels.len(), N * 4);
+        for px in dec5_32.pixels.chunks_exact(4) {
+            assert_eq!(px, &[0x42, 0x42, 0x42, 0xff][..]);
+        }
+
+        // Type 6 — RGB. Encoder takes B/G/R inputs in wire order
+        // (see encode_solid_rgb's docs).
+        let (b, g, r) = (0x11u8, 0x22, 0x33);
+        let frame6 = encode_solid_rgb(b, g, r);
+        let dec6_24 = decode_frame(&frame6, W, H, PixelKind::Bgr24).expect("solid-rgb Bgr24");
+        for px in dec6_24.pixels.chunks_exact(3) {
+            assert_eq!(px, &[b, g, r][..]);
+        }
+        let dec6_32 = decode_frame(&frame6, W, H, PixelKind::Bgra32).expect("solid-rgb Bgra32");
+        for px in dec6_32.pixels.chunks_exact(4) {
+            assert_eq!(px, &[b, g, r, 0xff][..]);
+        }
+
+        // Type 9 — RGBA. Alpha is wire-driven, not 0xff.
+        let (b, g, r, a) = (0x44u8, 0x55, 0x66, 0x77);
+        let frame9 = encode_solid_rgba(b, g, r, a);
+        let dec9_32 = decode_frame(&frame9, W, H, PixelKind::Bgra32).expect("solid-rgba Bgra32");
+        for px in dec9_32.pixels.chunks_exact(4) {
+            assert_eq!(
+                px,
+                &[b, g, r, a][..],
+                "solid-RGBA Bgra32 must carry wire alpha (not opaque fill)",
+            );
+        }
+    }
+
+    /// Pin the buffer-length contract — the hoisted-branch + chunked-
+    /// write form in `decode_solid` must size the output identically
+    /// to `PixelKind::buffer_len`. A regression that miscalculated the
+    /// `vec![0u8; n * bpp]` capacity would surface here.
+    #[test]
+    fn solid_frames_pack_loop_buffer_length() {
+        for (w, h) in [(1, 1), (3, 4), (8, 8), (17, 5)] {
+            let frame5 = encode_solid_grey(0x00);
+            let dec5_24 = decode_frame(&frame5, w, h, PixelKind::Bgr24).unwrap();
+            assert_eq!(dec5_24.pixels.len(), PixelKind::Bgr24.buffer_len(w, h));
+            let dec5_32 = decode_frame(&frame5, w, h, PixelKind::Bgra32).unwrap();
+            assert_eq!(dec5_32.pixels.len(), PixelKind::Bgra32.buffer_len(w, h));
+        }
+    }
+
+    /// Non-RGB frames (types 3 / 10) still go through the YV12 / YUY2
+    /// packers, which the round-216 hoist did NOT touch. Pin that
+    /// neither path was accidentally redirected through the packed-RGB
+    /// pack helper — they should error out with `PixelFormatMismatch`
+    /// when asked for a packed buffer.
+    #[test]
+    fn planar_frames_reject_packed_pixel_kinds_unchanged() {
+        const W: u32 = 8;
+        const H: u32 = 8;
+
+        let yv12_in = lcg_bytes(0x0001_0203, PixelKind::Yv12.buffer_len(W, H));
+        let yv12_frame = encode_arith_yv12(&yv12_in, W, H);
+        for kind in [PixelKind::Bgr24, PixelKind::Bgra32] {
+            assert!(
+                matches!(
+                    decode_frame(&yv12_frame, W, H, kind),
+                    Err(crate::Error::PixelFormatMismatch { .. })
+                ),
+                "YV12 must reject packed pixel kind {kind:?}",
+            );
+        }
+
+        let yuy2_in = lcg_bytes(0x0405_0607, PixelKind::Yuy2.buffer_len(W, H));
+        let yuy2_frame = encode_arith_yuy2(&yuy2_in, W, H);
+        for kind in [PixelKind::Bgr24, PixelKind::Bgra32] {
+            assert!(
+                matches!(
+                    decode_frame(&yuy2_frame, W, H, kind),
+                    Err(crate::Error::PixelFormatMismatch { .. })
+                ),
+                "YUY2 must reject packed pixel kind {kind:?}",
+            );
+        }
+    }
+}

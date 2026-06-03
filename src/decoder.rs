@@ -283,25 +283,38 @@ fn decode_solid(
         SolidShape::Rgba => (payload[1], payload[2], payload[3], payload[4]),
     };
     let n = width as usize * height as usize;
-    let mut pixels = Vec::with_capacity(n * bpp);
-    for _ in 0..n {
-        match pixel_kind {
-            PixelKind::Bgr24 => {
-                pixels.push(b);
-                pixels.push(g);
-                pixels.push(r);
-            }
-            PixelKind::Bgra32 => {
-                pixels.push(b);
-                pixels.push(g);
-                pixels.push(r);
-                pixels.push(a);
-            }
-            PixelKind::Yv12 | PixelKind::Yuy2 => {
-                unreachable!("guarded by packed_bpp() above")
+    // Pack into output (round 216 — single hoisted-branch pack loop +
+    // bulk-fill). The solid-frame payload writes the same 3 or 4 byte
+    // tuple to every pixel; `Vec::resize` / chunked-write turns the
+    // per-pixel push loop into a bulk memset-then-stripe over the
+    // pre-sized buffer. Output byte sequence is unchanged.
+    let mut pixels: Vec<u8>;
+    match pixel_kind {
+        PixelKind::Bgr24 => {
+            pixels = vec![0u8; n * 3];
+            for px in pixels.chunks_exact_mut(3) {
+                px[0] = b;
+                px[1] = g;
+                px[2] = r;
             }
         }
+        PixelKind::Bgra32 => {
+            pixels = vec![0u8; n * 4];
+            for px in pixels.chunks_exact_mut(4) {
+                px[0] = b;
+                px[1] = g;
+                px[2] = r;
+                px[3] = a;
+            }
+        }
+        PixelKind::Yv12 | PixelKind::Yuy2 => {
+            unreachable!("guarded by packed_bpp() above")
+        }
     }
+    // `bpp` is the per-pixel byte width pinned by `packed_bpp()` for
+    // sanity-check parity with the previous form; the chunked writes
+    // above sized the buffer identically.
+    debug_assert_eq!(pixels.len(), n * bpp);
     Ok(DecodedFrame {
         width,
         height,
@@ -372,23 +385,35 @@ fn decode_arith_rgb(
     // is unchanged.
     cross_plane_decorrelate_rgb(&mut plane_b, &plane_g, &mut plane_r);
 
+    // Pack into output (round 216 — single hoisted-branch pack loop).
+    // `pixel_kind` is loop-invariant after the early `packed_bpp()`
+    // validation, so dispatch once on it and run a tight per-pixel
+    // loop in each branch. The previous form had a per-pixel `match
+    // pixel_kind` in the hot loop; rustc inlined the branch but the
+    // generated code still re-tested the discriminant on every
+    // iteration (the compiler conservatively assumed the loop body
+    // could change the value). Output byte sequence is unchanged —
+    // each branch emits the same bytes in the same order as the
+    // round-211 form.
     let mut pixels = Vec::with_capacity(n_pixels * bpp);
-    for i in 0..n_pixels {
-        match pixel_kind {
-            PixelKind::Bgr24 => {
+    match pixel_kind {
+        PixelKind::Bgr24 => {
+            for i in 0..n_pixels {
                 pixels.push(plane_b[i]);
                 pixels.push(plane_g[i]);
                 pixels.push(plane_r[i]);
             }
-            PixelKind::Bgra32 => {
+        }
+        PixelKind::Bgra32 => {
+            for i in 0..n_pixels {
                 pixels.push(plane_b[i]);
                 pixels.push(plane_g[i]);
                 pixels.push(plane_r[i]);
                 pixels.push(0xff);
             }
-            PixelKind::Yv12 | PixelKind::Yuy2 => {
-                unreachable!("guarded by early packed_bpp() above")
-            }
+        }
+        PixelKind::Yv12 | PixelKind::Yuy2 => {
+            unreachable!("guarded by early packed_bpp() above")
         }
     }
     Ok(DecodedFrame {
@@ -467,30 +492,35 @@ fn decode_arith_rgba(
     // Alpha plane has no cross-plane decorrelation per `spec/03`
     // §4.3.
 
+    // Pack into output (round 216 — single hoisted-branch pack loop).
+    // Same shape as `decode_arith_rgb`; the Bgra32 arm here additionally
+    // pulls a real alpha byte from `plane_a_opt` (round 211's lazy
+    // alpha decode guarantees `Some(_)` on Bgra32 and `None` on Bgr24).
     let mut pixels = Vec::with_capacity(n_pixels * bpp);
-    for i in 0..n_pixels {
-        match pixel_kind {
-            PixelKind::Bgr24 => {
+    match pixel_kind {
+        PixelKind::Bgr24 => {
+            for i in 0..n_pixels {
                 pixels.push(plane_b[i]);
                 pixels.push(plane_g[i]);
                 pixels.push(plane_r[i]);
             }
-            PixelKind::Bgra32 => {
+        }
+        PixelKind::Bgra32 => {
+            // Bgra32 dispatch decoded the alpha plane above (round 211
+            // lazy alpha-decode guard); the `expect` here is
+            // structurally enforced by the same `matches!` guard.
+            let plane_a = plane_a_opt
+                .as_ref()
+                .expect("Bgra32 path always decodes alpha");
+            for i in 0..n_pixels {
                 pixels.push(plane_b[i]);
                 pixels.push(plane_g[i]);
                 pixels.push(plane_r[i]);
-                // Bgra32 dispatch initialised `plane_a_opt` above; the
-                // `expect` here is structurally guaranteed by the
-                // `matches!` guard at decode time.
-                pixels.push(
-                    plane_a_opt
-                        .as_ref()
-                        .expect("Bgra32 path always decodes alpha")[i],
-                );
+                pixels.push(plane_a[i]);
             }
-            PixelKind::Yv12 | PixelKind::Yuy2 => {
-                unreachable!("guarded by packed_bpp() above")
-            }
+        }
+        PixelKind::Yv12 | PixelKind::Yuy2 => {
+            unreachable!("guarded by packed_bpp() above")
         }
     }
     Ok(DecodedFrame {
@@ -821,23 +851,29 @@ fn decode_legacy_rgb(
 
     cross_plane_decorrelate_rgb(&mut plane_b, &plane_g, &mut plane_r);
 
+    // Pack into output (round 216 — single hoisted-branch pack loop).
+    // Type-7 legacy uses the same BGR(A) pack shape as the modern
+    // arithmetic-RGB family above. `pixel_kind` is loop-invariant
+    // after the early `packed_bpp()` validation, so dispatch once.
     let mut pixels = Vec::with_capacity(n_pixels * bpp);
-    for i in 0..n_pixels {
-        match pixel_kind {
-            PixelKind::Bgr24 => {
+    match pixel_kind {
+        PixelKind::Bgr24 => {
+            for i in 0..n_pixels {
                 pixels.push(plane_b[i]);
                 pixels.push(plane_g[i]);
                 pixels.push(plane_r[i]);
             }
-            PixelKind::Bgra32 => {
+        }
+        PixelKind::Bgra32 => {
+            for i in 0..n_pixels {
                 pixels.push(plane_b[i]);
                 pixels.push(plane_g[i]);
                 pixels.push(plane_r[i]);
                 pixels.push(0xff);
             }
-            PixelKind::Yv12 | PixelKind::Yuy2 => {
-                unreachable!("guarded by early packed_bpp() above")
-            }
+        }
+        PixelKind::Yv12 | PixelKind::Yuy2 => {
+            unreachable!("guarded by early packed_bpp() above")
         }
     }
     Ok(DecodedFrame {

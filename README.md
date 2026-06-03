@@ -25,7 +25,26 @@ alpha) + `spec/04` §5 item 5 (channels compressed independently).
 Pixel-kind validation also moves to function entry on the modern and
 legacy RGB families, so `Yv12` / `Yuy2` host buffers for RGB-coded
 frames now surface `PixelFormatMismatch` before any per-channel
-decode work (3 new tests pin both halves of the contract).**
+decode work (3 new tests pin both halves of the contract).
+Round 216 — **packed-RGB(A) pack-loop branch hoist**: the per-pixel
+`match pixel_kind` arm inside the BGR(A) pack loops of
+`decode_arith_rgb` (types 2 / 4), `decode_arith_rgba` (type 8),
+`decode_legacy_rgb` (type 7), and `decode_solid` (types 5 / 6 / 9)
+is hoisted outside the loop so dispatch fires once per call instead
+of once per pixel. `decode_solid` additionally swaps the per-pixel
+`Vec::push` push-loop for a `vec![0u8; n * bpp]` + chunked-write
+form (one allocation + one bounds-check pair per pixel rather than
+one per byte). Output byte sequence unchanged; round 211's lazy
+alpha-decode invariant is preserved structurally (the `plane_a_opt
+.expect("Bgra32 path always decodes alpha")` moves out of the loop
+body so the matches!-guard relationship is still single-source).
+Six new tests in module `pack_loop_byte_layout_pins` pin the
+invariants the refactor must keep: Bgra32 alpha is 0xff on RGB-only
+frames (types 2 / 4 / 6 / 7), wire-driven on RGBA frames (types 8
+/ 9), Bgr24/Bgra32 BGR triplets match across pixel kinds for the
+same source frame, solid-frame buffer length matches
+`PixelKind::buffer_len`, and planar (YV12 / YUY2) frames still
+reject packed pixel kinds.**
 This `master` branch is the clean-room rebuild against the
 strict-isolation cleanroom workspace at
 [`docs/video/lagarith/`](https://github.com/OxideAV/docs/tree/master/video/lagarith).
@@ -382,7 +401,7 @@ type-7 stream still awaits a fixture oracle
 
 ## Tests
 
-219 unit + integration tests cover the range coder, Fibonacci
+228 unit + integration tests cover the range coder, Fibonacci
 prefix, RLE escape, predictor + decorrelation, channel-header
 dispatcher, the channel-header `0x01..=0x03` arithmetic-with-RLE
 path and the `0x05..=0x07` raw-RLE path, an end-to-end encode →
@@ -502,7 +521,9 @@ asymmetries that fire only on rare residual distributions —
 in particular). Reduced-resolution type 11 is excluded by
 construction (its 2× downsample → upsample is lossy; only the
 fixed-point round-trips, pinned by `reduced_res_roundtrip_*`).
-219 unit + integration tests pass after the addition.
+219 unit + integration tests pass after the addition. Round 216
+brings the total to **228** with the new packed-RGB(A) pack-loop
+byte-layout pins.
 
 ### SIMD-vs-scalar predictor (`spec/06` §3.2)
 

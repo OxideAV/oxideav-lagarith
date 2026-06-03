@@ -6,8 +6,45 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- round 216 — **packed-RGB(A) pack-loop branch hoist.** Lifted the
+  per-pixel `match pixel_kind` arm out of the BGR(A) pack loops of
+  `decode_arith_rgb` (types 2 / 4), `decode_arith_rgba` (type 8),
+  `decode_legacy_rgb` (type 7), and `decode_solid` (types 5 / 6 / 9)
+  so the dispatch fires once per call rather than once per pixel
+  (`pixel_kind` is invariant after the existing early `packed_bpp()`
+  validation). `decode_solid` additionally swaps the per-pixel
+  `Vec::push` push-loop for `vec![0u8; n * bpp]` + a chunked-write
+  fill. The plane-A `Option::expect` site in `decode_arith_rgba`
+  also moves out of the hot loop body, so the round-211 lazy alpha-
+  decode invariant (`Some(_)` on Bgra32, `None` on Bgr24) is
+  enforced exactly once per call rather than once per pixel. Output
+  byte sequence is unchanged on every input; verified by the
+  existing 215 lib + 7 ffmpeg pin tests passing without modification.
+
 ### Added
 
+- round 216 — **packed-RGB(A) pack-loop byte-layout pins.** 6 new
+  tests in module `pack_loop_byte_layout_pins` lock the layout
+  invariants the round-216 hoist must preserve:
+  `arith_rgb_bgra32_pack_alpha_is_opaque_constant` (RGB-coded Bgra32
+  must fill alpha with 0xff and the BGR triplet must match the
+  Bgr24 decode of the same wire bytes),
+  `arith_rgba_bgra32_pack_carries_real_alpha` (RGBA-coded Bgra32
+  carries the wire alpha, not the opaque constant, verified with a
+  per-pixel gradient that excludes both 0x00 and 0xff),
+  `legacy_rgb_bgra32_pack_alpha_is_opaque_constant` (same as the
+  modern RGB pin, on type 7),
+  `solid_frames_pack_loop_byte_layout` (types 5 / 6 / 9 each pack
+  the correct BGR(A) tuple to every pixel under both host kinds),
+  `solid_frames_pack_loop_buffer_length` (chunked-write `vec![0u8;
+  n * bpp]` sizing matches `PixelKind::buffer_len`), and
+  `planar_frames_reject_packed_pixel_kinds_unchanged` (YV12 / YUY2
+  still surface `PixelFormatMismatch` for `Bgr24` / `Bgra32`,
+  confirming the hoist did not accidentally route them through the
+  packed-RGB packer). Brings lib tests from 215 to 221, total to
+  **228** (221 lib + 7 ffmpeg pins).
 - round 211 — lazy alpha-plane decode in `decode_arith_rgba` for the
   `PixelKind::Bgr24` host buffer, plus early pixel-kind validation
   on the modern `decode_arith_rgb` / `decode_arith_rgba` and legacy
