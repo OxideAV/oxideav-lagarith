@@ -5,6 +5,32 @@ Pure-Rust Lagarith lossless video codec for the
 
 ## Status
 
+**Round 239 — typed `LegacyChannelHeader` accessor on the legacy
+(type-7) per-plane channel-header byte.** A new public enum
+classifies the outer channel-header byte of every type-7 channel
+slice per `spec/07` §1.3 + §2.1 into its semantic wire form:
+`BareFib` (`0x00`, 2-byte channel prefix — outer header + inner
+codec-mode flag — followed by a Fibonacci-coded 256-entry
+frequency table at offset 2) and `RleThenFib { escape_len }`
+(`0x01..=0x03`, 5-byte channel prefix — outer header + u32 LE
+post-RLE length field — followed by a `spec/05` zero-run-RLE-
+compressed Fibonacci-coded freq table at offset 5 with the
+per-channel escape length equal to the outer header byte). The
+legal outer-header set is strictly `{0x00, 0x01, 0x02, 0x03}` —
+disjoint from the modern (`ChannelHeader`) wire form set, which
+also accepts `0x04` raw, `0x05..=0x07` raw-with-RLE, and `0xff`
+constant-fill (`spec/03` §2.1 + `spec/06` §1.1). The surface
+exposes `from_byte`, `to_byte`, `uses_rle_pre_decompress`,
+`rle_escape_len`, and `freq_table_offset` so callers can
+introspect a parsed legacy wire header without re-running the
+dispatcher. The decoder dispatcher (`decode_legacy_channel`) now
+classifies through the typed accessor, making it the single
+source of truth for the legal set. Three new unit tests pin
+byte-classification on the four accepted bytes, rejection of
+ten representative out-of-range bytes including the modern-only
+headers (`0x04..=0x07`, `0xff`), and `from_byte` → `to_byte`
+round-trip closure.
+
 **Rounds 1..5 — arithmetic-coded RGB / YV12 / YUY2 + NULL-frame
 replay + reduced-resolution + legacy RGB (type 7) with Rule B
 first-column predictor + RLE-then-Fibonacci channel sub-path.

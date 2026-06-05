@@ -130,6 +130,117 @@ impl ChannelHeader {
     }
 }
 
+/// Typed accessor on the per-plane channel-header byte used by the
+/// **legacy type-7 (adaptive-CDF RGB)** frame type per `spec/07`
+/// §1.3 + §2.1.
+///
+/// The legacy channel-header dispatcher accepts a strictly narrower
+/// byte set than the modern dispatcher: `{0x00, 0x01, 0x02, 0x03}`.
+/// Under outer header `0x00` the wire form carries a 1-byte
+/// **inner codec-mode flag** at offset 1 (`spec/07` §1.3 final
+/// paragraph + §2.5 second blockquote): the proprietary binary's
+/// builder at `lagarith.dll!0x180001f60` performs a second dispatch
+/// on this byte and only the `0x00` value (bare Fibonacci) appears
+/// in the encoder's observed output; non-zero values select an
+/// undocumented RLE-then-Fibonacci sub-path that is rejected as
+/// [`Error::BadChannelHeader`] by [`decode_legacy_channel`].
+///
+/// All other outer-header values (everything outside
+/// `{0x00, 0x01, 0x02, 0x03}`) are out of range and rejected as
+/// [`Error::BadChannelHeader`].
+///
+/// Note that this set is disjoint from the modern
+/// [`ChannelHeader`] set: the legacy fork has no `0x04` raw, no
+/// `0x05..=0x07` raw-with-RLE, and no `0xff` constant-fill — those
+/// wire forms exist only on the modern path (`spec/03` §2.1 +
+/// `spec/06` §1.1). See [`decode_legacy_channel`] for the wire
+/// dispatcher this enum classifies.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum LegacyChannelHeader {
+    /// `0x00` — bare Fibonacci wire (`spec/07` §2.1 first bullet):
+    /// 2-byte channel prefix (outer header + inner codec-mode flag),
+    /// Fibonacci-coded 256-entry frequency table at offset 2, then
+    /// the legacy range-coder body. The inner codec-mode flag at
+    /// channel-data offset 1 must be `0x00`; non-zero values are
+    /// rejected (`spec/07` §1.3 final paragraph).
+    BareFib,
+    /// `0x01..=0x03` — RLE-then-Fibonacci wire (`spec/07` §2.1
+    /// second bullet + §2.3 / §2.4): outer header at offset 0,
+    /// u32 LE post-RLE byte count at offsets 1..4, RLE-compressed
+    /// Fibonacci-coded frequency table at offset 5, then the
+    /// legacy range-coder body. The outer header byte doubles as
+    /// the per-channel zero-run escape length.
+    RleThenFib {
+        /// Zero-run escape length, range `1..=3`. Equal to the
+        /// outer header byte value.
+        escape_len: u8,
+    },
+}
+
+impl LegacyChannelHeader {
+    /// Classify a legacy (type-7) outer channel-header byte per
+    /// `spec/07` §1.3 + §2.1.
+    ///
+    /// Returns [`Error::BadChannelHeader`] for any value outside
+    /// the four-element accepted set `{0x00, 0x01, 0x02, 0x03}`.
+    pub fn from_byte(b: u8) -> Result<Self> {
+        match b {
+            0x00 => Ok(Self::BareFib),
+            0x01..=0x03 => Ok(Self::RleThenFib { escape_len: b }),
+            other => Err(Error::BadChannelHeader(other)),
+        }
+    }
+
+    /// Wire-level outer-header byte that this variant maps back to.
+    /// Round-trips with [`from_byte`](Self::from_byte) on every
+    /// accepted input.
+    pub fn to_byte(self) -> u8 {
+        match self {
+            Self::BareFib => 0x00,
+            Self::RleThenFib { escape_len } => escape_len,
+        }
+    }
+
+    /// `true` if the header's wire form runs the
+    /// pre-Fibonacci-table RLE decompressor (`spec/07` §2.4):
+    /// only [`RleThenFib`](Self::RleThenFib).
+    pub fn uses_rle_pre_decompress(self) -> bool {
+        matches!(self, Self::RleThenFib { .. })
+    }
+
+    /// `Some(escape_len)` when the header's wire form carries a
+    /// per-channel zero-run RLE escape length (always equal to the
+    /// outer header byte). `None` for [`BareFib`](Self::BareFib).
+    /// Returned value is in `1..=3`.
+    pub fn rle_escape_len(self) -> Option<u8> {
+        match self {
+            Self::RleThenFib { escape_len } => Some(escape_len),
+            Self::BareFib => None,
+        }
+    }
+
+    /// Byte offset at which the Fibonacci-coded 256-entry
+    /// frequency table begins, relative to the channel-data
+    /// pointer (channel byte 0):
+    ///
+    /// * `2` for [`BareFib`](Self::BareFib) — channel header byte
+    ///   + inner codec-mode flag (`spec/07` §1.3 + §2.5).
+    /// * `5` for [`RleThenFib`](Self::RleThenFib) — channel header
+    ///   byte + 4-byte u32 post-RLE length field (`spec/07` §2.1
+    ///   second bullet).
+    ///
+    /// Note: on the `RleThenFib` path the Fibonacci table is
+    /// decoded out of the **post-RLE intermediate buffer**, not
+    /// directly from the channel byte stream; this offset names
+    /// where the RLE input bytes begin.
+    pub fn freq_table_offset(self) -> usize {
+        match self {
+            Self::BareFib => 2,
+            Self::RleThenFib { .. } => 5,
+        }
+    }
+}
+
 /// Decode one channel into a `Vec<u8>` of `n_pixels` residuals.
 /// Returns the residuals; the predictor pipeline runs separately.
 pub(crate) fn decode_channel(channel: &[u8], n_pixels: usize) -> Result<Vec<u8>> {
@@ -257,11 +368,14 @@ pub(crate) fn decode_legacy_channel(channel: &[u8], n_pixels: usize) -> Result<V
             context: "legacy type-7 channel header",
         });
     }
-    let header = channel[0];
-    match header {
-        0x00 => decode_legacy_bare_fib(channel, n_pixels),
-        0x01..=0x03 => decode_legacy_rle_then_fib(channel, n_pixels, header as usize),
-        other => Err(Error::BadChannelHeader(other)),
+    // Classify via the typed accessor so the wire dispatcher and
+    // the [`LegacyChannelHeader`] public API share a single source
+    // of truth for the legal outer-header set (`spec/07` §2.1).
+    match LegacyChannelHeader::from_byte(channel[0])? {
+        LegacyChannelHeader::BareFib => decode_legacy_bare_fib(channel, n_pixels),
+        LegacyChannelHeader::RleThenFib { escape_len } => {
+            decode_legacy_rle_then_fib(channel, n_pixels, escape_len as usize)
+        }
     }
 }
 
@@ -494,6 +608,60 @@ mod tests {
             // And re-classifying the round-tripped byte returns the
             // same variant.
             assert_eq!(ChannelHeader::from_byte(ch.to_byte()).unwrap(), ch);
+        }
+    }
+
+    #[test]
+    fn legacy_channel_header_byte_classification() {
+        // `spec/07` §2.1 first bullet — outer header 0x00 is the
+        // bare-Fibonacci wire (2-byte prefix; freq table at offset 2).
+        let bare = LegacyChannelHeader::from_byte(0x00).unwrap();
+        assert_eq!(bare, LegacyChannelHeader::BareFib);
+        assert!(!bare.uses_rle_pre_decompress());
+        assert_eq!(bare.rle_escape_len(), None);
+        assert_eq!(bare.freq_table_offset(), 2);
+        assert_eq!(bare.to_byte(), 0x00);
+
+        // `spec/07` §2.1 second bullet — outer header 0x01..=0x03
+        // is the RLE-then-Fibonacci wire (5-byte prefix; RLE bytes
+        // at offset 5). The escape_len equals the outer-header byte.
+        for h in 0x01u8..=0x03 {
+            let lc = LegacyChannelHeader::from_byte(h).unwrap();
+            assert_eq!(lc, LegacyChannelHeader::RleThenFib { escape_len: h });
+            assert!(lc.uses_rle_pre_decompress());
+            assert_eq!(lc.rle_escape_len(), Some(h));
+            assert_eq!(lc.freq_table_offset(), 5);
+            assert_eq!(lc.to_byte(), h);
+        }
+    }
+
+    #[test]
+    fn legacy_channel_header_rejects_out_of_range_bytes() {
+        // `spec/07` §2.1: the legal outer-header set is strictly
+        // `{0x00, 0x01, 0x02, 0x03}`. Every other byte (including
+        // the modern-only headers 0x04..=0x07 and 0xff) must surface
+        // BadChannelHeader carrying the offending byte.
+        for b in [0x04u8, 0x05, 0x06, 0x07, 0x08, 0x10, 0x7f, 0x80, 0xfe, 0xff] {
+            assert!(
+                matches!(
+                    LegacyChannelHeader::from_byte(b),
+                    Err(Error::BadChannelHeader(x)) if x == b,
+                ),
+                "legacy byte 0x{b:02x} should be rejected as BadChannelHeader"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_channel_header_roundtrip_to_byte() {
+        // Every accepted outer-header byte round-trips losslessly,
+        // and re-classification of `to_byte()` reproduces the same
+        // variant (i.e. `from_byte ∘ to_byte = id` on the accepted
+        // set `{0x00, 0x01, 0x02, 0x03}`).
+        for b in 0x00u8..=0x03 {
+            let lc = LegacyChannelHeader::from_byte(b).unwrap();
+            assert_eq!(lc.to_byte(), b);
+            assert_eq!(LegacyChannelHeader::from_byte(lc.to_byte()).unwrap(), lc);
         }
     }
 }

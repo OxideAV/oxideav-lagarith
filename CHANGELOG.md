@@ -8,6 +8,39 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- round 239 — **typed `LegacyChannelHeader` accessor on the legacy
+  (type-7, adaptive-CDF RGB) per-plane channel-header byte.** A new
+  public enum (`LegacyChannelHeader`) classifies the outer
+  channel-header byte at offset 0 of every legacy (frame type 7)
+  channel slice per `spec/07` §1.3 + §2.1 into its semantic wire
+  form: `BareFib` (`0x00`, 2-byte channel prefix — outer header +
+  inner codec-mode flag — followed by a Fibonacci-coded 256-entry
+  frequency table at offset 2 and the legacy range-coder body) and
+  `RleThenFib { escape_len }` (`0x01..=0x03`, 5-byte channel prefix
+  — outer header + u32 LE post-RLE length field — followed by a
+  `spec/05` zero-run-RLE-compressed Fibonacci-coded freq table at
+  offset 5 with the per-channel escape length equal to the outer
+  header byte). The legal set is strictly `{0x00, 0x01, 0x02, 0x03}`
+  — disjoint from the modern (`ChannelHeader`) wire form set, which
+  also accepts `0x04` raw, `0x05..=0x07` raw-with-RLE, and `0xff`
+  constant-fill (`spec/03` §2.1 + `spec/06` §1.1). The surface
+  exposes `from_byte`, `to_byte`, `uses_rle_pre_decompress`,
+  `rle_escape_len`, and `freq_table_offset` so callers can
+  introspect a parsed legacy wire header without re-running the
+  dispatcher. The wire-level decoder (`decode_legacy_channel`) now
+  classifies through the typed accessor, making it the single
+  source of truth for the legal outer-header set so the public
+  API and the dispatcher can't drift apart. Three new unit tests
+  in module `channel::tests` cover (a) full byte-classification
+  for the four accepted bytes including `escape_len` extraction on
+  the three RLE-bearing values plus correct `freq_table_offset`
+  for both variants, (b) rejection of representative out-of-range
+  bytes (`0x04`, `0x05`, `0x06`, `0x07`, `0x08`, `0x10`, `0x7f`,
+  `0x80`, `0xfe`, `0xff`) as `Error::BadChannelHeader` —
+  explicitly including the modern-only headers — and (c)
+  `from_byte` → `to_byte` round-trip closure on every accepted
+  byte. Total test count rises from 242 to 245 (registry).
+
 - round 236 — **typed `ChannelHeader` accessor on the modern per-plane
   channel-header byte.** A new public enum classifies the
   channel-header byte at offset 0 of every modern arithmetic-coded
