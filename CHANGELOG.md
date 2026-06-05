@@ -8,6 +8,30 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- round 236 — **typed `ChannelHeader` accessor on the modern per-plane
+  channel-header byte.** A new public enum classifies the
+  channel-header byte at offset 0 of every modern arithmetic-coded
+  channel slice (frame types 2, 3, 4, 8, 10, 11) per `spec/03` §2.1 +
+  `spec/06` §1.1 into its semantic wire form: `BareArithmetic`
+  (`0x00`, Fibonacci prefix + arithmetic body, no RLE), `ArithRle`
+  (`0x01..=0x03`, arithmetic body + `spec/05` zero-run RLE
+  post-process with `escape_len = header`), `Raw` (`0x04`, literal
+  bytes), `RawRle` (`0x05..=0x07`, literal bytes + RLE with
+  `escape_len = header - 4`), and `ConstantFill` (`0xff`). The legacy
+  (type 7) channel header uses a disjoint, narrower set per
+  `spec/07` §1.3 + §2.3 and is **not** covered by this enum (see
+  `decode_legacy_channel`). The surface exposes `from_byte`,
+  `to_byte`, `uses_arithmetic_body`, `uses_rle_postprocess`, and
+  `rle_escape_len` for callers that need to introspect a parsed wire
+  header without re-running the dispatcher. Three new unit tests in
+  module `channel::tests` cover (a) full byte-classification for the
+  nine accepted bytes including escape-length extraction on the two
+  RLE-bearing ranges, (b) rejection of representative out-of-range
+  bytes (`0x08`, `0x09`, `0x10`, `0x80`, `0xfe`) as
+  `Error::BadChannelHeader`, and (c) `from_byte` → `to_byte`
+  round-trip closure on every accepted byte. Total test count rises
+  from 239 to 242 (registry).
+
 - round 229 — **type-7 (legacy adaptive-CDF RGB) frame-level type-1
   (uncompressed) size guard.** A fifth `*_or_uncompressed` public
   encoder entry point — `encode_legacy_rgb_or_uncompressed` — extends

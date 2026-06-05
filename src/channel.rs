@@ -21,6 +21,115 @@ use crate::legacy_range_coder::{
 use crate::range_coder::{Cdf, RangeDecoder};
 use crate::rle;
 
+/// Typed accessor on the per-plane channel-header byte used by the
+/// modern arithmetic-coded RGB / RGBA / YV12 / YUY2 frame types
+/// (frame types 2, 3, 4, 8, 10, 11) per `spec/03` §2.1 + `spec/06`
+/// §1.1.
+///
+/// The wire-level dispatcher partitions the seven accepted header
+/// values into four sub-paths: bare arithmetic (`0x00`),
+/// arithmetic with inline RLE post-processing
+/// (`0x01..=0x03`, escape_len = header), raw plane (`0x04`),
+/// raw with RLE post-processing (`0x05..=0x07`, escape_len =
+/// header - 4), and constant-fill (`0xff`).
+///
+/// All other byte values are out of range and rejected as
+/// [`Error::BadChannelHeader`] by [`decode_channel`].
+///
+/// Note that the legacy (type 7) channel-header byte uses a
+/// disjoint, narrower set (`0x00` + `0x01..=0x03`) per `spec/07`
+/// §1.3 + §2.3; see [`decode_legacy_channel`].
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum ChannelHeader {
+    /// `0x00` — Fibonacci-coded probability prefix at offset 1
+    /// followed by the modern arithmetic body. No post-process RLE.
+    /// The decoder emits `n_pixels` 8-bit residuals.
+    BareArithmetic,
+    /// `0x01..=0x03` — Fibonacci-coded probability prefix at offset
+    /// 5 followed by the modern arithmetic body that emits
+    /// `pre_rle_len` symbols, then `spec/05` zero-run RLE expansion
+    /// with `escape_len = header` to fill `n_pixels`. The
+    /// `pre_rle_len` 32-bit field at offsets 1..4 governs the
+    /// "u32 ≥ n_pixels" fall-back per `spec/06` §1.4 (rerouted to
+    /// the [`BareArithmetic`](Self::BareArithmetic) shape with the
+    /// prefix beginning at offset 1, not offset 5).
+    ArithRle {
+        /// Zero-run escape length, range `1..=3`.
+        escape_len: u8,
+    },
+    /// `0x04` — `n_pixels` literal residual bytes at offsets
+    /// `1..(1 + n_pixels)`. No entropy, no RLE.
+    Raw,
+    /// `0x05..=0x07` — literal residual bytes at offset 1
+    /// post-processed by `spec/05` zero-run RLE expansion with
+    /// `escape_len = header - 4`. No entropy.
+    RawRle {
+        /// Zero-run escape length, range `1..=3`.
+        escape_len: u8,
+    },
+    /// `0xff` — constant-fill: the byte at offset 1 is replicated
+    /// `n_pixels` times. The plane carries exactly two bytes on the
+    /// wire (header + fill).
+    ConstantFill,
+}
+
+impl ChannelHeader {
+    /// Classify a channel-header byte per `spec/03` §2.1 +
+    /// `spec/06` §1.1.
+    ///
+    /// Returns [`Error::BadChannelHeader`] for any value outside
+    /// the seven-element accepted set
+    /// `{0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0xff}`.
+    pub fn from_byte(b: u8) -> Result<Self> {
+        match b {
+            0x00 => Ok(Self::BareArithmetic),
+            0x01..=0x03 => Ok(Self::ArithRle { escape_len: b }),
+            0x04 => Ok(Self::Raw),
+            0x05..=0x07 => Ok(Self::RawRle { escape_len: b - 4 }),
+            0xff => Ok(Self::ConstantFill),
+            other => Err(Error::BadChannelHeader(other)),
+        }
+    }
+
+    /// Wire-level header byte that this variant maps back to.
+    /// Round-trips with [`from_byte`](Self::from_byte) on every
+    /// accepted input.
+    pub fn to_byte(self) -> u8 {
+        match self {
+            Self::BareArithmetic => 0x00,
+            Self::ArithRle { escape_len } => escape_len,
+            Self::Raw => 0x04,
+            Self::RawRle { escape_len } => escape_len + 4,
+            Self::ConstantFill => 0xff,
+        }
+    }
+
+    /// `true` if the header's wire form runs the modern arithmetic
+    /// body (`BareArithmetic` or `ArithRle`). Used by encoder /
+    /// decoder paths that gate on "needs a Fibonacci probability
+    /// prefix".
+    pub fn uses_arithmetic_body(self) -> bool {
+        matches!(self, Self::BareArithmetic | Self::ArithRle { .. })
+    }
+
+    /// `true` if the header's wire form post-processes its output
+    /// through the `spec/05` zero-run RLE expander (`ArithRle` or
+    /// `RawRle`).
+    pub fn uses_rle_postprocess(self) -> bool {
+        matches!(self, Self::ArithRle { .. } | Self::RawRle { .. })
+    }
+
+    /// `Some(escape_len)` when the header's wire form carries a
+    /// `spec/05` zero-run RLE escape length; `None` otherwise. The
+    /// returned value is always in `1..=3`.
+    pub fn rle_escape_len(self) -> Option<u8> {
+        match self {
+            Self::ArithRle { escape_len } | Self::RawRle { escape_len } => Some(escape_len),
+            _ => None,
+        }
+    }
+}
+
 /// Decode one channel into a `Vec<u8>` of `n_pixels` residuals.
 /// Returns the residuals; the predictor pipeline runs separately.
 pub(crate) fn decode_channel(channel: &[u8], n_pixels: usize) -> Result<Vec<u8>> {
@@ -309,4 +418,82 @@ fn decode_arith_rle(
     // consumes (escape_len consecutive zeros + supplement byte, etc.).
     let (plane, _) = rle::expand_raw(&symbols, escape_len, n_pixels)?;
     Ok(plane)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn channel_header_byte_classification() {
+        // Bare arithmetic.
+        assert_eq!(
+            ChannelHeader::from_byte(0x00).unwrap(),
+            ChannelHeader::BareArithmetic
+        );
+
+        // Arithmetic + RLE, escape_len = 1..=3.
+        for h in 0x01u8..=0x03 {
+            let ch = ChannelHeader::from_byte(h).unwrap();
+            assert_eq!(ch, ChannelHeader::ArithRle { escape_len: h });
+            assert!(ch.uses_arithmetic_body());
+            assert!(ch.uses_rle_postprocess());
+            assert_eq!(ch.rle_escape_len(), Some(h));
+            assert_eq!(ch.to_byte(), h);
+        }
+
+        // Raw plane (no entropy, no RLE).
+        let raw = ChannelHeader::from_byte(0x04).unwrap();
+        assert_eq!(raw, ChannelHeader::Raw);
+        assert!(!raw.uses_arithmetic_body());
+        assert!(!raw.uses_rle_postprocess());
+        assert_eq!(raw.rle_escape_len(), None);
+        assert_eq!(raw.to_byte(), 0x04);
+
+        // Raw + RLE, escape_len = header - 4.
+        for h in 0x05u8..=0x07 {
+            let ch = ChannelHeader::from_byte(h).unwrap();
+            assert_eq!(ch, ChannelHeader::RawRle { escape_len: h - 4 });
+            assert!(!ch.uses_arithmetic_body());
+            assert!(ch.uses_rle_postprocess());
+            assert_eq!(ch.rle_escape_len(), Some(h - 4));
+            assert_eq!(ch.to_byte(), h);
+        }
+
+        // Constant fill.
+        let fill = ChannelHeader::from_byte(0xff).unwrap();
+        assert_eq!(fill, ChannelHeader::ConstantFill);
+        assert!(!fill.uses_arithmetic_body());
+        assert!(!fill.uses_rle_postprocess());
+        assert_eq!(fill.rle_escape_len(), None);
+        assert_eq!(fill.to_byte(), 0xff);
+    }
+
+    #[test]
+    fn channel_header_rejects_out_of_range_bytes() {
+        // `spec/06` §1.1: anything not in {0x00..=0x07, 0xff} is
+        // out-of-range. Spot-check the boundaries plus a handful of
+        // mid-range values that aren't legal headers.
+        for b in [0x08u8, 0x09, 0x10, 0x80, 0xfe] {
+            assert!(
+                matches!(
+                    ChannelHeader::from_byte(b),
+                    Err(Error::BadChannelHeader(x)) if x == b,
+                ),
+                "byte 0x{b:02x} should be rejected as BadChannelHeader"
+            );
+        }
+    }
+
+    #[test]
+    fn channel_header_roundtrip_to_byte() {
+        // Every accepted header byte round-trips losslessly.
+        for b in (0x00u8..=0x07).chain(std::iter::once(0xffu8)) {
+            let ch = ChannelHeader::from_byte(b).unwrap();
+            assert_eq!(ch.to_byte(), b);
+            // And re-classifying the round-tripped byte returns the
+            // same variant.
+            assert_eq!(ChannelHeader::from_byte(ch.to_byte()).unwrap(), ch);
+        }
+    }
 }

@@ -191,8 +191,38 @@ let frame_a = dec.decode(&payload_a, width, height, PixelKind::Bgra32)?;
 let frame_b = dec.decode(&[], width, height, PixelKind::Bgra32)?;
 ```
 
+Round 236 adds a typed [`ChannelHeader`] accessor for the modern
+per-plane channel-header byte (frame types 2, 3, 4, 8, 10, 11) per
+[`spec/03` §2.1](https://github.com/OxideAV/docs/blob/master/video/lagarith/spec/03-channel-decorrelation-and-predictors.md)
+and [`spec/06` §1.1](https://github.com/OxideAV/docs/blob/master/video/lagarith/spec/06-simd-predictor-rle-entropy-channel-dispatcher.md).
+It classifies the wire-level byte into one of five semantic forms —
+`BareArithmetic` (`0x00`), `ArithRle { escape_len }`
+(`0x01..=0x03`), `Raw` (`0x04`), `RawRle { escape_len }`
+(`0x05..=0x07`), and `ConstantFill` (`0xff`) — with helpers
+`uses_arithmetic_body`, `uses_rle_postprocess`, `rle_escape_len`,
+and a `to_byte` round-trip for callers that want to introspect a
+parsed wire header without re-running the dispatcher. Out-of-range
+bytes return `Error::BadChannelHeader`. The legacy (type 7)
+channel-header byte uses a disjoint, narrower set per `spec/07`
+§1.3 + §2.3 and is **not** covered by this accessor.
+
+```rust
+use oxideav_lagarith::{ChannelHeader, Error};
+
+assert_eq!(
+    ChannelHeader::from_byte(0x06).unwrap(),
+    ChannelHeader::RawRle { escape_len: 2 },
+);
+assert!(matches!(
+    ChannelHeader::from_byte(0x10),
+    Err(Error::BadChannelHeader(0x10)),
+));
+```
+
 `oxideav-core` framework registration is gated on the default-on
 `registry` Cargo feature and claims the `LAGS` FOURCC.
+
+[`ChannelHeader`]: https://docs.rs/oxideav-lagarith/latest/oxideav_lagarith/enum.ChannelHeader.html
 
 ## Performance
 
@@ -458,7 +488,7 @@ type-7 stream still awaits a fixture oracle
 
 ## Tests
 
-246 unit + integration tests cover the range coder, Fibonacci
+249 unit + integration tests cover the range coder, Fibonacci
 prefix, RLE escape, predictor + decorrelation, channel-header
 dispatcher, the channel-header `0x01..=0x03` arithmetic-with-RLE
 path and the `0x05..=0x07` raw-RLE path, an end-to-end encode →

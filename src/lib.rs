@@ -81,6 +81,7 @@ mod tables;
 #[cfg(test)]
 mod roundtrip_tests;
 
+pub use crate::channel::ChannelHeader;
 pub use crate::decoder::{decode_frame, decode_frame_with_prev, DecodedFrame, Decoder, PixelKind};
 pub use crate::error::{Error, Result};
 pub use crate::frame::FrameType;
