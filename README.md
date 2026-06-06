@@ -5,6 +5,38 @@ Pure-Rust Lagarith lossless video codec for the
 
 ## Status
 
+**Round 242 — typed `FrameType` classification accessors on the
+outermost wire byte.** Extends the public `FrameType` enum with a
+`to_byte` round-trip (`from_byte ∘ to_byte = id` on the legal set
+`1..=11`) plus 11 spec-grounded semantic helpers anchored in
+`spec/01`: `is_uncompressed` (type 1, §2.1), `is_solid` (types
+5 / 6 / 9, §2.2), `is_arithmetic` (types 2 / 3 / 4 / 7 / 8 / 10 /
+11, §2.3), `is_legacy_decode_only` (type 7 per §3 row 7 — the
+encoder-side cross-check writes "(none)"), `is_reduced_resolution`
+(type 11, §2.4), `is_planar_yv12` (types 10 / 11), `is_packed_yuy2`
+(type 3), `is_packed_rgb` (types 2 / 4 / 7 / 8), and
+`is_produced_by_v64_encoder` (the eight types §3 enumerates with
+immediate-byte writes: 2 / 3 / 4 / 5 / 6 / 8 / 9 / 10 — exclusion
+of types 1, 7, 11 reflects the §3 table's "(none)" rows). Two
+structural-size accessors expose the §2.3 channel-offset prefix
+sizes: `prefix_size` (`1` for literal / solid types; `9` for
+3-channel arithmetic; `13` for 4-channel RGBA arithmetic) and
+`channel_offset_table_size` (= `prefix_size − 1`). The new
+surface lets downstream callers introspect a parsed frame-type
+byte without re-running the per-type dispatcher in
+`decoder::decode_frame`, mirroring the round-236 / -239 pattern
+for the modern (`ChannelHeader`) and legacy (`LegacyChannelHeader`)
+channel-header bytes. 13 new unit tests pin `to_byte` round-trip
+closure, the top-level-classes partition invariant (uncompressed
+/ solid / arithmetic — every accepted byte satisfies exactly one),
+per-predicate membership against explicit positive sets for the
+seven boolean accessors, the arithmetic-sub-classes partition
+invariant (every arithmetic frame type satisfies exactly one of
+{planar-YV12, packed-YUY2, packed-RGB}), the v64-encoder-produced
+set, `prefix_size` matching the §2.3 table, and `prefix_size`
+consistency with the existing `pack_channels` / `split_channels`
+helpers. Brings the total unit-test count from 246 to **259**.
+
 **Round 239 — typed `LegacyChannelHeader` accessor on the legacy
 (type-7) per-plane channel-header byte.** A new public enum
 classifies the outer channel-header byte of every type-7 channel
@@ -640,7 +672,8 @@ byte-layout pins. Round 222 adds the frame-level type-1 (uncompressed)
 size guard module (`frame_uncompressed_size_guard`) with 13 new pins,
 bringing the total to 241. Round 229 extends the size guard to type 7
 (`legacy_frame_uncompressed_size_guard`) with 5 new pins, bringing the
-total to **246**.
+total to 246. Round 242 adds 13 typed-`FrameType`-accessor pins in
+module `frame::tests`, bringing the total to **259**.
 
 ### SIMD-vs-scalar predictor (`spec/06` §3.2)
 

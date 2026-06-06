@@ -8,6 +8,43 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- round 242 — **typed `FrameType` classification accessors on the
+  outermost wire byte (frame-type selector).** Extends the existing
+  public `FrameType` enum with a `to_byte` round-trip (`from_byte ∘
+  to_byte = id` on `1..=11`) plus eleven semantic helpers grounded
+  in `spec/01`: `is_uncompressed` (type 1, §2.1), `is_solid`
+  (types 5 / 6 / 9, §2.2), `is_arithmetic` (types 2 / 3 / 4 / 7
+  / 8 / 10 / 11, §2.3), `is_legacy_decode_only` (type 7 per §3
+  row 7 — encoder writes "(none)"), `is_reduced_resolution`
+  (type 11, §2.4), `is_planar_yv12` (types 10 / 11), `is_packed_yuy2`
+  (type 3), `is_packed_rgb` (types 2 / 4 / 7 / 8), and
+  `is_produced_by_v64_encoder` (the eight types §3 enumerates with
+  immediate-byte writes: 2 / 3 / 4 / 5 / 6 / 8 / 9 / 10 — excludes
+  types 1, 7, 11). Two structural-size accessors expose the §2.3
+  channel-offset prefix sizes: `prefix_size` (`1` for literal /
+  solid types; `9` for 3-channel arithmetic; `13` for 4-channel
+  RGBA arithmetic) and `channel_offset_table_size` (`prefix_size −
+  1`). The new surface lets downstream callers introspect a parsed
+  frame-type byte without re-running the per-type dispatcher in
+  `decoder::decode_frame`, mirroring the round-236 / -239 pattern
+  for the modern + legacy channel-header bytes. 13 new unit tests
+  in module `frame::tests` cover (a) `to_byte` round-trip closure
+  on `1..=11`, (b) the top-level-classes-partition invariant — the
+  three uncompressed / solid / arithmetic predicates partition the
+  accepted set without overlap or gap — (c) per-predicate
+  membership for the seven boolean accessors against the explicit
+  positive sets, (d) the arithmetic-sub-classes-partition invariant
+  — every arithmetic frame type satisfies exactly one of
+  {planar-YV12, packed-YUY2, packed-RGB} — (e) the §3 v64-encoder-
+  produced set against its explicit positive + negative sets, (f)
+  `prefix_size` + `channel_offset_table_size` match the §2.3 table
+  (9 / 13 / 1 for arithmetic-3ch / RGBA-arithmetic / literal), and
+  (g) `prefix_size` is consistent with the existing
+  `pack_channels` / `split_channels` helpers (a frame packed at the
+  canonical type byte has its first channel starting at offset
+  `ft.prefix_size()`). Brings the total unit-test count from 246
+  to **259**. No wire-format change.
+
 - round 239 — **typed `LegacyChannelHeader` accessor on the legacy
   (type-7, adaptive-CDF RGB) per-plane channel-header byte.** A new
   public enum (`LegacyChannelHeader`) classifies the outer
