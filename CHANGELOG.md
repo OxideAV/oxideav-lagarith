@@ -8,6 +8,45 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- round 245 — **typed `PixelKind` classification accessors on the
+  host-side pixel-format selector.** Extends the existing public
+  `PixelKind` enum (`Bgr24` / `Bgra32` / `Yv12` / `Yuy2`) with six
+  semantic helpers grounded in `spec/01` §2.2..§2.3 + `spec/03`
+  §6.1 / §6.2: `is_rgb_family` (matches `Bgr24` / `Bgra32` — the
+  host targets for the modern arithmetic-coded RGB / RGBA families
+  and the SOLID-RGB / SOLID-RGBA literals), `is_yuv_family` (matches
+  `Yv12` / `Yuy2` — `spec/03` §6.1 / §6.2), `is_packed` (matches
+  `Bgr24` / `Bgra32` / `Yuy2` — packed memory order; YUY2 is packed
+  at the macropixel level per `spec/03` §6.2), `is_planar` (matches
+  `Yv12` only — Y / V / U region concatenation per `spec/03` §6.1.1),
+  `has_alpha` (matches `Bgra32` only — the alpha byte the decoder
+  either fills with `0xff` for non-RGBA frame types or copies from
+  the decoded alpha plane for RGBA frame type 8 / SOLID-RGBA type
+  9), and `bytes_per_pixel` (`Some(3)` for `Bgr24`, `Some(4)` for
+  `Bgra32`; `None` for the two YUV-family formats — the public
+  face of the existing private `packed_bpp` helper). A companion
+  `PixelKind::all()` enumerates the four recognised host formats
+  in declaration order. The new surface lets downstream callers
+  introspect a host-format choice without re-running the per-format
+  dispatch in `decode_arith_rgb` / `decode_arith_yv12` /
+  `decode_arith_yuy2`, mirroring the round 236 / 239 / 242 pattern
+  that exposed the modern channel-header, legacy channel-header,
+  and frame-type bytes via typed enums. 12 new unit tests in
+  module `decoder::tests` cover (a) the four-element enumeration
+  order of `PixelKind::all()`, (b) per-predicate membership for the
+  four boolean accessors against the explicit positive sets, (c)
+  the color-family partition invariant (`is_rgb_family` +
+  `is_yuv_family` is exactly one for every variant), (d) the
+  memory-layout partition invariant (`is_packed` + `is_planar` is
+  exactly one for every variant), (e) the `bytes_per_pixel` value
+  for each variant, (f) `bytes_per_pixel`-implies-`is_packed`
+  consistency, (g) `buffer_len(w, h) == w * h * bpp` whenever
+  `bytes_per_pixel` returns `Some(bpp)`, (h) `buffer_len` on
+  `Yuy2` is `w * h * 2` per `spec/03` §6.2, and (i) `buffer_len`
+  on `Yv12` matches the `n + 2 * (n / 4)` formula per `spec/03`
+  §6.1.1 across multiple W / H pairs. Brings the total unit-test
+  count from 259 to **272**. No wire-format change.
+
 - round 242 — **typed `FrameType` classification accessors on the
   outermost wire byte (frame-type selector).** Extends the existing
   public `FrameType` enum with a `to_byte` round-trip (`from_byte ∘

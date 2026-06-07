@@ -86,6 +86,78 @@ impl PixelKind {
             Self::Yv12 | Self::Yuy2 => None,
         }
     }
+
+    /// `true` for the RGB-family host pixel formats — `Bgr24`
+    /// (24-bpp BGR, Windows `BI_RGB` 24-bpp DIB) and `Bgra32`
+    /// (32-bpp BGRA). These are the host targets the decoder packs
+    /// the modern arithmetic-coded RGB / RGBA frame families
+    /// (`spec/01` §2.3 rows 2 / 4 / 7 / 8) — and the SOLID-RGB(A)
+    /// literal frame families (`spec/01` §2.2 rows 6 / 9) — back
+    /// into after the per-plane decode and inverse G-pivot
+    /// decorrelation (`spec/03` §4).
+    pub fn is_rgb_family(self) -> bool {
+        matches!(self, Self::Bgr24 | Self::Bgra32)
+    }
+
+    /// `true` for the YUV-family host pixel formats — `Yv12`
+    /// (12-bpp planar Y / V / U per `spec/03` §6.1) and `Yuy2`
+    /// (16-bpp packed `Y0 U Y1 V` per `spec/03` §6.2). These are
+    /// the host targets the decoder produces for the YV12 (frame
+    /// type 10), reduced-resolution YV12 (type 11), and YUY2 (type
+    /// 3) wire forms. Neither YUY2 nor YV12 applies any cross-plane
+    /// decorrelation (`spec/03` §4.4).
+    pub fn is_yuv_family(self) -> bool {
+        matches!(self, Self::Yv12 | Self::Yuy2)
+    }
+
+    /// `true` for the packed-pixel host formats — `Bgr24`, `Bgra32`,
+    /// and `Yuy2`. Packed formats interleave all components of one
+    /// pixel (or one macropixel for `Yuy2`) contiguously in the
+    /// output buffer; planar formats keep each component in a
+    /// separate region. The YUY2 case is packed at the macropixel
+    /// level (`Y0 U Y1 V`, 2 bytes / pixel in aggregate per
+    /// `spec/03` §6.2).
+    pub fn is_packed(self) -> bool {
+        matches!(self, Self::Bgr24 | Self::Bgra32 | Self::Yuy2)
+    }
+
+    /// `true` for the planar host pixel formats — `Yv12` only. The
+    /// `Yv12` output layout is three concatenated plane regions in
+    /// Y / V / U order (`spec/03` §6.1.1). All other host formats
+    /// — `Bgr24`, `Bgra32`, `Yuy2` — are packed.
+    pub fn is_planar(self) -> bool {
+        matches!(self, Self::Yv12)
+    }
+
+    /// `true` for host pixel formats that carry an explicit alpha
+    /// channel — `Bgra32` only. For `Bgra32` the decoder writes
+    /// `0xff` into the alpha byte of every output pixel when the
+    /// source frame type lacks alpha (the modern RGB24 / YV12 /
+    /// YUY2 / SOLID-RGB / SOLID-GREY / legacy-RGB families) and
+    /// the decoded alpha plane when the source is RGBA (`spec/01`
+    /// §2.3 row 8 + §2.2 row 9 SOLID-RGBA).
+    pub fn has_alpha(self) -> bool {
+        matches!(self, Self::Bgra32)
+    }
+
+    /// `Some(bytes-per-pixel)` for host pixel formats whose
+    /// bytes-per-pixel is a single integer at the pixel level —
+    /// `Bgr24` (= 3) and `Bgra32` (= 4). `None` for `Yv12` (planar,
+    /// fractional aggregate) and for `Yuy2` (packed at the
+    /// macropixel level — 2 bytes / pixel in aggregate but
+    /// unevenly distributed across the four bytes of the macropixel).
+    /// This is the public face of the existing `packed_bpp` helper.
+    pub fn bytes_per_pixel(self) -> Option<usize> {
+        self.packed_bpp()
+    }
+
+    /// The four host pixel formats this build's decoder recognises,
+    /// in the order they appear on the public enum (`Bgr24`,
+    /// `Bgra32`, `Yv12`, `Yuy2`). Useful for exhaustively driving
+    /// the per-format decode dispatch in tests / fixtures.
+    pub fn all() -> [Self; 4] {
+        [Self::Bgr24, Self::Bgra32, Self::Yv12, Self::Yuy2]
+    }
 }
 
 /// Decoded frame payload.
@@ -901,6 +973,188 @@ fn upscale_plane_2x(src: &[u8], src_w: usize, src_h: usize, dst: &mut [u8], dst_
             dst[dst_row_top + 2 * x + 1] = v;
             dst[dst_row_bot + 2 * x] = v;
             dst[dst_row_bot + 2 * x + 1] = v;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `PixelKind::all()` enumerates the four host pixel formats in
+    /// the order they appear on the public enum: `Bgr24`, `Bgra32`,
+    /// `Yv12`, `Yuy2`.
+    #[test]
+    fn pixel_kind_all_enumerates_four_variants() {
+        let v = PixelKind::all();
+        assert_eq!(v.len(), 4);
+        assert_eq!(v[0], PixelKind::Bgr24);
+        assert_eq!(v[1], PixelKind::Bgra32);
+        assert_eq!(v[2], PixelKind::Yv12);
+        assert_eq!(v[3], PixelKind::Yuy2);
+    }
+
+    /// `is_rgb_family` matches exactly `Bgr24` and `Bgra32` per
+    /// `spec/01` §2.3 (modern RGB / RGBA wire) + `spec/01` §2.2
+    /// (SOLID-RGB / SOLID-RGBA literal). All other host formats are
+    /// YUV-family.
+    #[test]
+    fn pixel_kind_is_rgb_family() {
+        let rgbs = [PixelKind::Bgr24, PixelKind::Bgra32];
+        for pk in rgbs {
+            assert!(pk.is_rgb_family(), "{pk:?} should be is_rgb_family");
+        }
+        for pk in PixelKind::all() {
+            assert_eq!(pk.is_rgb_family(), rgbs.contains(&pk), "{pk:?}");
+        }
+    }
+
+    /// `is_yuv_family` matches exactly `Yv12` and `Yuy2` per
+    /// `spec/03` §6.1 / §6.2. All other host formats are RGB-family.
+    #[test]
+    fn pixel_kind_is_yuv_family() {
+        let yuvs = [PixelKind::Yv12, PixelKind::Yuy2];
+        for pk in yuvs {
+            assert!(pk.is_yuv_family(), "{pk:?} should be is_yuv_family");
+        }
+        for pk in PixelKind::all() {
+            assert_eq!(pk.is_yuv_family(), yuvs.contains(&pk), "{pk:?}");
+        }
+    }
+
+    /// The two color-family predicates partition the accepted set
+    /// of host pixel formats: every `PixelKind` belongs to exactly
+    /// one of {RGB-family, YUV-family}.
+    #[test]
+    fn pixel_kind_color_family_predicates_partition_set() {
+        for pk in PixelKind::all() {
+            let r = pk.is_rgb_family() as u8;
+            let y = pk.is_yuv_family() as u8;
+            assert_eq!(r + y, 1, "exactly one color family must hold for {pk:?}");
+        }
+    }
+
+    /// `is_packed` matches exactly `Bgr24`, `Bgra32`, and `Yuy2`
+    /// per `spec/03` §6.2 (YUY2 packed `Y0 U Y1 V`). Only `Yv12` is
+    /// planar.
+    #[test]
+    fn pixel_kind_is_packed() {
+        let packed = [PixelKind::Bgr24, PixelKind::Bgra32, PixelKind::Yuy2];
+        for pk in packed {
+            assert!(pk.is_packed(), "{pk:?} should be is_packed");
+        }
+        for pk in PixelKind::all() {
+            assert_eq!(pk.is_packed(), packed.contains(&pk), "{pk:?}");
+        }
+    }
+
+    /// `is_planar` matches `Yv12` only per `spec/03` §6.1.1
+    /// (concatenated Y / V / U regions).
+    #[test]
+    fn pixel_kind_is_planar() {
+        assert!(PixelKind::Yv12.is_planar());
+        for pk in [PixelKind::Bgr24, PixelKind::Bgra32, PixelKind::Yuy2] {
+            assert!(!pk.is_planar(), "{pk:?} should not be is_planar");
+        }
+    }
+
+    /// The two memory-layout predicates partition the accepted set
+    /// of host pixel formats: every `PixelKind` belongs to exactly
+    /// one of {packed, planar}.
+    #[test]
+    fn pixel_kind_layout_predicates_partition_set() {
+        for pk in PixelKind::all() {
+            let p = pk.is_packed() as u8;
+            let l = pk.is_planar() as u8;
+            assert_eq!(p + l, 1, "exactly one layout must hold for {pk:?}");
+        }
+    }
+
+    /// `has_alpha` matches `Bgra32` only. The other three host
+    /// formats — `Bgr24` (no alpha byte), `Yv12` (no alpha plane),
+    /// `Yuy2` (no alpha component) — report `false`.
+    #[test]
+    fn pixel_kind_has_alpha() {
+        assert!(PixelKind::Bgra32.has_alpha());
+        for pk in [PixelKind::Bgr24, PixelKind::Yv12, PixelKind::Yuy2] {
+            assert!(!pk.has_alpha(), "{pk:?} should not have alpha");
+        }
+    }
+
+    /// `bytes_per_pixel` returns `Some(3)` for `Bgr24`, `Some(4)`
+    /// for `Bgra32`, and `None` for both YUV-family formats (`Yv12`
+    /// is planar with fractional aggregate; `Yuy2` is packed at the
+    /// macropixel level — 2 bytes / pixel in aggregate but unevenly
+    /// distributed across the 4-byte macropixel).
+    #[test]
+    fn pixel_kind_bytes_per_pixel() {
+        assert_eq!(PixelKind::Bgr24.bytes_per_pixel(), Some(3));
+        assert_eq!(PixelKind::Bgra32.bytes_per_pixel(), Some(4));
+        assert_eq!(PixelKind::Yv12.bytes_per_pixel(), None);
+        assert_eq!(PixelKind::Yuy2.bytes_per_pixel(), None);
+    }
+
+    /// `bytes_per_pixel` and `is_packed` are consistent: whenever
+    /// `bytes_per_pixel` returns `Some(_)`, `is_packed` is true (the
+    /// converse does not hold — `Yuy2` is packed but has no
+    /// single-integer bytes-per-pixel because its bytes split
+    /// unevenly across the four-byte macropixel).
+    #[test]
+    fn pixel_kind_bytes_per_pixel_implies_packed() {
+        for pk in PixelKind::all() {
+            if pk.bytes_per_pixel().is_some() {
+                assert!(
+                    pk.is_packed(),
+                    "{pk:?} with bytes_per_pixel should be is_packed"
+                );
+            }
+        }
+    }
+
+    /// When `bytes_per_pixel` returns `Some(bpp)`, the
+    /// `buffer_len(w, h)` accessor matches `w * h * bpp` exactly.
+    /// This anchors the per-format buffer-sizing rule to the
+    /// per-pixel byte count for the packed RGB-family formats.
+    #[test]
+    fn pixel_kind_buffer_len_matches_bytes_per_pixel() {
+        for (w, h) in [(1u32, 1u32), (4, 4), (16, 9), (640, 480)] {
+            for pk in PixelKind::all() {
+                if let Some(bpp) = pk.bytes_per_pixel() {
+                    assert_eq!(
+                        pk.buffer_len(w, h),
+                        (w as usize) * (h as usize) * bpp,
+                        "{pk:?} {w}x{h}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `buffer_len` on `Yuy2` is `w * h * 2` per `spec/03` §6.2
+    /// (packed `Y0 U Y1 V`, 2 bytes / pixel in aggregate). This
+    /// anchors the YUY2 buffer rule even though `bytes_per_pixel`
+    /// returns `None` for it (the four bytes of the macropixel
+    /// split unevenly across two adjacent pixels).
+    #[test]
+    fn pixel_kind_buffer_len_yuy2_is_two_bytes_per_pixel() {
+        for (w, h) in [(2u32, 1u32), (4, 4), (640, 480)] {
+            assert_eq!(
+                PixelKind::Yuy2.buffer_len(w, h),
+                (w as usize) * (h as usize) * 2,
+                "Yuy2 {w}x{h}"
+            );
+        }
+    }
+
+    /// `buffer_len` on `Yv12` matches `n + 2 * (n / 4)` per
+    /// `spec/03` §6.1.1 (Y plane at `W * H`; V and U each at
+    /// `floor((W * H) / 4)`). For even-W/even-H frames this is
+    /// the canonical `n * 3 / 2` formula.
+    #[test]
+    fn pixel_kind_buffer_len_yv12_matches_spec_6_1_1() {
+        for (w, h) in [(2u32, 2u32), (4, 4), (16, 16), (640, 480)] {
+            let n = (w as usize) * (h as usize);
+            assert_eq!(PixelKind::Yv12.buffer_len(w, h), n + 2 * (n / 4));
         }
     }
 }
