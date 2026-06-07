@@ -5,6 +5,34 @@ Pure-Rust Lagarith lossless video codec for the
 
 ## Status
 
+**Round 250 — typed `ChannelHeader` structural accessors on the
+modern per-plane channel-header byte.** Extends the public
+`ChannelHeader` enum (rounds 236 / 242) with two new structural
+accessors anchored in `spec/03` §2.1 + `spec/06` §1.2:
+`freq_table_offset` returning `Some(1)` for `BareArithmetic` (the
+no-length-field path — `spec/06` §1.2 call site B; Fibonacci
+prefix begins at channel-data byte 1), `Some(5)` for `ArithRle`
+(the §1.4-precondition path — call site A; Fibonacci prefix begins
+at byte 5 after the 4-byte u32 pre-RLE length field at bytes 1..4),
+and `None` for the three non-arithmetic forms `Raw` / `RawRle` /
+`ConstantFill` which carry no Fibonacci-coded freq table; and
+`prefix_size` returning the channel-prefix byte count the
+dispatcher consumes before the wire-body proper begins (`1` for
+every variant that consumes only the header byte; `5` for
+`ArithRle`'s header + u32 length field). Mirrors the round-239
+`LegacyChannelHeader::freq_table_offset` shape so the modern and
+legacy channel-header wire-form classifiers expose the same
+structural surface, and mirrors `FrameType::prefix_size` at the
+channel level — the two `prefix_size` accessors together let
+downstream callers compute byte offsets through both prefix layers
+(frame-level channel-offset table + per-channel header machinery)
+without re-running the dispatcher. 4 new unit tests pin the two
+accessors' values per-byte across the full nine-element accepted
+set, consistency of `freq_table_offset` with `prefix_size` (when
+present, the offset equals the prefix size; when absent, the
+prefix size is 1), and equivalence of `freq_table_offset.is_some()`
+with the existing `uses_arithmetic_body` predicate.
+
 **Round 242 — typed `FrameType` classification accessors on the
 outermost wire byte.** Extends the public `FrameType` enum with a
 `to_byte` round-trip (`from_byte ∘ to_byte = id` on the legal set

@@ -128,6 +128,97 @@ impl ChannelHeader {
             _ => None,
         }
     }
+
+    /// `Some(offset)` when the header's wire form carries a
+    /// `spec/04` Fibonacci-coded 256-entry frequency table — the
+    /// returned offset is the byte position relative to channel
+    /// byte 0 at which the Fibonacci bit stream begins.
+    ///
+    /// Per `spec/06` §1.2 the per-channel dispatcher takes one of
+    /// two pointer-paths into the probability-table loader at
+    /// `lagarith.dll!0x1800012b0`:
+    ///
+    /// * **Call site B** (the no-length-field path) — used by
+    ///   `BareArithmetic`. The Fibonacci prefix begins at
+    ///   **channel-data byte 1**, immediately after the header
+    ///   byte.
+    /// * **Call site A** (the §1.4-precondition path) — used by
+    ///   `ArithRle` when the u32 pre-RLE length at channel bytes
+    ///   1..5 is strictly less than the channel's pixel count. The
+    ///   Fibonacci prefix begins at **channel-data byte 5**, after
+    ///   the 4-byte u32 length field.
+    ///
+    /// Returns `None` for the three non-arithmetic wire forms —
+    /// `Raw` (literal bytes at byte 1), `RawRle` (RLE-compressed
+    /// bytes at byte 1), and `ConstantFill` (a single fill byte at
+    /// byte 1) — which carry no Fibonacci-coded freq table by
+    /// construction (`spec/03` §2.1 rows for headers `0x04` and
+    /// `0x05..=0x07` plus the `0xff` solid-fill row).
+    ///
+    /// Note: when the `ArithRle` u32 length field at channel bytes
+    /// 1..4 happens to be `>= n_pixels`, the `spec/06` §1.4
+    /// fall-back rerouts the dispatch to the `BareArithmetic` shape
+    /// with the Fibonacci prefix beginning at byte 1 — i.e. the
+    /// effective freq-table offset on that runtime branch is `1`,
+    /// not `5`. This accessor reports the static-by-header value
+    /// only, so callers that need the runtime-resolved offset must
+    /// re-check the u32 length field themselves; see
+    /// [`decode_channel`] for the dispatcher's full rule.
+    ///
+    /// Mirrors [`LegacyChannelHeader::freq_table_offset`] —
+    /// the legacy (type-7) channel-header byte uses a disjoint,
+    /// narrower set with its own offset choices (`spec/07` §1.3 +
+    /// §2.1). The two accessors share the same shape so callers can
+    /// reason about either wire form uniformly.
+    pub fn freq_table_offset(self) -> Option<usize> {
+        match self {
+            Self::BareArithmetic => Some(1),
+            Self::ArithRle { .. } => Some(5),
+            Self::Raw | Self::RawRle { .. } | Self::ConstantFill => None,
+        }
+    }
+
+    /// Channel-prefix size in bytes — the number of leading bytes
+    /// of the channel data that the dispatcher consumes for
+    /// header / metadata fields before the wire-body proper
+    /// begins.
+    ///
+    /// Per `spec/03` §2.1 + `spec/06` §1.2:
+    ///
+    /// * `1` for `BareArithmetic` (header only — the Fibonacci
+    ///   prefix begins at byte 1).
+    /// * `5` for `ArithRle` (header + 4-byte u32 pre-RLE
+    ///   symbol-stream length at bytes 1..5 — the Fibonacci
+    ///   prefix begins at byte 5; `spec/06` §1.2 call site A).
+    /// * `1` for `Raw` (header only — the literal plane bytes
+    ///   begin at byte 1).
+    /// * `1` for `RawRle` (header only — the RLE-compressed plane
+    ///   bytes begin at byte 1).
+    /// * `1` for `ConstantFill` (header only — the fill byte sits
+    ///   at byte 1).
+    ///
+    /// Equal to `1 + freq_table_offset().unwrap_or(1) - 1` for
+    /// every variant: a structural restatement of the dispatcher's
+    /// two-call-sites pointer arithmetic. Equivalently, this is
+    /// the offset within the channel slice at which the wire body
+    /// content `decode_channel` reads next begins — the Fibonacci
+    /// prefix for the arithmetic forms, or the post-header
+    /// payload bytes for the literal forms.
+    ///
+    /// Mirrors [`FrameType::prefix_size`] (which reports the
+    /// channel-offset-table prefix size at the *frame* level) at
+    /// the channel level. Note: when the `ArithRle` u32 length
+    /// field is `>= n_pixels` the `spec/06` §1.4 fall-back rerouts
+    /// the dispatcher to the `BareArithmetic` shape with prefix
+    /// size `1`; this accessor reports the static-by-header value
+    /// only, matching the same convention as
+    /// [`freq_table_offset`](Self::freq_table_offset).
+    pub fn prefix_size(self) -> usize {
+        match self {
+            Self::BareArithmetic | Self::Raw | Self::RawRle { .. } | Self::ConstantFill => 1,
+            Self::ArithRle { .. } => 5,
+        }
+    }
 }
 
 /// Typed accessor on the per-plane channel-header byte used by the
@@ -662,6 +753,114 @@ mod tests {
             let lc = LegacyChannelHeader::from_byte(b).unwrap();
             assert_eq!(lc.to_byte(), b);
             assert_eq!(LegacyChannelHeader::from_byte(lc.to_byte()).unwrap(), lc);
+        }
+    }
+
+    /// `freq_table_offset` matches `spec/06` §1.2 + `spec/03` §2.1:
+    /// `Some(1)` for `BareArithmetic` (call site B — Fibonacci
+    /// prefix begins at channel-data byte 1), `Some(5)` for
+    /// `ArithRle` (call site A — prefix begins at byte 5 after the
+    /// 4-byte u32 length field at bytes 1..4), and `None` for the
+    /// three non-arithmetic forms `Raw` / `RawRle` / `ConstantFill`
+    /// (which carry no Fibonacci-coded freq table).
+    #[test]
+    fn channel_header_freq_table_offset() {
+        assert_eq!(
+            ChannelHeader::from_byte(0x00).unwrap().freq_table_offset(),
+            Some(1),
+        );
+        for h in 0x01u8..=0x03 {
+            assert_eq!(
+                ChannelHeader::from_byte(h).unwrap().freq_table_offset(),
+                Some(5),
+                "ArithRle escape_len={h} should expose Fib prefix at byte 5",
+            );
+        }
+        assert_eq!(
+            ChannelHeader::from_byte(0x04).unwrap().freq_table_offset(),
+            None,
+        );
+        for h in 0x05u8..=0x07 {
+            assert_eq!(
+                ChannelHeader::from_byte(h).unwrap().freq_table_offset(),
+                None,
+                "RawRle escape_len={} should have no Fib prefix",
+                h - 4,
+            );
+        }
+        assert_eq!(
+            ChannelHeader::from_byte(0xff).unwrap().freq_table_offset(),
+            None,
+        );
+    }
+
+    /// `prefix_size` matches `spec/03` §2.1 + `spec/06` §1.2:
+    /// 1 byte for every variant that consumes only the header byte
+    /// before the wire body proper begins (`BareArithmetic`,
+    /// `Raw`, `RawRle`, `ConstantFill`), and 5 bytes for `ArithRle`
+    /// (header + 4-byte u32 pre-RLE length field).
+    #[test]
+    fn channel_header_prefix_size() {
+        assert_eq!(ChannelHeader::from_byte(0x00).unwrap().prefix_size(), 1);
+        for h in 0x01u8..=0x03 {
+            assert_eq!(
+                ChannelHeader::from_byte(h).unwrap().prefix_size(),
+                5,
+                "ArithRle escape_len={h} should have 5-byte prefix",
+            );
+        }
+        assert_eq!(ChannelHeader::from_byte(0x04).unwrap().prefix_size(), 1);
+        for h in 0x05u8..=0x07 {
+            assert_eq!(
+                ChannelHeader::from_byte(h).unwrap().prefix_size(),
+                1,
+                "RawRle escape_len={} should have 1-byte prefix",
+                h - 4,
+            );
+        }
+        assert_eq!(ChannelHeader::from_byte(0xff).unwrap().prefix_size(), 1);
+    }
+
+    /// The new `freq_table_offset` and `prefix_size` accessors are
+    /// consistent: when a header carries a Fibonacci freq table,
+    /// the prefix size equals the freq-table offset (the Fibonacci
+    /// bit stream begins exactly where the header machinery ends);
+    /// when there is no freq table, the prefix size is 1 (just the
+    /// header byte itself, with the payload — raw bytes, RLE
+    /// bytes, or fill byte — beginning at byte 1).
+    #[test]
+    fn channel_header_freq_table_offset_consistent_with_prefix_size() {
+        for b in (0x00u8..=0x07).chain(std::iter::once(0xffu8)) {
+            let ch = ChannelHeader::from_byte(b).unwrap();
+            match ch.freq_table_offset() {
+                Some(off) => assert_eq!(
+                    off,
+                    ch.prefix_size(),
+                    "byte 0x{b:02x}: freq_table_offset must equal prefix_size on arithmetic forms",
+                ),
+                None => assert_eq!(
+                    ch.prefix_size(),
+                    1,
+                    "byte 0x{b:02x}: non-arithmetic forms must have a 1-byte prefix",
+                ),
+            }
+        }
+    }
+
+    /// `freq_table_offset` and `uses_arithmetic_body` are
+    /// equivalent classifiers — a channel-header byte uses the
+    /// arithmetic body iff it carries a Fibonacci-coded freq
+    /// table. Verifies the two accessors agree on every byte in
+    /// the accepted nine-element set.
+    #[test]
+    fn channel_header_freq_table_offset_implies_uses_arithmetic_body() {
+        for b in (0x00u8..=0x07).chain(std::iter::once(0xffu8)) {
+            let ch = ChannelHeader::from_byte(b).unwrap();
+            assert_eq!(
+                ch.freq_table_offset().is_some(),
+                ch.uses_arithmetic_body(),
+                "byte 0x{b:02x}: freq_table_offset.is_some() must match uses_arithmetic_body",
+            );
         }
     }
 }

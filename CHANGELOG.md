@@ -8,6 +8,25 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- round 250 — **typed `ChannelHeader` structural accessors on the
+  modern per-plane channel-header byte.** Extends the public
+  `ChannelHeader` enum with `freq_table_offset() -> Option<usize>`
+  (returns `Some(1)` for `BareArithmetic`, `Some(5)` for `ArithRle`,
+  `None` for `Raw` / `RawRle` / `ConstantFill`) per `spec/06` §1.2
+  call sites A + B + `spec/03` §2.1, and `prefix_size() -> usize`
+  (`1` for every variant whose dispatcher only consumes the header
+  byte before the wire body proper begins; `5` for `ArithRle` whose
+  prefix carries the 4-byte u32 pre-RLE length field at bytes 1..4).
+  Mirrors `LegacyChannelHeader::freq_table_offset` (the modern and
+  legacy classifiers now expose the same structural surface) and
+  mirrors `FrameType::prefix_size` at the channel level so
+  downstream callers can compute byte offsets through both prefix
+  layers without re-running the dispatcher. 4 new unit tests pin
+  the two accessors per-byte across the full nine-element accepted
+  set, consistency between `freq_table_offset` and `prefix_size`,
+  and equivalence of `freq_table_offset.is_some()` with the
+  existing `uses_arithmetic_body` predicate.
+
 - round 245 — **typed `PixelKind` classification accessors on the
   host-side pixel-format selector.** Extends the existing public
   `PixelKind` enum (`Bgr24` / `Bgra32` / `Yv12` / `Yuy2`) with six
