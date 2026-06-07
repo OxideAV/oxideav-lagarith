@@ -8,6 +8,38 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- round 253 — **typed `FrameType` × `PixelKind` compatibility
+  relation accessor.** Extends the public `FrameType` enum with
+  `accepts_pixel_kind(PixelKind) -> bool` (the predicate the per-
+  frame-type decoders already enforce at function entry) and a
+  complementary `compatible_pixel_kinds() -> &'static [PixelKind]`
+  slice accessor returning the exact element-wise set of host
+  pixel kinds the frame type accepts. Compatibility table is
+  anchored in `spec/01` §2.1 (uncompressed accepts all four host
+  pixel kinds — `Bgr24` / `Bgra32` / `Yv12` / `Yuy2` — the wire
+  body is the host pixel buffer verbatim) + §2.2.1 (the three
+  solid types accept `Bgr24` / `Bgra32` only — Windows BI_RGB BGR
+  memory order) + §2.3 (the four packed-RGB arithmetic families
+  pack into BGR(A) — accept `Bgr24` / `Bgra32`) + §2.4 +
+  `spec/03` §6.1 (the YV12 family accepts `Yv12` only — planar Y
+  / V / U region concatenation) + `spec/03` §6.2 (YUY2 accepts
+  `Yuy2` only — packed Y0 U Y1 V macropixels). Mirrors the round-
+  245 `PixelKind` partition on the frame-type axis. 5 new unit
+  tests pin the full 11×4 acceptance table per (frame_type,
+  pixel_kind) pair (`frame_type_accepts_pixel_kind_table`), non-
+  emptiness (every frame type accepts at least one pixel kind —
+  no structurally-unreachable frame types,
+  `frame_type_accepts_pixel_kind_non_empty`), element-wise
+  consistency between the two new accessors
+  (`frame_type_accepts_pixel_kind_consistent_with_compatible_set`),
+  the exact slice sequence returned by `compatible_pixel_kinds`
+  so iteration order is part of the public contract
+  (`frame_type_compatible_pixel_kinds_exact_sequence`), and
+  alignment with the existing `is_planar_yv12` / `is_packed_yuy2`
+  / `is_packed_rgb` / `is_solid` sub-classifiers
+  (`frame_type_accepts_pixel_kind_aligns_with_yuv_subclassifiers`).
+  Brings the total unit-test count from 276 to **281**.
+
 - round 250 — **typed `ChannelHeader` structural accessors on the
   modern per-plane channel-header byte.** Extends the public
   `ChannelHeader` enum with `freq_table_offset() -> Option<usize>`

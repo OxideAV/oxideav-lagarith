@@ -1,6 +1,7 @@
 //! Frame-type byte parsing + per-frame channel-offset table layout
 //! per `spec/01` §1 / §2.
 
+use crate::decoder::PixelKind;
 use crate::error::{Error, Result};
 
 /// Recognised frame types this build's decoder accepts. Round 3 adds
@@ -210,6 +211,111 @@ impl FrameType {
     /// (size `0`).
     pub fn channel_offset_table_size(self) -> usize {
         self.prefix_size() - 1
+    }
+
+    /// `true` if this frame type accepts the given host
+    /// [`PixelKind`] at decode time. The compatibility relation
+    /// is anchored in `spec/01` §2.1 (uncompressed payload is
+    /// format-agnostic), `spec/01` §2.2.1 (solid frames target
+    /// the Windows `BI_RGB` 24-bpp or 32-bpp DIB buffer), and
+    /// `spec/03` §6.1 / §6.2 (YV12 / YUY2 wire forms target their
+    /// matching host planar / packed pixel kinds):
+    ///
+    /// | Frame type | Accepted [`PixelKind`] set |
+    /// | ---------- | -------------------------- |
+    /// | [`Uncompressed`](Self::Uncompressed) (1) | all four — `Bgr24`, `Bgra32`, `Yv12`, `Yuy2` (the wire body is the host pixel buffer verbatim — `spec/01` §2.1 "RGB24 / RGB32 / RGBA / YUY2 / YV12 with no Lagarith transformation applied"). |
+    /// | [`SolidGrey`](Self::SolidGrey) (5) / [`SolidRgb`](Self::SolidRgb) (6) / [`SolidRgba`](Self::SolidRgba) (9) | `Bgr24` / `Bgra32` only (`spec/01` §2.2.1 BGR memory order — the proprietary's solid-fill helper at `lagarith.dll!0x1800049e0` targets the host BGR(A) memory layout). |
+    /// | [`UnalignedRgb24`](Self::UnalignedRgb24) (2) / [`ArithmeticRgb24`](Self::ArithmeticRgb24) (4) / [`LegacyRgb`](Self::LegacyRgb) (7) / [`ArithmeticRgba`](Self::ArithmeticRgba) (8) | `Bgr24` / `Bgra32` only — the four packed-RGB arithmetic families pack the per-plane decode output into the host BGR(A) buffer per `spec/01` §2.3. |
+    /// | [`ArithmeticYv12`](Self::ArithmeticYv12) (10) / [`ReducedResYv12`](Self::ReducedResYv12) (11) | `Yv12` only — `spec/03` §6.1 + `spec/01` §2.4 (the type-11 wire body is a half-W / half-H YV12 form, upscaled into the host YV12 buffer at decode time). |
+    /// | [`ArithmeticYuy2`](Self::ArithmeticYuy2) (3) | `Yuy2` only — `spec/03` §6.2 packed `Y0 U Y1 V` macropixel layout. |
+    ///
+    /// This is the predicate the per-frame-type decoders enforce
+    /// at function entry — the literal pixel-kind matches in
+    /// `decoder::decode_arith_yv12` / `decode_arith_yuy2` /
+    /// `decode_reduced_res` and the `PixelKind::bytes_per_pixel`
+    /// (`packed_bpp`) gate in `decoder::decode_solid` /
+    /// `decode_arith_rgb` / `decode_arith_rgba` /
+    /// `decode_legacy_rgb` collectively realise this relation.
+    /// The new accessor lets downstream callers introspect the
+    /// compatibility relation without re-running the dispatcher
+    /// or interrogating the dispatcher's
+    /// [`Error::PixelFormatMismatch`](crate::error::Error::PixelFormatMismatch)
+    /// surface; structurally it mirrors the
+    /// [`PixelKind::bytes_per_pixel`] / [`PixelKind::is_planar`] /
+    /// [`PixelKind::is_packed`] partition (round 245) on the
+    /// frame-type axis.
+    pub fn accepts_pixel_kind(self, pixel_kind: PixelKind) -> bool {
+        match self {
+            // §2.1: uncompressed wire payload is the source pixel
+            // buffer in its source layout with no transformation —
+            // all four host pixel kinds are valid targets.
+            Self::Uncompressed => true,
+            // §2.2.1: solid-colour frames target Windows BGR(A)
+            // memory order via `lagarith.dll!0x1800049e0`. The
+            // packed-bpp gate in `decoder::decode_solid` rejects
+            // `Yv12` / `Yuy2` up-front.
+            Self::SolidGrey | Self::SolidRgb | Self::SolidRgba => pixel_kind.is_rgb_family(),
+            // §2.3: the four packed-RGB arithmetic families pack
+            // the per-plane output into BGR(A); the
+            // `packed_bpp().ok_or(PixelFormatMismatch)` gate in
+            // each decoder mirrors this.
+            Self::UnalignedRgb24
+            | Self::ArithmeticRgb24
+            | Self::LegacyRgb
+            | Self::ArithmeticRgba => pixel_kind.is_rgb_family(),
+            // §6.1 + §2.4: the YV12 wire families target the YV12
+            // planar host buffer only.
+            Self::ArithmeticYv12 | Self::ReducedResYv12 => matches!(pixel_kind, PixelKind::Yv12),
+            // §6.2: the YUY2 wire family targets the YUY2 packed
+            // host buffer only.
+            Self::ArithmeticYuy2 => matches!(pixel_kind, PixelKind::Yuy2),
+        }
+    }
+
+    /// The list of host [`PixelKind`] values this frame type
+    /// accepts at decode time — the structural inverse of
+    /// [`accepts_pixel_kind`](Self::accepts_pixel_kind).
+    ///
+    /// Returns one of:
+    ///
+    /// * All four (`Bgr24` / `Bgra32` / `Yv12` / `Yuy2`) for
+    ///   [`Uncompressed`](Self::Uncompressed) (`spec/01` §2.1).
+    /// * The two-element RGB-family slice (`Bgr24` / `Bgra32`)
+    ///   for the three solid types (5 / 6 / 9, `spec/01` §2.2.1)
+    ///   and the four packed-RGB arithmetic types (2 / 4 / 7 / 8,
+    ///   `spec/01` §2.3).
+    /// * The single-element `Yv12` slice for [`ArithmeticYv12`](Self::ArithmeticYv12)
+    ///   (10) and [`ReducedResYv12`](Self::ReducedResYv12) (11)
+    ///   (`spec/03` §6.1 + `spec/01` §2.4).
+    /// * The single-element `Yuy2` slice for
+    ///   [`ArithmeticYuy2`](Self::ArithmeticYuy2) (3)
+    ///   (`spec/03` §6.2).
+    ///
+    /// The returned slice's element-wise membership coincides
+    /// exactly with [`accepts_pixel_kind`](Self::accepts_pixel_kind)
+    /// returning `true` on every accepted [`PixelKind`] — a
+    /// structural invariant pinned by
+    /// `frame_type_accepts_pixel_kind_consistent_with_compatible_set`.
+    pub fn compatible_pixel_kinds(self) -> &'static [PixelKind] {
+        const ALL: &[PixelKind] = &[
+            PixelKind::Bgr24,
+            PixelKind::Bgra32,
+            PixelKind::Yv12,
+            PixelKind::Yuy2,
+        ];
+        const RGB: &[PixelKind] = &[PixelKind::Bgr24, PixelKind::Bgra32];
+        const YV12_ONLY: &[PixelKind] = &[PixelKind::Yv12];
+        const YUY2_ONLY: &[PixelKind] = &[PixelKind::Yuy2];
+        match self {
+            Self::Uncompressed => ALL,
+            Self::SolidGrey | Self::SolidRgb | Self::SolidRgba => RGB,
+            Self::UnalignedRgb24
+            | Self::ArithmeticRgb24
+            | Self::LegacyRgb
+            | Self::ArithmeticRgba => RGB,
+            Self::ArithmeticYv12 | Self::ReducedResYv12 => YV12_ONLY,
+            Self::ArithmeticYuy2 => YUY2_ONLY,
+        }
     }
 }
 
@@ -642,6 +748,167 @@ mod tests {
                 0,
                 "{ft:?} offset-table should be 0"
             );
+        }
+    }
+
+    /// `accepts_pixel_kind` matches the per-frame-type decoder
+    /// gates: uncompressed accepts all four host pixel kinds
+    /// (`spec/01` §2.1 "RGB24 / RGB32 / RGBA / YUY2 / YV12"),
+    /// the three solid types (5 / 6 / 9) and four packed-RGB
+    /// arithmetic types (2 / 4 / 7 / 8) accept BGR-family only
+    /// (`spec/01` §2.2.1 + §2.3), the two YV12-family types (10 /
+    /// 11) accept `Yv12` only (`spec/03` §6.1 + `spec/01` §2.4),
+    /// and YUY2 (3) accepts `Yuy2` only (`spec/03` §6.2).
+    #[test]
+    fn frame_type_accepts_pixel_kind_table() {
+        // Uncompressed accepts everything.
+        for pk in PixelKind::all() {
+            assert!(
+                FrameType::Uncompressed.accepts_pixel_kind(pk),
+                "Uncompressed should accept {pk:?}",
+            );
+        }
+        // Solid + packed-RGB arithmetic: BGR(A) only.
+        let rgb_only = [
+            FrameType::SolidGrey,
+            FrameType::SolidRgb,
+            FrameType::SolidRgba,
+            FrameType::UnalignedRgb24,
+            FrameType::ArithmeticRgb24,
+            FrameType::LegacyRgb,
+            FrameType::ArithmeticRgba,
+        ];
+        for ft in rgb_only {
+            assert!(ft.accepts_pixel_kind(PixelKind::Bgr24), "{ft:?} Bgr24");
+            assert!(ft.accepts_pixel_kind(PixelKind::Bgra32), "{ft:?} Bgra32");
+            assert!(!ft.accepts_pixel_kind(PixelKind::Yv12), "{ft:?} Yv12");
+            assert!(!ft.accepts_pixel_kind(PixelKind::Yuy2), "{ft:?} Yuy2");
+        }
+        // YV12 / Reduced-Res: Yv12 only.
+        for ft in [FrameType::ArithmeticYv12, FrameType::ReducedResYv12] {
+            assert!(!ft.accepts_pixel_kind(PixelKind::Bgr24), "{ft:?} Bgr24");
+            assert!(!ft.accepts_pixel_kind(PixelKind::Bgra32), "{ft:?} Bgra32");
+            assert!(ft.accepts_pixel_kind(PixelKind::Yv12), "{ft:?} Yv12");
+            assert!(!ft.accepts_pixel_kind(PixelKind::Yuy2), "{ft:?} Yuy2");
+        }
+        // YUY2: Yuy2 only.
+        assert!(!FrameType::ArithmeticYuy2.accepts_pixel_kind(PixelKind::Bgr24));
+        assert!(!FrameType::ArithmeticYuy2.accepts_pixel_kind(PixelKind::Bgra32));
+        assert!(!FrameType::ArithmeticYuy2.accepts_pixel_kind(PixelKind::Yv12));
+        assert!(FrameType::ArithmeticYuy2.accepts_pixel_kind(PixelKind::Yuy2));
+    }
+
+    /// Every accepted (frame-type byte, pixel-kind) pair has at
+    /// least one acceptance: `accepts_pixel_kind` returns `true`
+    /// for **at least one** [`PixelKind`] on every frame-type byte
+    /// in the legal `1..=11` set — no frame type is structurally
+    /// unreachable from the host-buffer side.
+    #[test]
+    fn frame_type_accepts_pixel_kind_non_empty() {
+        for b in 1u8..=11 {
+            let ft = FrameType::from_byte(b).unwrap();
+            let any = PixelKind::all().iter().any(|&pk| ft.accepts_pixel_kind(pk));
+            assert!(
+                any,
+                "{ft:?} must accept at least one PixelKind (no orphan frame type)",
+            );
+        }
+    }
+
+    /// `compatible_pixel_kinds` returns the exact element-wise
+    /// set of [`PixelKind`] values for which
+    /// [`accepts_pixel_kind`](FrameType::accepts_pixel_kind)
+    /// returns `true`. Together the two accessors are
+    /// equivalent classifiers — one slice-shaped, the other
+    /// predicate-shaped — and disagree on no input.
+    #[test]
+    fn frame_type_accepts_pixel_kind_consistent_with_compatible_set() {
+        for b in 1u8..=11 {
+            let ft = FrameType::from_byte(b).unwrap();
+            let compat = ft.compatible_pixel_kinds();
+            for pk in PixelKind::all() {
+                let in_set = compat.contains(&pk);
+                let accepted = ft.accepts_pixel_kind(pk);
+                assert_eq!(
+                    in_set, accepted,
+                    "{ft:?} / {pk:?}: compatible_pixel_kinds.contains == accepts_pixel_kind must hold",
+                );
+            }
+        }
+    }
+
+    /// `compatible_pixel_kinds` returns the exact slice expected
+    /// by `spec/01` §2.1 / §2.2.1 / §2.3 / §2.4 + `spec/03` §6.1
+    /// / §6.2: all four for Uncompressed, BGR(A) for solid /
+    /// packed-RGB arithmetic, single-element `Yv12` for the YV12
+    /// family, single-element `Yuy2` for YUY2. Pins the exact
+    /// element sequence (not just contains) so downstream
+    /// iteration order is part of the public contract.
+    #[test]
+    fn frame_type_compatible_pixel_kinds_exact_sequence() {
+        assert_eq!(
+            FrameType::Uncompressed.compatible_pixel_kinds(),
+            &[
+                PixelKind::Bgr24,
+                PixelKind::Bgra32,
+                PixelKind::Yv12,
+                PixelKind::Yuy2,
+            ],
+        );
+        for ft in [
+            FrameType::SolidGrey,
+            FrameType::SolidRgb,
+            FrameType::SolidRgba,
+            FrameType::UnalignedRgb24,
+            FrameType::ArithmeticRgb24,
+            FrameType::LegacyRgb,
+            FrameType::ArithmeticRgba,
+        ] {
+            assert_eq!(
+                ft.compatible_pixel_kinds(),
+                &[PixelKind::Bgr24, PixelKind::Bgra32],
+                "{ft:?} compatible_pixel_kinds must be [Bgr24, Bgra32]",
+            );
+        }
+        for ft in [FrameType::ArithmeticYv12, FrameType::ReducedResYv12] {
+            assert_eq!(
+                ft.compatible_pixel_kinds(),
+                &[PixelKind::Yv12],
+                "{ft:?} compatible_pixel_kinds must be [Yv12]",
+            );
+        }
+        assert_eq!(
+            FrameType::ArithmeticYuy2.compatible_pixel_kinds(),
+            &[PixelKind::Yuy2],
+        );
+    }
+
+    /// `accepts_pixel_kind` aligns with the existing
+    /// `is_planar_yv12` / `is_packed_yuy2` predicates on the YUV
+    /// frame families: a frame type is `is_planar_yv12` iff its
+    /// compatible set is exactly `[Yv12]`, and is `is_packed_yuy2`
+    /// iff its compatible set is exactly `[Yuy2]`.
+    #[test]
+    fn frame_type_accepts_pixel_kind_aligns_with_yuv_subclassifiers() {
+        for b in 1u8..=11 {
+            let ft = FrameType::from_byte(b).unwrap();
+            let compat = ft.compatible_pixel_kinds();
+            if ft.is_planar_yv12() {
+                assert_eq!(compat, &[PixelKind::Yv12], "{ft:?} planar-YV12");
+            }
+            if ft.is_packed_yuy2() {
+                assert_eq!(compat, &[PixelKind::Yuy2], "{ft:?} packed-YUY2");
+            }
+            // RGB-family arithmetic types and solid types are all
+            // packed-RGB targets; their compatible set is the BGR(A)
+            // pair.
+            if ft.is_packed_rgb() || ft.is_solid() {
+                assert_eq!(
+                    compat,
+                    &[PixelKind::Bgr24, PixelKind::Bgra32],
+                    "{ft:?} packed-RGB / solid",
+                );
+            }
         }
     }
 

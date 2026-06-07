@@ -5,6 +5,37 @@ Pure-Rust Lagarith lossless video codec for the
 
 ## Status
 
+**Round 253 — typed `FrameType` × `PixelKind` compatibility relation
+accessor.** Extends the public `FrameType` enum (rounds 242 / 245)
+with `accepts_pixel_kind(PixelKind) -> bool` and a complementary
+`compatible_pixel_kinds() -> &'static [PixelKind]` slice accessor
+anchored in `spec/01` §2.1 / §2.2.1 / §2.3 / §2.4 + `spec/03` §6.1 /
+§6.2. The compatibility table — uncompressed (type 1) accepts all
+four host pixel kinds (`spec/01` §2.1's "RGB24 / RGB32 / RGBA / YUY2
+/ YV12 with no Lagarith transformation applied"); the three solid
+types (5 / 6 / 9) and four packed-RGB arithmetic types (2 / 4 / 7 /
+8) accept the BGR-family pair (`Bgr24` / `Bgra32`, `spec/01` §2.2.1
++ §2.3); the YV12 family (10 / 11) accepts `Yv12` only (`spec/03`
+§6.1 + `spec/01` §2.4); YUY2 (3) accepts `Yuy2` only (`spec/03`
+§6.2) — is the predicate the per-frame-type decoders already enforce
+at function entry, via the literal pixel-kind matches in
+`decode_arith_yv12` / `decode_arith_yuy2` / `decode_reduced_res` and
+the `PixelKind::bytes_per_pixel` (`packed_bpp`) gate in
+`decode_solid` / `decode_arith_rgb` / `decode_arith_rgba` /
+`decode_legacy_rgb`. The new accessor lets downstream callers
+introspect the relation without re-running the dispatcher or
+interrogating `Error::PixelFormatMismatch` failures, and structurally
+mirrors the round-245 `PixelKind` partition (`is_rgb_family` /
+`is_yuv_family` / `is_packed` / `is_planar` / `has_alpha` /
+`bytes_per_pixel`) on the frame-type axis. 5 new unit tests pin the
+full 11 × 4 acceptance table per (frame_type, pixel_kind) pair,
+non-emptiness (every frame type accepts at least one pixel kind —
+no orphan rows), element-wise consistency between the two accessors,
+the exact slice sequence returned by `compatible_pixel_kinds` (so
+iteration order is part of the public contract), and alignment with
+the existing `is_planar_yv12` / `is_packed_yuy2` / `is_packed_rgb`
+sub-classifiers. Brings the total unit-test count from 276 to **281**.
+
 **Round 250 — typed `ChannelHeader` structural accessors on the
 modern per-plane channel-header byte.** Extends the public
 `ChannelHeader` enum (rounds 236 / 242) with two new structural
