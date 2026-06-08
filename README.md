@@ -5,6 +5,35 @@ Pure-Rust Lagarith lossless video codec for the
 
 ## Status
 
+**Round 257 — typed `LegacyChannelHeader::prefix_size` accessor.**
+Extends the public `LegacyChannelHeader` enum (round 239) with a
+structural `prefix_size` accessor returning the byte count the
+legacy (type-7) channel-data dispatcher consumes for header /
+metadata fields before the wire body proper begins: `2` for
+`BareFib` (outer header byte at offset 0 + inner codec-mode flag
+byte at offset 1 per `spec/07` §1.3 final paragraph + §2.5 second
+blockquote) and `5` for `RleThenFib` (outer header byte +
+4-byte LE u32 post-RLE length field at offsets 1..5 per `spec/07`
+§2.1 second bullet + §2.3 / §2.4). Equals the existing
+`freq_table_offset` on every legacy variant — every legacy
+channel-header form carries a Fibonacci-coded frequency table
+(directly on `BareFib`; via the post-RLE intermediate buffer on
+`RleThenFib`), so the wire body the dispatcher reads next always
+begins at the freq-table input-byte offset. Mirrors the round-250
+`ChannelHeader::prefix_size` on the modern channel-header byte so
+the modern and legacy channel-header wire-form classifiers expose
+the same structural surface, and mirrors `FrameType::prefix_size`
+at the channel level; together the two `prefix_size` accessors let
+downstream callers compute byte offsets through both prefix layers
+(frame-level channel-offset table + per-channel header machinery)
+of the type-7 legacy decode path without re-running the dispatcher.
+3 new unit tests pin the per-byte values across the four-element
+accepted set `{0x00, 0x01, 0x02, 0x03}`, equality of `prefix_size`
+and `freq_table_offset` on every legacy variant, and cross-form
+agreement on the RLE sub-path (modern `ArithRle(h)` and legacy
+`RleThenFib(h)` both report `prefix_size = 5`). Brings the total
+unit-test count from 281 to **284**.
+
 **Round 253 — typed `FrameType` × `PixelKind` compatibility relation
 accessor.** Extends the public `FrameType` enum (rounds 242 / 245)
 with `accepts_pixel_kind(PixelKind) -> bool` and a complementary

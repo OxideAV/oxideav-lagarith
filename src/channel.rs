@@ -330,6 +330,60 @@ impl LegacyChannelHeader {
             Self::RleThenFib { .. } => 5,
         }
     }
+
+    /// Channel-prefix size in bytes — the number of leading bytes
+    /// of the channel data that the legacy (type-7) dispatcher
+    /// consumes for header / metadata fields before the wire body
+    /// proper begins.
+    ///
+    /// Per `spec/07` §1.3 + §2.1:
+    ///
+    /// * `2` for [`BareFib`](Self::BareFib) — outer channel-header
+    ///   byte at offset 0 + inner codec-mode flag byte at offset 1
+    ///   (`spec/07` §1.3 final paragraph + §2.5 second blockquote;
+    ///   the proprietary's histogram-and-CDF builder at
+    ///   `lagarith.dll!0x180001f60` consumes the inner flag byte
+    ///   before reading the Fibonacci-coded frequency table that
+    ///   begins at channel-data byte 2).
+    /// * `5` for [`RleThenFib`](Self::RleThenFib) — outer
+    ///   channel-header byte at offset 0 + 4-byte little-endian
+    ///   u32 post-RLE length field at offsets 1..5 (`spec/07` §2.1
+    ///   second bullet + §2.3 / §2.4; the RLE-compressed
+    ///   Fibonacci-coded frequency-table input bytes begin at
+    ///   channel-data byte 5).
+    ///
+    /// On both legacy variants the value equals
+    /// [`freq_table_offset`](Self::freq_table_offset): every
+    /// legacy channel-header form carries a Fibonacci-coded
+    /// frequency table (directly on the `BareFib` path; via the
+    /// post-RLE intermediate buffer on the `RleThenFib` path), so
+    /// the wire body the dispatcher reads next always begins at
+    /// the freq-table input-byte offset. The two accessors are
+    /// thus interchangeable on the legacy path but kept as two
+    /// distinct names so callers reasoning about the channel
+    /// layout structurally — and callers reasoning about the
+    /// Fibonacci-decode entry point semantically — see the same
+    /// surface as on the modern path
+    /// ([`ChannelHeader::prefix_size`] /
+    /// [`ChannelHeader::freq_table_offset`]).
+    ///
+    /// Mirrors [`ChannelHeader::prefix_size`] — the modern
+    /// channel-header byte exposes the same accessor name at the
+    /// channel level so callers can compute channel-data offsets
+    /// uniformly across the two wire forms. Mirrors
+    /// [`FrameType::prefix_size`](crate::frame::FrameType::prefix_size)
+    /// — the frame-level channel-offset-table prefix size — at
+    /// the channel-prefix level; together the two `prefix_size`
+    /// accessors let downstream callers compute byte offsets
+    /// through both prefix layers (frame-level + channel-level)
+    /// of the type-7 legacy decode without re-running the
+    /// dispatcher.
+    pub fn prefix_size(self) -> usize {
+        match self {
+            Self::BareFib => 2,
+            Self::RleThenFib { .. } => 5,
+        }
+    }
 }
 
 /// Decode one channel into a `Vec<u8>` of `n_pixels` residuals.
@@ -753,6 +807,67 @@ mod tests {
             let lc = LegacyChannelHeader::from_byte(b).unwrap();
             assert_eq!(lc.to_byte(), b);
             assert_eq!(LegacyChannelHeader::from_byte(lc.to_byte()).unwrap(), lc);
+        }
+    }
+
+    /// `LegacyChannelHeader::prefix_size` matches `spec/07` §1.3 +
+    /// §2.1: 2 bytes for `BareFib` (outer header byte + inner
+    /// codec-mode flag byte) and 5 bytes for `RleThenFib` (outer
+    /// header byte + 4-byte u32 LE post-RLE length field). Pinned
+    /// per-byte across the full four-element accepted set
+    /// `{0x00, 0x01, 0x02, 0x03}`.
+    #[test]
+    fn legacy_channel_header_prefix_size() {
+        assert_eq!(
+            LegacyChannelHeader::from_byte(0x00).unwrap().prefix_size(),
+            2,
+            "BareFib (0x00) prefix is outer header + inner codec-mode flag = 2 bytes",
+        );
+        for h in 0x01u8..=0x03 {
+            assert_eq!(
+                LegacyChannelHeader::from_byte(h).unwrap().prefix_size(),
+                5,
+                "RleThenFib (escape_len={h}) prefix is outer header + u32 LE length = 5 bytes",
+            );
+        }
+    }
+
+    /// On the legacy (type-7) path the wire body the dispatcher
+    /// reads next is always the Fibonacci-coded frequency-table
+    /// input bytes — directly on the `BareFib` path; via the
+    /// post-RLE intermediate buffer on the `RleThenFib` path.
+    /// `prefix_size` must therefore equal `freq_table_offset` on
+    /// every accepted variant.
+    #[test]
+    fn legacy_channel_header_prefix_size_equals_freq_table_offset() {
+        for b in 0x00u8..=0x03 {
+            let lc = LegacyChannelHeader::from_byte(b).unwrap();
+            assert_eq!(
+                lc.prefix_size(),
+                lc.freq_table_offset(),
+                "byte 0x{b:02x}: prefix_size must equal freq_table_offset on every legacy variant",
+            );
+        }
+    }
+
+    /// `LegacyChannelHeader::prefix_size` reports the same value on
+    /// the `RleThenFib` variant as `ChannelHeader::prefix_size` on
+    /// the modern `ArithRle` variant — both are the
+    /// header + 4-byte u32 length field, 5 bytes total. The two
+    /// wire forms parallel each other at the channel-prefix level
+    /// even though the legacy set lacks the modern raw / raw-RLE /
+    /// constant-fill sub-paths (`spec/03` §2.1 + `spec/07` §2.1).
+    #[test]
+    fn legacy_and_modern_prefix_size_agree_on_rle_subpath() {
+        for h in 0x01u8..=0x03 {
+            let modern_arith_rle = ChannelHeader::from_byte(h).unwrap();
+            let legacy_rle_then_fib = LegacyChannelHeader::from_byte(h).unwrap();
+            assert_eq!(
+                modern_arith_rle.prefix_size(),
+                legacy_rle_then_fib.prefix_size(),
+                "modern ArithRle(0x{h:02x}) and legacy RleThenFib(0x{h:02x}) must share prefix_size",
+            );
+            assert_eq!(modern_arith_rle.prefix_size(), 5);
         }
     }
 

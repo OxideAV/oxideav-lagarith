@@ -8,6 +8,34 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- round 257 — **typed `LegacyChannelHeader::prefix_size` accessor.**
+  Extends the public `LegacyChannelHeader` enum with a structural
+  `prefix_size` accessor returning the byte count the legacy
+  (type-7) channel-data dispatcher consumes for header / metadata
+  fields before the wire body proper begins: `2` for `BareFib`
+  (outer header byte at offset 0 + inner codec-mode flag byte at
+  offset 1 per `spec/07` §1.3 final paragraph + §2.5 second
+  blockquote) and `5` for `RleThenFib` (outer header byte + 4-byte
+  LE u32 post-RLE length field at offsets 1..5 per `spec/07` §2.1
+  second bullet + §2.3 / §2.4). Equals the existing
+  `freq_table_offset` on every legacy variant — every legacy
+  channel-header form carries a Fibonacci-coded frequency table
+  (directly on `BareFib`; via the post-RLE intermediate buffer on
+  `RleThenFib`), so the wire body the dispatcher reads next always
+  begins at the freq-table input-byte offset. Mirrors round-250
+  `ChannelHeader::prefix_size` on the modern channel-header byte so
+  the modern and legacy channel-header wire-form classifiers expose
+  the same structural surface, and mirrors `FrameType::prefix_size`
+  at the channel level. 3 new unit tests pin the per-byte values
+  across the four-element accepted set
+  (`legacy_channel_header_prefix_size`), equality of `prefix_size`
+  and `freq_table_offset` on every legacy variant
+  (`legacy_channel_header_prefix_size_equals_freq_table_offset`),
+  and cross-form agreement on the RLE sub-path (modern `ArithRle(h)`
+  and legacy `RleThenFib(h)` both report `prefix_size = 5`,
+  `legacy_and_modern_prefix_size_agree_on_rle_subpath`). Brings the
+  total unit-test count from 281 to **284**.
+
 - round 253 — **typed `FrameType` × `PixelKind` compatibility
   relation accessor.** Extends the public `FrameType` enum with
   `accepts_pixel_kind(PixelKind) -> bool` (the predicate the per-
