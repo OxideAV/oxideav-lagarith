@@ -5,6 +5,35 @@ Pure-Rust Lagarith lossless video codec for the
 
 ## Status
 
+**Round 261 — typed `FrameType::has_alpha_plane` accessor on the
+outermost wire byte.** Extends the public `FrameType` enum (rounds
+242 / 253) with `has_alpha_plane() -> bool` returning `true` exactly
+for the two RGBA frame types — `ArithmeticRgba` (8) and `SolidRgba`
+(9), anchored in `spec/01` §2.2 row 9 + §2.3 row 8 + `spec/03` §4.3.
+Type 8 splits four planes (R / G / B / A) with the alpha plane
+decoded independently (left predictor on row 0, JPEG-LS median on
+rows ≥ 1) and no cross-plane decorrelation against G; type 9 carries
+exactly four colour bytes (R / G / B / A) replicated to fill the
+host BGRA buffer. Type 1 (Uncompressed) is excluded — its wire body
+is the source pixel buffer in its source layout per `spec/01` §2.1
+"RGB24 / RGB32 / RGBA / YUY2 / YV12 with no Lagarith transformation
+applied", so the presence of an alpha byte is a host-format
+property, not a frame-type property; the three solid-RGB types (5
+grey, 6 RGB) are excluded per `spec/03` §4 third bullet ("RGB32 has
+no alpha plane on the wire", filled to the constant `0xff` at
+`lagarith.dll!0x180009486`); the YUV families (3 YUY2, 10 YV12, 11
+reduced-res) are excluded per `spec/03` §4.4. Mirrors
+`PixelKind::has_alpha` (round 245) on the frame-type axis:
+`PixelKind::has_alpha` reports whether the host buffer reserves an
+alpha byte per pixel; this new accessor reports whether the wire
+form supplies one. 4 new unit tests pin the per-byte positive set
+across the full 1..=11 byte range, structural equivalence with
+`n_channels() == 4` on the arithmetic-type subset, the one-direction
+implication `has_alpha_plane => accepts(Bgra32) && Bgra32 ∈
+compatible_pixel_kinds`, and disjointness with the planar / packed
+YUV sub-classifiers. Brings the total unit-test count from 284 to
+**288**.
+
 **Round 257 — typed `LegacyChannelHeader::prefix_size` accessor.**
 Extends the public `LegacyChannelHeader` enum (round 239) with a
 structural `prefix_size` accessor returning the byte count the

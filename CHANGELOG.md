@@ -8,6 +8,39 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- round 261 — **typed `FrameType::has_alpha_plane` accessor on the
+  outermost wire byte.** Extends the public `FrameType` enum
+  (rounds 242 / 253) with `has_alpha_plane() -> bool` returning
+  `true` exactly for the two RGBA frame types — `ArithmeticRgba`
+  (8) and `SolidRgba` (9). Type 8 (`spec/01` §2.3 row 8 +
+  `spec/03` §4.3) splits four planes (R / G / B / A) on the wire
+  with the alpha plane decoded independently (left predictor on
+  row 0, JPEG-LS median on rows ≥ 1) and no cross-plane
+  decorrelation against G; type 9 (`spec/01` §2.2 row 9) carries
+  exactly four colour bytes (R / G / B / A) replicated to fill
+  the host BGRA buffer. Type 1 (Uncompressed) is excluded — its
+  wire body is the source pixel buffer in its source layout per
+  `spec/01` §2.1, so the presence of an alpha byte is a host-
+  format property; the three solid-RGB types (5 grey, 6 RGB)
+  are excluded per `spec/03` §4 third bullet ("RGB32 has no
+  alpha plane on the wire", filled to the constant `0xff` by
+  `lagarith.dll!0x180009486`); types 3 / 10 / 11 are excluded
+  per `spec/03` §4.4 (YUY2 / YV12 carry no alpha plane). Mirrors
+  `PixelKind::has_alpha` (round 245) on the frame-type axis:
+  `PixelKind::has_alpha` reports whether the host buffer reserves
+  an alpha byte per pixel, this new accessor reports whether the
+  wire form supplies one. 4 new unit tests pin the per-byte
+  positive set across the full 1..=11 byte range
+  (`frame_type_has_alpha_plane`), structural equivalence with
+  `n_channels() == 4` on the arithmetic-type subset
+  (`frame_type_has_alpha_plane_implies_four_channels_on_arithmetic_set`),
+  the one-direction implication
+  `has_alpha_plane => accepts(Bgra32) && Bgra32 ∈ compatible_pixel_kinds`
+  (`frame_type_has_alpha_plane_implies_bgra32_compatible`), and
+  disjointness with the planar / packed YUV sub-classifiers
+  (`frame_type_has_alpha_plane_disjoint_from_yuv_families`).
+  Brings the total unit-test count from 284 to **288**.
+
 - round 257 — **typed `LegacyChannelHeader::prefix_size` accessor.**
   Extends the public `LegacyChannelHeader` enum with a structural
   `prefix_size` accessor returning the byte count the legacy

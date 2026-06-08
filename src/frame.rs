@@ -162,6 +162,52 @@ impl FrameType {
         )
     }
 
+    /// `true` for the frame types whose wire form carries an
+    /// explicit alpha plane / alpha byte — exactly the two RGBA
+    /// frame types: [`ArithmeticRgba`](Self::ArithmeticRgba) (8) and
+    /// [`SolidRgba`](Self::SolidRgba) (9).
+    ///
+    /// Type 8 (`spec/01` §2.3 row 8 + `spec/03` §4.3) splits four
+    /// planes (R / G / B / A) on the wire; the alpha plane is
+    /// decoded independently (left predictor on row 0, JPEG-LS
+    /// median on rows ≥ 1) with **no** cross-plane decorrelation
+    /// against G (only R and B receive the post-prediction
+    /// `+= G` correction). Type 9 (`spec/01` §2.2 row 9) is the
+    /// solid-RGBA literal frame whose wire payload is exactly
+    /// four colour bytes (R / G / B / A) replicated to fill the
+    /// host BGR(A) buffer.
+    ///
+    /// Type 1 ([`Uncompressed`](Self::Uncompressed)) is **excluded**
+    /// even though a Bgra32 host buffer requested at decode time
+    /// will carry an alpha byte per pixel: the type-1 wire body is
+    /// the source pixel buffer in its source layout per `spec/01`
+    /// §2.1 ("RGB24 / RGB32 / RGBA / YUY2 / YV12 with no Lagarith
+    /// transformation applied"), so the presence of an alpha byte
+    /// on the wire is a host-format property, not a frame-type
+    /// property — there is no Lagarith-coded "alpha plane" on the
+    /// wire to speak of. The three solid-RGB types (5 grey, 6 RGB)
+    /// are also excluded because their wire payload is 1 / 3 colour
+    /// bytes respectively (`spec/01` §2.2.2) and the host BGRA
+    /// buffer's alpha byte is filled by an immediate-byte store
+    /// at `lagarith.dll!0x180009486` to the constant `0xff`
+    /// (`spec/03` §4 third bullet: "since RGB32 has no alpha plane
+    /// on the wire"). Every other frame type (2 / 3 / 4 / 7 / 10 /
+    /// 11) is similarly RGB / YV12 / YUY2 on the wire — no alpha.
+    ///
+    /// Returns the same set as `n_channels() == 4` for the two
+    /// frame types whose `n_channels` is defined (a structural
+    /// invariant pinned by
+    /// `frame_type_has_alpha_plane_implies_four_channels` for
+    /// arithmetic types and by exhaustive enumeration for the solid
+    /// type whose `n_channels` returns 0 by the existing convention).
+    /// Mirrors [`PixelKind::has_alpha`](crate::PixelKind::has_alpha)
+    /// on the frame-type axis: `PixelKind::has_alpha` reports whether
+    /// the host buffer reserves an alpha byte per pixel; this
+    /// accessor reports whether the wire form supplies one.
+    pub fn has_alpha_plane(self) -> bool {
+        matches!(self, Self::ArithmeticRgba | Self::SolidRgba)
+    }
+
     /// `true` for the 64-bit-encoder-produced frame types per
     /// `spec/01` §3 (encoder-side cross-check). The 64-bit encoder
     /// emits types 2, 3, 4, 5, 6, 8, 9, and 10; it **does not**
@@ -950,5 +996,111 @@ mod tests {
         assert_eq!(slices[0], ch0);
         assert_eq!(slices[3], ch3);
         assert_eq!(FrameType::ArithmeticRgba.prefix_size(), 13);
+    }
+
+    /// `has_alpha_plane` matches exactly the two RGBA frame types
+    /// per `spec/01` §2.2 row 9 + §2.3 row 8 + `spec/03` §4.3:
+    /// [`ArithmeticRgba`](FrameType::ArithmeticRgba) (8) and
+    /// [`SolidRgba`](FrameType::SolidRgba) (9). Every other frame
+    /// type in the legal `1..=11` set is on the wire either RGB
+    /// (no alpha plane), YV12 (no alpha plane per `spec/03` §4.4),
+    /// YUY2 (no alpha plane per `spec/03` §4.4), or — for
+    /// [`Uncompressed`](FrameType::Uncompressed) — a host-format-
+    /// dependent raw passthrough where the presence of an alpha
+    /// byte is a host-buffer property, not a wire-form property.
+    #[test]
+    fn frame_type_has_alpha_plane() {
+        let rgba = [FrameType::ArithmeticRgba, FrameType::SolidRgba];
+        for ft in rgba {
+            assert!(
+                ft.has_alpha_plane(),
+                "{ft:?} should report has_alpha_plane (RGBA family)",
+            );
+        }
+        for b in 1u8..=11 {
+            let ft = FrameType::from_byte(b).unwrap();
+            assert_eq!(
+                ft.has_alpha_plane(),
+                rgba.contains(&ft),
+                "{ft:?} has_alpha_plane should match RGBA-family membership",
+            );
+        }
+    }
+
+    /// On every arithmetic frame type (i.e. every type for which
+    /// [`FrameType::n_channels`] is non-zero), `has_alpha_plane`
+    /// agrees with `n_channels() == 4`: the only arithmetic type
+    /// with four wire-coded channels is
+    /// [`ArithmeticRgba`](FrameType::ArithmeticRgba) (8), which is
+    /// also the only arithmetic type carrying an alpha plane on
+    /// the wire (`spec/03` §4.3). Pins the structural equivalence
+    /// of the two accessors on the arithmetic-type subset.
+    #[test]
+    fn frame_type_has_alpha_plane_implies_four_channels_on_arithmetic_set() {
+        for b in 1u8..=11 {
+            let ft = FrameType::from_byte(b).unwrap();
+            if ft.is_arithmetic() {
+                let four_chan = ft.n_channels() == 4;
+                assert_eq!(
+                    ft.has_alpha_plane(),
+                    four_chan,
+                    "{ft:?}: on arithmetic types, has_alpha_plane must equal (n_channels == 4)",
+                );
+            }
+        }
+        // Direct check on the two arithmetic poles.
+        assert!(FrameType::ArithmeticRgba.has_alpha_plane());
+        assert_eq!(FrameType::ArithmeticRgba.n_channels(), 4);
+        assert!(!FrameType::ArithmeticRgb24.has_alpha_plane());
+        assert_eq!(FrameType::ArithmeticRgb24.n_channels(), 3);
+    }
+
+    /// `has_alpha_plane` aligns with `compatible_pixel_kinds` and
+    /// `accepts_pixel_kind` in the expected way: every frame type
+    /// reporting `has_alpha_plane = true` accepts the
+    /// [`Bgra32`](crate::PixelKind::Bgra32) host buffer (so the
+    /// decoded alpha plane has a host-side slot to land in), and
+    /// the RGBA frame types' compatible-pixel-kinds slice always
+    /// contains `Bgra32`. The converse does not hold — many
+    /// non-RGBA frame types also accept `Bgra32` (they pad alpha
+    /// with the constant `0xff` per `spec/03` §4 third bullet) —
+    /// so this is a one-direction implication only.
+    #[test]
+    fn frame_type_has_alpha_plane_implies_bgra32_compatible() {
+        for b in 1u8..=11 {
+            let ft = FrameType::from_byte(b).unwrap();
+            if ft.has_alpha_plane() {
+                assert!(
+                    ft.accepts_pixel_kind(PixelKind::Bgra32),
+                    "{ft:?}: has_alpha_plane => accepts Bgra32 host buffer",
+                );
+                assert!(
+                    ft.compatible_pixel_kinds().contains(&PixelKind::Bgra32),
+                    "{ft:?}: has_alpha_plane => compatible_pixel_kinds contains Bgra32",
+                );
+            }
+        }
+    }
+
+    /// `has_alpha_plane` is disjoint from the planar and packed-
+    /// YUV sub-classifiers per `spec/03` §4.4 (YV12 / YUY2 have
+    /// no alpha plane on the wire). Pins the orthogonality of the
+    /// alpha-plane and YUV-family axes on the public accessor
+    /// surface.
+    #[test]
+    fn frame_type_has_alpha_plane_disjoint_from_yuv_families() {
+        for b in 1u8..=11 {
+            let ft = FrameType::from_byte(b).unwrap();
+            if ft.has_alpha_plane() {
+                assert!(
+                    !ft.is_planar_yv12(),
+                    "{ft:?}: has_alpha_plane and is_planar_yv12 must be disjoint",
+                );
+                assert!(
+                    !ft.is_packed_yuy2(),
+                    "{ft:?}: has_alpha_plane and is_packed_yuy2 must be disjoint",
+                );
+            }
+        }
     }
 }
