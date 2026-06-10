@@ -330,18 +330,20 @@ fn decode_solid(
     pixel_kind: PixelKind,
     shape: SolidShape,
 ) -> Result<DecodedFrame> {
-    let bpp = pixel_kind.packed_bpp().ok_or(Error::PixelFormatMismatch {
-        frame_type: match shape {
-            SolidShape::Grey => 5,
-            SolidShape::Rgb => 6,
-            SolidShape::Rgba => 9,
-        },
-    })?;
-    let need = match shape {
-        SolidShape::Grey => 2,
-        SolidShape::Rgb => 4,
-        SolidShape::Rgba => 5,
+    let frame_type = match shape {
+        SolidShape::Grey => FrameType::SolidGrey,
+        SolidShape::Rgb => FrameType::SolidRgb,
+        SolidShape::Rgba => FrameType::SolidRgba,
     };
+    let bpp = pixel_kind.packed_bpp().ok_or(Error::PixelFormatMismatch {
+        frame_type: frame_type.to_byte(),
+    })?;
+    // `spec/01` §2.2.2 solid-frame total payload size (2 / 4 / 5
+    // bytes); `FrameType::solid_wire_size` is the single source of
+    // truth for the table.
+    let need = frame_type
+        .solid_wire_size()
+        .expect("solid frame types have a fixed wire size");
     if payload.len() < need {
         return Err(Error::Truncated {
             context: "solid-frame colour bytes",

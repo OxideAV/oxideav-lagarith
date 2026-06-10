@@ -8,6 +8,39 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- round 262 — **typed `FrameType` solid-frame wire-size
+  accessors.** Extends the public `FrameType` enum (rounds 242 /
+  253 / 261) with `solid_colour_byte_count() -> Option<usize>`
+  returning the `spec/01` §2.2 bytes-consumed table (`Some(1)` /
+  `Some(3)` / `Some(4)` for types 5 / 6 / 9; wire bytes map to
+  output pixel positions +0.. per `spec/01` §2.2.1's BGR(A)
+  memory convention) and `solid_wire_size() -> Option<usize>`
+  returning the `spec/01` §2.2.2 "Solid-frame total payload
+  sizes" table (`Some(2)` / `Some(4)` / `Some(5)` — the values
+  the proprietary encoder commits to the codec context's
+  compressed-size field at `+0x14` via immediate loads of `0x2`
+  at `lagarith.dll!0x180002c84`, `0x4` at `0x180002ca3`, and
+  `0x5` at `0x180002f88`). Both return `None` on every non-solid
+  frame type (their wire size is input-dependent and determined
+  by the frame chunk size per `spec/01` §2.1 last paragraph), so
+  `is_some()` coincides exactly with `is_solid()`. The decoder's
+  solid-frame minimum-length gate (`decode_solid`'s `need`
+  value) now reads `FrameType::solid_wire_size`, making the
+  typed accessor the single source of truth for the §2.2.2
+  table (round-239 pattern). 4 new unit tests pin the per-byte
+  values of both accessors across the full 1..=11 byte range +
+  the `is_some ⟺ is_solid` coincidence
+  (`frame_type_solid_colour_byte_count`), the structural
+  identity `solid_wire_size = prefix_size +
+  solid_colour_byte_count` on the solid set
+  (`frame_type_solid_wire_size_matches_spec_table`), agreement
+  with the three solid-frame encoder entry points on output
+  length + byte-0 reclassification
+  (`frame_type_solid_wire_size_matches_encoder_output_len`),
+  and the decoder boundary contract — exactly `solid_wire_size`
+  bytes decode, one byte fewer reports `Error::Truncated`
+  (`frame_type_solid_wire_size_is_decoder_minimum_length`).
+  Brings the total unit-test count from 288 to **292**.
 - round 261 — **typed `FrameType::has_alpha_plane` accessor on the
   outermost wire byte.** Extends the public `FrameType` enum
   (rounds 242 / 253) with `has_alpha_plane() -> bool` returning

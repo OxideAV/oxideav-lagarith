@@ -259,6 +259,61 @@ impl FrameType {
         self.prefix_size() - 1
     }
 
+    /// Number of literal colour bytes following the frame-type byte
+    /// for the three solid-colour frame types, per the `spec/01`
+    /// §2.2 bytes-consumed table: `Some(1)` for
+    /// [`SolidGrey`](Self::SolidGrey) (type 5 — byte 1 is the
+    /// greyscale value replicated to all of R, G, B), `Some(3)` for
+    /// [`SolidRgb`](Self::SolidRgb) (type 6 — bytes 1, 2, 3 map to
+    /// output pixel positions +0, +1, +2 = B, G, R under the
+    /// Windows `BI_RGB` memory convention of `spec/01` §2.2.1), and
+    /// `Some(4)` for [`SolidRgba`](Self::SolidRgba) (type 9 — as
+    /// type 6 plus byte 4 → output position +3 = A).
+    ///
+    /// Returns `None` for every non-solid frame type: their wire
+    /// body length is input-dependent (type 1's raw pixel data per
+    /// `spec/01` §2.1; the arithmetic types' compressed channel
+    /// bodies per `spec/01` §2.3), so no fixed colour-byte count
+    /// exists. `is_some()` coincides exactly with
+    /// [`is_solid`](Self::is_solid).
+    pub fn solid_colour_byte_count(self) -> Option<usize> {
+        match self {
+            // §2.2 row 5: "byte 1 — greyscale value".
+            Self::SolidGrey => Some(1),
+            // §2.2 row 6: "bytes 1, 2, 3 — output positions +0,
+            // +1, +2 of the pixel".
+            Self::SolidRgb => Some(3),
+            // §2.2 row 9: "bytes 1, 2, 3, 4 — output positions
+            // +0..+3 of the pixel".
+            Self::SolidRgba => Some(4),
+            _ => None,
+        }
+    }
+
+    /// Total wire payload size in bytes for the three solid-colour
+    /// frame types, per the `spec/01` §2.2.2 "Solid-frame total
+    /// payload sizes" table: `Some(2)` for
+    /// [`SolidGrey`](Self::SolidGrey) (1 type byte + 1 colour
+    /// byte), `Some(4)` for [`SolidRgb`](Self::SolidRgb) (1 + 3),
+    /// and `Some(5)` for [`SolidRgba`](Self::SolidRgba) (1 + 4).
+    /// These are the values the proprietary encoder commits to the
+    /// codec context's compressed-size field at offset `+0x14` —
+    /// immediate loads of `0x2` at `lagarith.dll!0x180002c84`
+    /// (type 5), `0x4` at `0x180002ca3` (type 6), and `0x5` at
+    /// `0x180002f88` (type 9) per `spec/01` §2.2.2.
+    ///
+    /// Returns `None` for every non-solid frame type — their total
+    /// wire size is input-dependent and determined by the frame
+    /// chunk size, not the type byte (`spec/01` §2.1 last
+    /// paragraph). Structurally equals
+    /// `prefix_size() + solid_colour_byte_count()` on the solid
+    /// set (the solid types carry no channel-offset table, so the
+    /// prefix is the lone type byte).
+    pub fn solid_wire_size(self) -> Option<usize> {
+        self.solid_colour_byte_count()
+            .map(|colour_bytes| self.prefix_size() + colour_bytes)
+    }
+
     /// `true` if this frame type accepts the given host
     /// [`PixelKind`] at decode time. The compatibility relation
     /// is anchored in `spec/01` §2.1 (uncompressed payload is
@@ -1101,6 +1156,131 @@ mod tests {
                     "{ft:?}: has_alpha_plane and is_packed_yuy2 must be disjoint",
                 );
             }
+        }
+    }
+
+    /// `solid_colour_byte_count` returns the `spec/01` §2.2
+    /// bytes-consumed table — `Some(1)` for type 5 (greyscale
+    /// value), `Some(3)` for type 6 (B / G / R), `Some(4)` for
+    /// type 9 (B / G / R / A) — and `None` on every non-solid
+    /// frame type. `is_some()` coincides exactly with `is_solid`
+    /// across the full accepted byte range.
+    #[test]
+    fn frame_type_solid_colour_byte_count() {
+        for b in 1u8..=11 {
+            let ft = FrameType::from_byte(b).unwrap();
+            let expected = match b {
+                5 => Some(1),
+                6 => Some(3),
+                9 => Some(4),
+                _ => None,
+            };
+            assert_eq!(
+                ft.solid_colour_byte_count(),
+                expected,
+                "solid_colour_byte_count mismatch on {ft:?}"
+            );
+            assert_eq!(
+                ft.solid_colour_byte_count().is_some(),
+                ft.is_solid(),
+                "{ft:?}: solid_colour_byte_count presence must coincide with is_solid"
+            );
+        }
+    }
+
+    /// `solid_wire_size` returns the `spec/01` §2.2.2 "Solid-frame
+    /// total payload sizes" table — `Some(2)` for type 5, `Some(4)`
+    /// for type 6, `Some(5)` for type 9 (the encoder's
+    /// compressed-size commits: immediate loads of `0x2` / `0x4` /
+    /// `0x5`) — and `None` on every non-solid frame type. On the
+    /// solid set it structurally equals
+    /// `prefix_size() + solid_colour_byte_count()`.
+    #[test]
+    fn frame_type_solid_wire_size_matches_spec_table() {
+        for b in 1u8..=11 {
+            let ft = FrameType::from_byte(b).unwrap();
+            let expected = match b {
+                5 => Some(2),
+                6 => Some(4),
+                9 => Some(5),
+                _ => None,
+            };
+            assert_eq!(
+                ft.solid_wire_size(),
+                expected,
+                "solid_wire_size mismatch on {ft:?}"
+            );
+            if let Some(colour_bytes) = ft.solid_colour_byte_count() {
+                assert_eq!(
+                    ft.solid_wire_size(),
+                    Some(ft.prefix_size() + colour_bytes),
+                    "{ft:?}: solid_wire_size must equal prefix_size + colour byte count"
+                );
+            }
+        }
+    }
+
+    /// The three solid-frame encoder entry points emit wires whose
+    /// total length equals `solid_wire_size` and whose byte 0
+    /// classifies back to the matching [`FrameType`] variant — the
+    /// accessor and the encoder agree on the `spec/01` §2.2.2
+    /// table.
+    #[test]
+    fn frame_type_solid_wire_size_matches_encoder_output_len() {
+        let cases: [(FrameType, Vec<u8>); 3] = [
+            (
+                FrameType::SolidGrey,
+                crate::encoder::encode_solid_grey(0x7f),
+            ),
+            (
+                FrameType::SolidRgb,
+                crate::encoder::encode_solid_rgb(0x11, 0x22, 0x33),
+            ),
+            (
+                FrameType::SolidRgba,
+                crate::encoder::encode_solid_rgba(0x11, 0x22, 0x33, 0x44),
+            ),
+        ];
+        for (ft, wire) in cases {
+            assert_eq!(
+                Some(wire.len()),
+                ft.solid_wire_size(),
+                "{ft:?}: encoder output length must equal solid_wire_size"
+            );
+            assert_eq!(
+                FrameType::from_byte(wire[0]).unwrap(),
+                ft,
+                "{ft:?}: encoder byte 0 must classify back to the same variant"
+            );
+        }
+    }
+
+    /// The decoder accepts a solid frame of exactly
+    /// `solid_wire_size` bytes and rejects one byte fewer with
+    /// `Error::Truncated` — `solid_wire_size` is the decoder's
+    /// minimum-length gate per `spec/01` §2.2 (the preamble reads
+    /// colour bytes 1..=N before filling the host buffer).
+    #[test]
+    fn frame_type_solid_wire_size_is_decoder_minimum_length() {
+        use crate::decoder::{decode_frame, PixelKind};
+        for ft in [
+            FrameType::SolidGrey,
+            FrameType::SolidRgb,
+            FrameType::SolidRgba,
+        ] {
+            let size = ft.solid_wire_size().unwrap();
+            let mut wire = vec![0u8; size];
+            wire[0] = ft.to_byte();
+            let decoded = decode_frame(&wire, 2, 2, PixelKind::Bgra32);
+            assert!(
+                decoded.is_ok(),
+                "{ft:?}: exactly solid_wire_size bytes must decode"
+            );
+            let truncated = decode_frame(&wire[..size - 1], 2, 2, PixelKind::Bgra32);
+            assert!(
+                matches!(truncated, Err(Error::Truncated { .. })),
+                "{ft:?}: solid_wire_size - 1 bytes must report Truncated"
+            );
         }
     }
 }

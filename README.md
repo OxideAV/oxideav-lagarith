@@ -5,6 +5,39 @@ Pure-Rust Lagarith lossless video codec for the
 
 ## Status
 
+**Round 262 — typed `FrameType` solid-frame wire-size accessors.**
+Extends the public `FrameType` enum (rounds 242 / 253 / 261) with
+two structural-size accessors on the three solid-colour frame
+types: `solid_colour_byte_count() -> Option<usize>` returning the
+`spec/01` §2.2 bytes-consumed table — `Some(1)` for `SolidGrey`
+(5, the greyscale value), `Some(3)` for `SolidRgb` (6, wire bytes
+1 / 2 / 3 → output positions +0 / +1 / +2 = B / G / R per §2.2.1),
+`Some(4)` for `SolidRgba` (9, plus byte 4 → +3 = A) — and
+`solid_wire_size() -> Option<usize>` returning the `spec/01`
+§2.2.2 "Solid-frame total payload sizes" table (`2` / `4` / `5`
+bytes; the values the proprietary encoder commits to the codec
+context's compressed-size field at `+0x14` via immediate loads of
+`0x2` at `lagarith.dll!0x180002c84`, `0x4` at `0x180002ca3`, `0x5`
+at `0x180002f88`). Both return `None` on every non-solid type —
+their wire size is input-dependent and determined by the frame
+chunk size, not the type byte (`spec/01` §2.1 last paragraph) —
+so `is_some()` coincides exactly with `is_solid()`. The decoder's
+solid-frame minimum-length gate (`decode_solid`'s `need`) now
+reads `FrameType::solid_wire_size`, making the accessor the
+single source of truth for the §2.2.2 table (round-239 pattern).
+Mirrors `prefix_size` / `channel_offset_table_size` (round 242)
+on the solid-frame axis: those expose the arithmetic types'
+fixed prefix geometry, these expose the solid types' fixed total
+geometry. 4 new unit tests pin the per-byte values of both
+accessors across the full 1..=11 byte range + the
+`is_some ⟺ is_solid` coincidence, the structural identity
+`solid_wire_size = prefix_size + solid_colour_byte_count` on the
+solid set, agreement with the three solid-frame encoder entry
+points (output length + byte-0 reclassification), and the decoder
+boundary contract (exactly `solid_wire_size` bytes decode;
+one byte fewer reports `Error::Truncated`). Brings the total
+unit-test count from 288 to **292**.
+
 **Round 261 — typed `FrameType::has_alpha_plane` accessor on the
 outermost wire byte.** Extends the public `FrameType` enum (rounds
 242 / 253) with `has_alpha_plane() -> bool` returning `true` exactly
