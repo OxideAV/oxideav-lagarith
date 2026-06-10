@@ -8,6 +8,33 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- round 276 — **encoder frame-level solid-colour fast path
+  (`spec/01` §3.1).** New test-side encoder wrappers
+  `encode_arith_rgb24_or_solid` / `encode_arith_rgba_or_solid`
+  implement the proprietary's solid-colour shortcut: a frame
+  whose pixels are all identical is emitted as the 2-byte
+  type-5 (Solid-Grey, input pixel's `R == G == B`), 4-byte
+  type-6 (Solid-RGB) or 5-byte type-9 (Solid-RGBA) frame
+  (`spec/01` §3 rows 5/6/9 + §2.2.2 totals), with the colour
+  bytes copied from the input pixel unchanged per the §2.2.1
+  encoder mirror (`lagarith.dll!0x180002c8c..0x180002cda` /
+  `0x180002f8c..0x180002fc8`). The proprietary gates the
+  shortcut on a post-encode compressed-size threshold (`0xf` at
+  `lagarith.dll!0x180002c65` on the RGB path, `0x15` at
+  `0x180002f7f` on the RGBA path); the wrappers gate on the
+  exact-constancy predicate itself — the
+  necessary-and-sufficient lossless condition the threshold
+  proxies — and emit byte-identical wire on every genuinely
+  solid frame. Non-solid input falls through to
+  `encode_arith_rgb24` / `encode_arith_rgba` byte-identically;
+  the RGBA path has no grey sub-shortcut (constant grey +
+  opaque BGRA still emits type 9). 7 new tests
+  (`frame_solid_fast_path` module) pin the exact wire shape per
+  solid type, decode round-trips at aligned / unaligned / 1×1
+  sizes, the grey-vs-RGB split, fall-through byte-identity on
+  gradient + almost-solid fixtures, and the never-larger /
+  strictly-smaller-on-solid size invariants.
+
 - round 262 — **typed `FrameType` solid-frame wire-size
   accessors.** Extends the public `FrameType` enum (rounds 242 /
   253 / 261) with `solid_colour_byte_count() -> Option<usize>`

@@ -4448,3 +4448,264 @@ mod legacy_frame_uncompressed_size_guard {
         assert_eq!(decoded.pixels, pixels);
     }
 }
+
+/// Round 276 — frame-level solid-colour fast path (`spec/01` §3.1).
+///
+/// `encode_arith_rgb24_or_solid` / `encode_arith_rgba_or_solid` wrap
+/// the modern arithmetic frame encoders with the proprietary's
+/// solid-colour shortcut: a frame whose pixels are all identical is
+/// emitted as the 2-byte type-5 (grey, `B == G == R`), 4-byte type-6
+/// (RGB) or 5-byte type-9 (RGBA) solid frame (`spec/01` §3 rows
+/// 5/6/9 + §2.2.2 totals), with colour bytes copied from the input
+/// pixel unchanged (`spec/01` §2.2.1 encoder mirror). The pins
+/// below cover:
+///
+/// 1. **Wire-shape pins** — exact output bytes for each solid type,
+///    including the `FrameType::solid_wire_size` totals (round 262)
+///    and the byte-0 classification.
+/// 2. **Decode-correct round-trip** — the solid wire decodes back to
+///    the original constant pixels, at aligned and unaligned widths.
+/// 3. **Grey-vs-RGB split** — `B == G == R` selects type 5 on the
+///    RGB path; the RGBA path emits type 9 even for grey + opaque
+///    constants (`spec/01` §3 lists the 5/6 overwrite sites on the
+///    RGB path only).
+/// 4. **Fall-through byte-identity** — non-solid input (including an
+///    almost-solid frame differing in a single byte of the last
+///    pixel) produces output byte-identical to the unwrapped
+///    arithmetic encoder.
+/// 5. **Never-larger invariant** — the wrapper output is `<=` the
+///    unwrapped arithmetic output everywhere, and strictly smaller
+///    on solid frames (2 / 4 / 5 bytes vs the arithmetic form's
+///    9- / 13-byte preamble + per-plane bodies).
+#[cfg(test)]
+mod frame_solid_fast_path {
+    use crate::decoder::{decode_frame, PixelKind};
+    use crate::encoder::{
+        encode_arith_rgb24, encode_arith_rgb24_or_solid, encode_arith_rgba,
+        encode_arith_rgba_or_solid,
+    };
+    use crate::frame::FrameType;
+
+    /// Packed BGR fixture with every pixel set to `(b, g, r)`.
+    fn constant_bgr(n: usize, b: u8, g: u8, r: u8) -> Vec<u8> {
+        let mut out = Vec::with_capacity(n * 3);
+        for _ in 0..n {
+            out.extend_from_slice(&[b, g, r]);
+        }
+        out
+    }
+
+    /// Packed BGRA fixture with every pixel set to `(b, g, r, a)`.
+    fn constant_bgra(n: usize, b: u8, g: u8, r: u8, a: u8) -> Vec<u8> {
+        let mut out = Vec::with_capacity(n * 4);
+        for _ in 0..n {
+            out.extend_from_slice(&[b, g, r, a]);
+        }
+        out
+    }
+
+    // ─── 1 + 2. Wire-shape pins + decode round-trip ────────────────
+
+    #[test]
+    fn rgb24_or_solid_emits_type5_on_constant_grey() {
+        // Aligned (4×4, 16×16), unaligned (5×3 — `width % 4 != 0`,
+        // the type-2 staging row of `spec/01` §3 is overwritten by
+        // the solid shortcut all the same), and single-pixel (1×1).
+        for &(w, h) in &[(4u32, 4u32), (16, 16), (5, 3), (1, 1)] {
+            let n = (w * h) as usize;
+            let pixels = constant_bgr(n, 0x7f, 0x7f, 0x7f);
+            let frame = encode_arith_rgb24_or_solid(&pixels, w, h);
+            assert_eq!(frame, vec![5, 0x7f], "type-5 wire shape at {w}×{h}");
+            assert_eq!(
+                frame.len(),
+                FrameType::SolidGrey.solid_wire_size().unwrap(),
+                "§2.2.2 total at {w}×{h}",
+            );
+            let decoded = decode_frame(&frame, w, h, PixelKind::Bgr24).unwrap();
+            assert_eq!(decoded.pixels, pixels, "type-5 round-trip at {w}×{h}");
+        }
+    }
+
+    #[test]
+    fn rgb24_or_solid_emits_type6_on_constant_colour() {
+        for &(w, h) in &[(4u32, 4u32), (16, 16), (5, 3), (1, 1)] {
+            let n = (w * h) as usize;
+            // B = 0x11, G = 0x22, R = 0x33 — wire bytes 1/2/3 carry
+            // the input pixel's bytes 0/1/2 unchanged (`spec/01`
+            // §2.2.1 encoder mirror).
+            let pixels = constant_bgr(n, 0x11, 0x22, 0x33);
+            let frame = encode_arith_rgb24_or_solid(&pixels, w, h);
+            assert_eq!(
+                frame,
+                vec![6, 0x11, 0x22, 0x33],
+                "type-6 wire shape at {w}×{h}",
+            );
+            assert_eq!(
+                frame.len(),
+                FrameType::SolidRgb.solid_wire_size().unwrap(),
+                "§2.2.2 total at {w}×{h}",
+            );
+            let decoded = decode_frame(&frame, w, h, PixelKind::Bgr24).unwrap();
+            assert_eq!(decoded.pixels, pixels, "type-6 round-trip at {w}×{h}");
+        }
+    }
+
+    #[test]
+    fn rgba_or_solid_emits_type9_on_constant_colour() {
+        for &(w, h) in &[(4u32, 4u32), (16, 16), (5, 3), (1, 1)] {
+            let n = (w * h) as usize;
+            let pixels = constant_bgra(n, 0x11, 0x22, 0x33, 0x44);
+            let frame = encode_arith_rgba_or_solid(&pixels, w, h);
+            assert_eq!(
+                frame,
+                vec![9, 0x11, 0x22, 0x33, 0x44],
+                "type-9 wire shape at {w}×{h}",
+            );
+            assert_eq!(
+                frame.len(),
+                FrameType::SolidRgba.solid_wire_size().unwrap(),
+                "§2.2.2 total at {w}×{h}",
+            );
+            let decoded = decode_frame(&frame, w, h, PixelKind::Bgra32).unwrap();
+            assert_eq!(decoded.pixels, pixels, "type-9 round-trip at {w}×{h}");
+        }
+    }
+
+    // ─── 3. Grey-vs-RGB split ──────────────────────────────────────
+
+    #[test]
+    fn solid_grey_split_follows_spec01_section3_rows() {
+        const W: u32 = 8;
+        const H: u32 = 8;
+        let n = (W * H) as usize;
+
+        // RGB path: B == G == R → type 5; any component differing →
+        // type 6 (`spec/01` §3 rows 5/6).
+        for v in [0x00u8, 0x01, 0x80, 0xff] {
+            let frame = encode_arith_rgb24_or_solid(&constant_bgr(n, v, v, v), W, H);
+            assert_eq!(frame[0], 5, "grey value {v:#04x} must select type 5");
+        }
+        for (b, g, r) in [
+            (0x10u8, 0x10u8, 0x11u8),
+            (0x10, 0x11, 0x10),
+            (0x11, 0x10, 0x10),
+        ] {
+            let frame = encode_arith_rgb24_or_solid(&constant_bgr(n, b, g, r), W, H);
+            assert_eq!(
+                frame[0], 6,
+                "non-grey ({b:#04x},{g:#04x},{r:#04x}) must select type 6",
+            );
+        }
+
+        // RGBA path: constant grey + opaque still emits type 9 — the
+        // 5/6 overwrite sites sit on the RGB path only (`spec/01`
+        // §3.1 thresholds `0xf` vs `0x15`).
+        let frame = encode_arith_rgba_or_solid(&constant_bgra(n, 0x7f, 0x7f, 0x7f, 0xff), W, H);
+        assert_eq!(frame, vec![9, 0x7f, 0x7f, 0x7f, 0xff]);
+    }
+
+    // ─── 4. Fall-through byte-identity ─────────────────────────────
+
+    #[test]
+    fn rgb24_or_solid_falls_through_byte_identical_on_non_solid() {
+        const W: u32 = 8;
+        const H: u32 = 8;
+        let n = (W * H) as usize;
+
+        // Gradient — plainly non-solid.
+        let gradient: Vec<u8> = (0..n * 3).map(|i| ((i * 73 + 11) & 0xff) as u8).collect();
+        assert_eq!(
+            encode_arith_rgb24_or_solid(&gradient, W, H),
+            encode_arith_rgb24(&gradient, W, H),
+            "gradient must fall through byte-identically",
+        );
+
+        // Almost-solid: one byte of the LAST pixel differs — the
+        // constancy scan must reject it (boundary of the predicate).
+        let mut almost = constant_bgr(n, 0x11, 0x22, 0x33);
+        let last = almost.len() - 1;
+        almost[last] ^= 0x01;
+        let frame = encode_arith_rgb24_or_solid(&almost, W, H);
+        assert_eq!(
+            frame,
+            encode_arith_rgb24(&almost, W, H),
+            "almost-solid must fall through byte-identically",
+        );
+        let decoded = decode_frame(&frame, W, H, PixelKind::Bgr24).unwrap();
+        assert_eq!(decoded.pixels, almost, "almost-solid round-trip");
+    }
+
+    #[test]
+    fn rgba_or_solid_falls_through_byte_identical_on_non_solid() {
+        const W: u32 = 8;
+        const H: u32 = 8;
+        let n = (W * H) as usize;
+
+        let gradient: Vec<u8> = (0..n * 4).map(|i| ((i * 73 + 11) & 0xff) as u8).collect();
+        assert_eq!(
+            encode_arith_rgba_or_solid(&gradient, W, H),
+            encode_arith_rgba(&gradient, W, H),
+            "gradient must fall through byte-identically",
+        );
+
+        // Almost-solid differing only in the last pixel's alpha byte.
+        let mut almost = constant_bgra(n, 0x11, 0x22, 0x33, 0x44);
+        let last = almost.len() - 1;
+        almost[last] ^= 0x01;
+        let frame = encode_arith_rgba_or_solid(&almost, W, H);
+        assert_eq!(
+            frame,
+            encode_arith_rgba(&almost, W, H),
+            "almost-solid must fall through byte-identically",
+        );
+        let decoded = decode_frame(&frame, W, H, PixelKind::Bgra32).unwrap();
+        assert_eq!(decoded.pixels, almost, "almost-solid round-trip");
+    }
+
+    // ─── 5. Never-larger invariant ─────────────────────────────────
+
+    #[test]
+    fn or_solid_never_larger_than_arith_and_strictly_smaller_on_solid() {
+        for &(w, h) in &[(4u32, 4u32), (8, 8), (16, 16), (5, 3)] {
+            let n = (w * h) as usize;
+
+            // Solid fixtures: strictly smaller (2 / 4 / 5 bytes vs
+            // the arithmetic form's channel-offset preamble alone —
+            // 9 / 13 bytes per `spec/01` §2.3 — plus plane bodies).
+            let grey = constant_bgr(n, 0x40, 0x40, 0x40);
+            let arith = encode_arith_rgb24(&grey, w, h);
+            let solid = encode_arith_rgb24_or_solid(&grey, w, h);
+            assert!(
+                solid.len() < arith.len(),
+                "solid grey {w}×{h}: {} !< {}",
+                solid.len(),
+                arith.len(),
+            );
+
+            let rgba = constant_bgra(n, 0x40, 0x41, 0x42, 0x43);
+            let arith = encode_arith_rgba(&rgba, w, h);
+            let solid = encode_arith_rgba_or_solid(&rgba, w, h);
+            assert!(
+                solid.len() < arith.len(),
+                "solid rgba {w}×{h}: {} !< {}",
+                solid.len(),
+                arith.len(),
+            );
+
+            // Non-solid fixtures: never larger (equality — the
+            // fall-through is byte-identical).
+            let gradient: Vec<u8> = (0..n * 3).map(|i| ((i * 73 + 11) & 0xff) as u8).collect();
+            assert!(
+                encode_arith_rgb24_or_solid(&gradient, w, h).len()
+                    <= encode_arith_rgb24(&gradient, w, h).len(),
+                "gradient rgb24 {w}×{h} grew",
+            );
+            let gradient4: Vec<u8> = (0..n * 4).map(|i| ((i * 73 + 11) & 0xff) as u8).collect();
+            assert!(
+                encode_arith_rgba_or_solid(&gradient4, w, h).len()
+                    <= encode_arith_rgba(&gradient4, w, h).len(),
+                "gradient rgba {w}×{h} grew",
+            );
+        }
+    }
+}

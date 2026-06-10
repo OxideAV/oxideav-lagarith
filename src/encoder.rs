@@ -1233,6 +1233,101 @@ pub fn encode_legacy_rgb_or_uncompressed(pixels: &[u8], width: u32, height: u32)
     }
 }
 
+// ─── Round 276 — frame-level solid-colour fast path (`spec/01` §3.1) ─
+//
+// The proprietary encoder's RGB and RGBA paths carry a solid-colour
+// shortcut: after the per-channel arithmetic encode, the compressed
+// size is checked against a threshold (`0xf` at
+// `lagarith.dll!0x180002c65` on the RGB path, `0x15` at
+// `lagarith.dll!0x180002f7f` on the RGBA path); on a match the
+// encoder discards the arithmetic output, overwrites the type byte
+// with 5 / 6 (RGB — 5 when the input pixel's R == G == B, else 6,
+// `spec/01` §3 rows 5/6) or 9 (RGBA, `spec/01` §3 row 9), and writes
+// 1 / 3 / 4 colour bytes copied from the input pixel unchanged
+// (encoder mirror at `lagarith.dll!0x180002c8c..0x180002cda` /
+// `0x180002f8c..0x180002fc8`, `spec/01` §2.2.1). The committed
+// frame sizes are the §2.2.2 totals: 2 / 4 / 5 bytes.
+//
+// A solid-frame substitution is lossless **iff every pixel of the
+// frame is identical** — `decode_solid` replicates the wire colour
+// bytes into every output pixel (`spec/01` §2.2). The proprietary
+// gates on its post-encode size threshold as a proxy for that
+// condition; the wrappers below gate on the exact-constancy
+// predicate itself, which is the necessary-and-sufficient lossless
+// condition the threshold stands in for. On every genuinely solid
+// frame both gates agree and the emitted wire bytes are identical
+// (type byte + input-pixel colour bytes); on non-solid frames the
+// wrappers fall through to the arithmetic frame encoder
+// byte-identically.
+
+/// Scan a packed 3-byte-per-pixel buffer for frame-wide constancy.
+/// Returns the common `(B, G, R)` tuple when every pixel equals
+/// pixel 0, `None` otherwise (including on an empty buffer — there
+/// is no input pixel to copy colour bytes from per `spec/01`
+/// §2.2.1's encoder mirror).
+fn solid_colour_bgr(pixels: &[u8]) -> Option<(u8, u8, u8)> {
+    let mut it = pixels.chunks_exact(3);
+    let first = it.next()?;
+    let (b, g, r) = (first[0], first[1], first[2]);
+    it.all(|px| px[0] == b && px[1] == g && px[2] == r)
+        .then_some((b, g, r))
+}
+
+/// Scan a packed 4-byte-per-pixel buffer for frame-wide constancy.
+/// Returns the common `(B, G, R, A)` tuple when every pixel equals
+/// pixel 0, `None` otherwise (including on an empty buffer).
+fn solid_colour_bgra(pixels: &[u8]) -> Option<(u8, u8, u8, u8)> {
+    let mut it = pixels.chunks_exact(4);
+    let first = it.next()?;
+    let (b, g, r, a) = (first[0], first[1], first[2], first[3]);
+    it.all(|px| px[0] == b && px[1] == g && px[2] == r && px[3] == a)
+        .then_some((b, g, r, a))
+}
+
+/// Frame-level **solid-colour fast path** wrapping
+/// [`encode_arith_rgb24`] — the `spec/01` §3.1 RGB-path shortcut.
+///
+/// When every input pixel is identical, emits the 2-byte type-5
+/// (Solid-Grey) frame if the pixel's `B == G == R` (`spec/01` §3
+/// row 5 "the input pixel's R == G == B") or the 4-byte type-6
+/// (Solid-RGB) frame otherwise (`spec/01` §3 row 6), with the
+/// colour bytes copied from the input pixel unchanged (`spec/01`
+/// §2.2.1 encoder mirror; §2.2.2 total sizes). Non-solid input
+/// falls through to [`encode_arith_rgb24`] byte-identically. The
+/// fast path sits on the shared RGB path **before** the type-2/4
+/// width split commits, so it applies to both `width % 4 == 0` and
+/// unaligned widths (`spec/01` §3 rows 2/4 vs rows 5/6 — the solid
+/// overwrite replaces whichever type byte the width split staged).
+pub fn encode_arith_rgb24_or_solid(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
+    if let Some((b, g, r)) = solid_colour_bgr(pixels) {
+        return if b == g && g == r {
+            encode_solid_grey(b)
+        } else {
+            encode_solid_rgb(b, g, r)
+        };
+    }
+    encode_arith_rgb24(pixels, width, height)
+}
+
+/// Frame-level **solid-colour fast path** wrapping
+/// [`encode_arith_rgba`] — the `spec/01` §3.1 RGBA-path shortcut.
+///
+/// When every input pixel is identical, emits the 5-byte type-9
+/// (Solid-RGBA) frame (`spec/01` §3 row 9; threshold `0x15` at
+/// `lagarith.dll!0x180002f7f`), with the four colour bytes copied
+/// from the input pixel unchanged (`spec/01` §2.2.1 — wire byte 4
+/// → output `+3` = A). The RGBA path has **no** greyscale
+/// sub-shortcut: a constant grey + opaque BGRA frame still emits
+/// type 9, never type 5/6 (`spec/01` §3 lists the 5/6 overwrite
+/// sites on the RGB path only). Non-solid input falls through to
+/// [`encode_arith_rgba`] byte-identically.
+pub fn encode_arith_rgba_or_solid(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
+    if let Some((b, g, r, a)) = solid_colour_bgra(pixels) {
+        return encode_solid_rgba(b, g, r, a);
+    }
+    encode_arith_rgba(pixels, width, height)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

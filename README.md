@@ -5,6 +5,39 @@ Pure-Rust Lagarith lossless video codec for the
 
 ## Status
 
+**Round 276 — encoder frame-level solid-colour fast path
+(`spec/01` §3.1).** The test-side encoder gains the proprietary's
+solid-colour shortcut as two frame-level wrappers:
+`encode_arith_rgb24_or_solid` and `encode_arith_rgba_or_solid`.
+The proprietary's RGB / RGBA encoder paths check the post-encode
+compressed size against a threshold (`0xf` at
+`lagarith.dll!0x180002c65`, `0x15` at `0x180002f7f`); on a match
+they discard the arithmetic output, overwrite the type byte with
+5 (input pixel's `R == G == B`) / 6 (RGB path, `spec/01` §3 rows
+5/6) or 9 (RGBA path, row 9), and copy 1 / 3 / 4 colour bytes
+from the input pixel unchanged (encoder mirror
+`0x180002c8c..0x180002cda` / `0x180002f8c..0x180002fc8`, §2.2.1),
+committing the §2.2.2 totals (2 / 4 / 5 bytes). A solid
+substitution is lossless **iff every pixel is identical**
+(`decode_solid` replicates the wire colour into every output
+pixel), so the wrappers gate on the exact-constancy predicate —
+the necessary-and-sufficient condition the proprietary's size
+threshold proxies — and agree with it byte-for-byte on every
+genuinely solid frame. The shortcut sits before the type-2/4
+width split commits, so it covers unaligned widths too; the RGBA
+path has **no** grey sub-shortcut (constant grey + opaque BGRA
+still emits type 9). Non-solid input falls through to
+`encode_arith_rgb24` / `encode_arith_rgba` byte-identically.
+7 new tests pin the exact wire shape for each solid type
+(including `FrameType::solid_wire_size` totals, round 262),
+decode round-trips at aligned / unaligned / 1×1 sizes, the
+grey-vs-RGB split on the RGB path + type-9-always on the RGBA
+path, fall-through byte-identity on gradient and almost-solid
+(last-byte-differs) fixtures, and the never-larger invariant
+(strictly smaller on solid frames: 2 / 4 / 5 bytes vs the
+arithmetic form's 9- / 13-byte channel-offset preamble + plane
+bodies). Brings the total unit-test count from 292 to **299**.
+
 **Round 262 — typed `FrameType` solid-frame wire-size accessors.**
 Extends the public `FrameType` enum (rounds 242 / 253 / 261) with
 two structural-size accessors on the three solid-colour frame
