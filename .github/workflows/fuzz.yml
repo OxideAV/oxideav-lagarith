@@ -1,0 +1,22 @@
+name: Fuzz
+
+# Daily fuzz run for the cargo-fuzz harness under fuzz/. Lagarith's
+# decoder (frame-type dispatch, channel-offset table walk, Fibonacci
+# probability prefix, range coder, zero-run RLE expansion, then the
+# spatial-predictor + cross-plane decorrelation inverse) is the attack
+# surface; there is no external library oracle worth pulling in (and the
+# clean-room wall bars any reference codec source anyway), so this is a
+# decode-only panic-free harness: one target gets the whole 30-minute
+# budget.
+
+on:
+  schedule:
+    - cron: "53 6 * * *"   # daily 06:53 UTC, jittered off the hour
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    uses: OxideAV/.github/.github/workflows/crate-fuzz.yml@master
+    with:
+      time_budget_seconds: 1800
+    secrets: inherit

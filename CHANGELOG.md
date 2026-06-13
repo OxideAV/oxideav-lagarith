@@ -6,7 +6,37 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- round 291 — **decode panic on overflowing probability table
+  (fuzz finding).** A malformed Fibonacci probability prefix could
+  decode per-symbol frequencies whose cumulative sum overflowed
+  `u32`, hitting an `.expect("prob table overflow")` in
+  `Cdf::from_frequencies` (`range_coder.rs`) and aborting the
+  decode. The build now returns the new
+  `Error::ProbabilityTableOverflow` instead of panicking, so a
+  hostile frame surfaces a defined error like every other malformed
+  input. Pinned by the `from_frequencies_rejects_overflow` and
+  `from_frequencies_accepts_u32_max_total` unit tests plus a corpus
+  regression seed. Found by the new `decode_lagarith` libFuzzer
+  target (below).
+
 ### Added
+
+- round 291 — **coverage-guided libFuzzer decode harness (`fuzz/`).**
+  New `decode_lagarith` cargo-fuzz target drives arbitrary mutated
+  bytes through the public `decode_frame` entry point across every
+  wire-type decode path and all four `PixelKind` host formats,
+  asserting the decoder always returns (`Ok`/`Err`) without
+  panicking, aborting, integer-overflowing, or indexing out of
+  bounds. Two leading selector bytes map to small even
+  (chroma-safe) dimensions so the budget goes to logic paths rather
+  than allocation. Hand-built seed corpus (solid grey/RGB/RGBA,
+  uncompressed, NULL, bad-type) plus the overflow regression seed.
+  Ran clean for 28.9M executions (300 s, 0 findings) after the fix
+  above; a daily `fuzz.yml` workflow keeps it on a 30-minute budget.
+  Decode-only by design — the clean-room wall bars any external
+  reference codec as a cross-decode oracle.
 
 - round 276 — **encoder frame-level solid-colour fast path
   (`spec/01` §3.1).** New test-side encoder wrappers

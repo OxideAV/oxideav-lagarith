@@ -38,6 +38,11 @@ pub enum Error {
     /// frequency zero. The range coder cannot decode against an
     /// empty CDF.
     EmptyProbabilityTable,
+    /// Decoded probability table's cumulative sum exceeded `u32::MAX`.
+    /// A malformed Fibonacci probability prefix can encode per-symbol
+    /// frequencies whose running total overflows 32 bits; the CDF
+    /// build rejects it rather than wrapping or panicking.
+    ProbabilityTableOverflow,
     /// Caller asked for a frame whose dimensions do not match a
     /// supported (width, height, pixel-format) tuple.
     BadDimensions {
@@ -109,6 +114,9 @@ impl core::fmt::Display for Error {
             }
             Error::FibonacciOverflow => {
                 f.write_str("Lagarith: Fibonacci prefix encodes value > 33 (decoder cap)")
+            }
+            Error::ProbabilityTableOverflow => {
+                f.write_str("Lagarith: probability table cumulative sum overflowed u32")
             }
             Error::EmptyProbabilityTable => {
                 f.write_str("Lagarith: probability table summed to zero")

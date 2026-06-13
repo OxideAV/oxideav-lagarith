@@ -858,6 +858,31 @@ bringing the total to 241. Round 229 extends the size guard to type 7
 total to 246. Round 242 adds 13 typed-`FrameType`-accessor pins in
 module `frame::tests`, bringing the total to **259**.
 
+### Continuous fuzzing (libFuzzer, `fuzz/`)
+
+Round 291 adds a coverage-guided libFuzzer harness under `fuzz/`
+(`cargo +nightly fuzz run decode_lagarith`) that complements the
+in-tree deterministic fuzz suites with millions of mutated inputs.
+The `decode_lagarith` target packs two selector bytes into a small
+even `(width, height)` (chroma-safe for YV12 / YUY2) and hands the
+remainder to the public `decode_frame` entry point, driving every
+wire-type decode path against all four `PixelKind` host formats.
+The invariant under test is purely that the call always *returns*
+(`Ok` or a defined `Err`) without panicking, aborting, integer-
+overflowing, or indexing out of bounds. The harness immediately
+surfaced a real decode panic: a malformed Fibonacci probability
+prefix could decode per-symbol frequencies whose cumulative sum
+overflowed `u32`, hitting an `.expect("prob table overflow")` in
+`Cdf::from_frequencies` (`range_coder.rs`). The fix returns the new
+`Error::ProbabilityTableOverflow` instead — pinned by the
+`from_frequencies_rejects_overflow` /
+`from_frequencies_accepts_u32_max_total` unit tests and a corpus
+regression seed. After the fix the target ran clean for **28.9M
+executions** (300 s, 0 findings; 506 corpus units covering 1064 PCs
+/ 3184 features). A daily `fuzz.yml` workflow keeps the harness on a
+30-minute budget. There is no external library decode oracle
+(clean-room wall), so the harness is decode-only.
+
 ### SIMD-vs-scalar predictor (`spec/06` §3.2)
 
 For frame types 2 / 4 / 8 the crate's predictor implements

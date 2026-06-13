@@ -1,0 +1,47 @@
+[package]
+name = "oxideav-lagarith-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Lagarith's decoder is the part worth fuzzing: a one-byte frame-type
+# selector chooses between the Uncompressed (type 1) literal body, the
+# SOLID grey / RGB / RGBA fills (types 5 / 6 / 9), the modern
+# arithmetic-coded RGB24 / RGB32 / RGBA / YV12 / YUY2 / reduced-res
+# families (types 2 / 4 / 8 / 10 / 3 / 11), and the legacy pre-1.1.0
+# adaptive-CDF RGB path (type 7). Each non-literal path drives a
+# channel-offset table walk, a Fibonacci probability prefix, a range
+# coder, a zero-run RLE expansion, and a spatial-predictor + cross-plane
+# decorrelation inverse — all reading lengths and offsets straight off
+# the wire. There is no external library worth pulling in as a
+# cross-decode oracle (and the clean-room wall bars any reference codec
+# source anyway), so this fuzz crate is **decode-only**: pack a tiny
+# (width, height) and pixel-kind selector into a header prefix, hand the
+# remainder to `decode_frame` at the real public entry point, and assert
+# the call always *returns* (Ok or Err) without panicking / aborting /
+# integer-overflowing / indexing out of bounds, no matter how hostile
+# the bytes are.
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.oxideav-lagarith]
+path = ".."
+# The decode surface under test needs no framework glue; keeping the
+# registry feature off makes the fuzz binary self-contained.
+default-features = false
+
+# Prevent this from interfering with the umbrella workspace.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "decode_lagarith"
+path = "fuzz_targets/decode_lagarith.rs"
+test = false
+doc = false

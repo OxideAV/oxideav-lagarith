@@ -80,7 +80,12 @@ impl Cdf {
         let mut acc: u32 = 0;
         for i in 0..256 {
             cum[i] = acc;
-            acc = acc.checked_add(freq[i]).expect("prob table overflow");
+            // A malformed Fibonacci probability prefix can decode
+            // per-symbol frequencies whose running total exceeds 32
+            // bits; reject it as a wire error rather than panicking.
+            acc = acc
+                .checked_add(freq[i])
+                .ok_or(Error::ProbabilityTableOverflow)?;
         }
         cum[256] = acc;
         if acc == 0 {
@@ -576,6 +581,34 @@ mod tests {
         assert_eq!(cdf.find_symbol(29), 1);
         assert_eq!(cdf.find_symbol(30), 2);
         assert_eq!(cdf.find_symbol(59), 2);
+    }
+
+    /// A frequency table whose cumulative sum exceeds `u32::MAX`
+    /// surfaces [`Error::ProbabilityTableOverflow`] instead of
+    /// panicking. Regression for the r291 fuzz finding: a malformed
+    /// Fibonacci probability prefix can decode per-symbol frequencies
+    /// whose running total overflows 32 bits.
+    #[test]
+    fn from_frequencies_rejects_overflow() {
+        let mut freq = [0u32; 256];
+        // Three entries near u32::MAX sum to well over 2^32.
+        freq[0] = u32::MAX;
+        freq[1] = u32::MAX;
+        freq[2] = 1;
+        assert!(matches!(
+            Cdf::from_frequencies(&freq),
+            Err(Error::ProbabilityTableOverflow)
+        ));
+    }
+
+    /// A frequency table summing to exactly `u32::MAX` is the largest
+    /// total that still builds without overflow.
+    #[test]
+    fn from_frequencies_accepts_u32_max_total() {
+        let mut freq = [0u32; 256];
+        freq[0] = u32::MAX;
+        let cdf = Cdf::from_frequencies(&freq).expect("u32::MAX total must build");
+        assert_eq!(cdf.total(), u32::MAX);
     }
 
     /// Self-roundtrip: encode symbols and decode them back.
