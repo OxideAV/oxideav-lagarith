@@ -5,6 +5,36 @@ Pure-Rust Lagarith lossless video codec for the
 
 ## Status
 
+**Round 308 — typed `FrameType::wire_plane_pixel_counts(width,
+height)` accessor: single source of truth for the planar-YUV
+chroma-subsampling geometry (`spec/03` §6.1 / §6.1.1 / §6.2).**
+A new structural accessor on the public `FrameType` enum returns
+the wire-side per-plane pixel (byte) counts in wire plane order for
+the two planar-YUV wire types: `Some([Y, V, U])` for
+`ArithmeticYv12` (10) — Y = `W×H`, V = U = `floor((W×H)/4)` (4:2:0;
+the integer-truncated count the proprietary computes by a logical
+right-shift of 2 at `lagarith.dll!0x180004f9a..0x180004fa1`, no
+rounding for odd W/H) — and `Some([Y, U, V])` for `ArithmeticYuy2`
+(3) — Y = `W×H`, U = V = `floor(W/2)×H` (4:2:2, full height / half
+width, U *before* V on the wire). Returns `None` for every other
+frame type: the literal (uncompressed / solid) types carry no
+per-plane wire layout, the packed-RGB(A) arithmetic families
+(2 / 4 / 7 / 8) decode `n_channels()` uniform `W×H` planes, and
+reduced-resolution (type 11) returns `None` for the *host*
+dimensions because its wire body is a YV12 frame at *half* the host
+W/H (`spec/01` §2.4). The YV12 / YUY2 channel decoders
+(`decode_arith_yv12` / `decode_arith_yuy2`) now read this accessor
+instead of recomputing the §6.1 / §6.2 plane-count formulae inline,
+so the chroma-subsampling geometry lives in one place — mirroring
+`prefix_size` / `channel_offset_table_size` (which expose the fixed
+*prefix* geometry per `spec/01` §2.3) on the per-plane *body* axis.
+Decode behaviour is byte-identical (the accessor returns the same
+counts the inline code computed). 4 new unit tests pin the per-type
+`Some` / `None` table, integer-truncation on odd dimensions, the
+luma-is-`W×H` + equal-chroma-pair structural invariants, and
+agreement of the YV12 plane-count sum with `PixelKind::buffer_len`.
+Brings the lib unit-test count to **306**.
+
 **Round 295 — YV12 / YUY2 / reduced-res first-column predictor
 rule spec-anchored to Rule A (`spec/06` §3.8).** The README's
 long-standing "YV12/YUY2 retain Rule A pending a clean ffmpeg pin"

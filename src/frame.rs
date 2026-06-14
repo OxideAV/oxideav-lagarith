@@ -418,6 +418,68 @@ impl FrameType {
             Self::ArithmeticYuy2 => YUY2_ONLY,
         }
     }
+
+    /// Wire-side per-plane pixel (byte) counts in wire plane order
+    /// for the **planar YUV** frame types, given the frame's `width`
+    /// and `height` — the single structural source of truth for the
+    /// chroma-subsampling geometry the YUV channel decoders consume.
+    ///
+    /// Returns `Some([Y, V, U])` for [`ArithmeticYv12`](Self::ArithmeticYv12)
+    /// (10) and `Some([Y, U, V])` for [`ArithmeticYuy2`](Self::ArithmeticYuy2)
+    /// (3):
+    ///
+    /// * **YV12** (4:2:0, `spec/03` §6.1 + §6.1.1): the luma plane is
+    ///   `W × H` bytes; each chroma plane (V then U on the wire — the
+    ///   YV12 plane order) is `floor((W × H) / 4)` bytes, the
+    ///   integer-truncated count the proprietary computes by a logical
+    ///   right-shift of 2 at `lagarith.dll!0x180004f9a..0x180004fa1`
+    ///   (no rounding adjustment for odd W / H).
+    /// * **YUY2** (4:2:2, `spec/03` §6.2): the luma plane is `W × H`
+    ///   bytes; each chroma plane (U then V on the wire — the YUY2
+    ///   plane order, U *before* V) is `floor(W / 2) × H` bytes (full
+    ///   height, half width — the 4:2:2 sub-sampling at columns
+    ///   `2k / 2k+1`).
+    ///
+    /// Returns `None` for every non-planar-YUV frame type: the
+    /// literal types (uncompressed / solid) carry no per-plane wire
+    /// layout, and the packed-RGB(A) arithmetic families (2 / 4 / 7 /
+    /// 8) decode `n_channels()` planes that are each `W × H` bytes —
+    /// a uniform geometry with no sub-sampling to expose here.
+    /// Reduced-resolution (type 11) returns `None` for the *host*
+    /// `(width, height)`: its wire body is a YV12 frame at *half* the
+    /// host dimensions (`spec/01` §2.4), so its wire plane counts are
+    /// `ArithmeticYv12::wire_plane_pixel_counts(width / 2, height / 2)`
+    /// — the caller must descend to the half-resolution YV12 frame to
+    /// query the embedded geometry rather than the host dimensions.
+    ///
+    /// Mirrors [`prefix_size`](Self::prefix_size) /
+    /// [`channel_offset_table_size`](Self::channel_offset_table_size)
+    /// on the plane-body axis: those expose the fixed *prefix*
+    /// geometry per `spec/01` §2.3; this exposes the per-plane *body*
+    /// geometry per `spec/03` §6.1 / §6.2. The two YUV channel
+    /// decoders (`decode_arith_yv12` / `decode_arith_yuy2`) read this
+    /// accessor so the §6.1 / §6.2 plane-count formulae live in one
+    /// place.
+    pub fn wire_plane_pixel_counts(self, width: u32, height: u32) -> Option<Vec<usize>> {
+        let w = width as usize;
+        let h = height as usize;
+        let y = w * h;
+        match self {
+            // §6.1 / §6.1.1: Y = W×H, V = U = floor(W×H / 4); wire
+            // plane order Y, V, U.
+            Self::ArithmeticYv12 => {
+                let c = y / 4;
+                Some(vec![y, c, c])
+            }
+            // §6.2: Y = W×H, U = V = floor(W/2) × H; wire plane order
+            // Y, U, V.
+            Self::ArithmeticYuy2 => {
+                let c = (w / 2) * h;
+                Some(vec![y, c, c])
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Read the channel-offset table that immediately follows the
@@ -1280,6 +1342,103 @@ mod tests {
             assert!(
                 matches!(truncated, Err(Error::Truncated { .. })),
                 "{ft:?}: solid_wire_size - 1 bytes must report Truncated"
+            );
+        }
+    }
+
+    /// `wire_plane_pixel_counts` returns `Some` exactly on the two
+    /// planar-YUV wire types and `None` on everything else, and the
+    /// per-plane counts match the `spec/03` §6.1 / §6.2 formulae on
+    /// representative even dimensions where the geometry is exact.
+    #[test]
+    fn wire_plane_pixel_counts_per_type() {
+        // YV12 (4:2:0): Y = W*H, V = U = floor(W*H / 4); order Y,V,U.
+        assert_eq!(
+            FrameType::ArithmeticYv12.wire_plane_pixel_counts(8, 6),
+            Some(vec![48, 12, 12]),
+        );
+        // YUY2 (4:2:2): Y = W*H, U = V = floor(W/2)*H; order Y,U,V.
+        assert_eq!(
+            FrameType::ArithmeticYuy2.wire_plane_pixel_counts(8, 6),
+            Some(vec![48, 24, 24]),
+        );
+        // None for every non-planar-YUV type.
+        for ft in [
+            FrameType::Uncompressed,
+            FrameType::UnalignedRgb24,
+            FrameType::ArithmeticRgb24,
+            FrameType::SolidGrey,
+            FrameType::SolidRgb,
+            FrameType::LegacyRgb,
+            FrameType::ArithmeticRgba,
+            FrameType::SolidRgba,
+            FrameType::ReducedResYv12,
+        ] {
+            assert_eq!(
+                ft.wire_plane_pixel_counts(8, 6),
+                None,
+                "{ft:?}: only the two planar-YUV wire types expose plane counts"
+            );
+        }
+    }
+
+    /// The chroma-plane count uses **integer truncation** toward zero
+    /// per `spec/03` §6.1.1: for odd W or H the YV12 chroma count is
+    /// `floor((W*H) / 4)` and the YUY2 chroma count is
+    /// `floor(W/2) * H`, never rounded up.
+    #[test]
+    fn wire_plane_pixel_counts_truncates_odd_dimensions() {
+        // 5x3: W*H = 15; YV12 chroma = floor(15/4) = 3.
+        assert_eq!(
+            FrameType::ArithmeticYv12.wire_plane_pixel_counts(5, 3),
+            Some(vec![15, 3, 3]),
+        );
+        // 5x3: YUY2 chroma = floor(5/2)*3 = 2*3 = 6.
+        assert_eq!(
+            FrameType::ArithmeticYuy2.wire_plane_pixel_counts(5, 3),
+            Some(vec![15, 6, 6]),
+        );
+    }
+
+    /// The luma count is always `width * height` and the chroma
+    /// planes are always equal-sized pairs (V == U for YV12,
+    /// U == V for YUY2) — the structural invariant the channel
+    /// decoders rely on (`spec/03` §6.1 / §6.2).
+    #[test]
+    fn wire_plane_pixel_counts_structural_invariants() {
+        for (w, h) in [(2u32, 2u32), (8, 8), (16, 12), (32, 18)] {
+            for ft in [FrameType::ArithmeticYv12, FrameType::ArithmeticYuy2] {
+                let counts = ft.wire_plane_pixel_counts(w, h).unwrap();
+                assert_eq!(counts.len(), 3, "{ft:?}: three planes on the wire");
+                assert_eq!(
+                    counts[0],
+                    (w as usize) * (h as usize),
+                    "{ft:?}: luma plane is W*H"
+                );
+                assert_eq!(
+                    counts[1], counts[2],
+                    "{ft:?}: the two chroma planes are equal-sized"
+                );
+            }
+        }
+    }
+
+    /// The YV12 luma + two chroma plane counts sum to the host YV12
+    /// buffer length per [`PixelKind::buffer_len`] on even dimensions
+    /// (`n + 2 * (n/4)`), so the accessor agrees with the host
+    /// buffer-size source of truth.
+    #[test]
+    fn wire_plane_pixel_counts_yv12_sums_to_buffer_len() {
+        use crate::decoder::PixelKind;
+        for (w, h) in [(2u32, 2u32), (8, 8), (16, 12)] {
+            let counts = FrameType::ArithmeticYv12
+                .wire_plane_pixel_counts(w, h)
+                .unwrap();
+            let sum: usize = counts.iter().sum();
+            assert_eq!(
+                sum,
+                PixelKind::Yv12.buffer_len(w, h),
+                "{w}x{h}: YV12 plane counts must sum to the host buffer length"
             );
         }
     }

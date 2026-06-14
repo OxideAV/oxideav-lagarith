@@ -627,12 +627,16 @@ fn decode_arith_yv12(
     }
     let w = width as usize;
     let h = height as usize;
-    let y_pixels = w * h;
-    // `spec/03` §6.1.1 audit-resolved: chroma plane size is the
-    // integer truncation `floor((W * H) / 4)`. For odd W or H,
-    // some output positions therefore have no chroma sample on
-    // the wire — host integration concern, not a wire-format event.
-    let c_pixels = y_pixels / 4;
+    // `spec/03` §6.1 / §6.1.1 plane geometry — single source of truth
+    // via the typed accessor: Y = W*H, V = U = floor((W*H) / 4)
+    // (integer truncation; for odd W or H some output positions have
+    // no chroma sample on the wire — host integration concern). Plane
+    // order on the wire is Y, V, U.
+    let plane_counts = FrameType::ArithmeticYv12
+        .wire_plane_pixel_counts(width, height)
+        .expect("YV12 frame type always has wire plane counts");
+    let y_pixels = plane_counts[0];
+    let c_pixels = plane_counts[1];
 
     let slices = split_channels(payload, 3)?;
     // Wire plane order: Y at slice 0 (W*H), V at slice 1
@@ -711,12 +715,17 @@ fn decode_arith_yuy2(
     }
     let w = width as usize;
     let h = height as usize;
-    let y_pixels = w * h;
     // Per `spec/03` §6.2 chroma planes are W/2 wide and H tall (4:2:2
     // sub-sampling). For odd widths the encoder truncates one luma
-    // column to the chroma macropixel — we mirror that.
+    // column to the chroma macropixel — we mirror that. Plane counts
+    // come from the typed accessor (single source of truth); `cw` is
+    // still needed for the pack loop's column stride.
     let cw = w / 2;
-    let c_pixels = cw * h;
+    let plane_counts = FrameType::ArithmeticYuy2
+        .wire_plane_pixel_counts(width, height)
+        .expect("YUY2 frame type always has wire plane counts");
+    let y_pixels = plane_counts[0];
+    let c_pixels = plane_counts[1];
 
     let slices = split_channels(payload, 3)?;
     let mut plane_y = decode_channel(slices[0], y_pixels)?;
