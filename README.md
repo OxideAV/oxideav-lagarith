@@ -916,18 +916,49 @@ executions** (300 s, 0 findings; 506 corpus units covering 1064 PCs
 30-minute budget. There is no external library decode oracle
 (clean-room wall), so the harness is decode-only.
 
+### Decode benchmarks (Criterion, `benches/decode.rs`)
+
+Round 301 wires up a `criterion` decode benchmark
+(`cargo bench -p oxideav-lagarith --bench decode`) so future
+optimisation rounds can A/B-test changes against a stable per-format
+pixel-rate baseline. The crate is decode-saturated (every wire frame
+type round-trips bit-exactly through the reference encoder), so per
+the workspace "saturated → fuzz / bench / profile" cadence this is a
+depth-mode addition rather than a new decode path. The bench feeds
+the public `decode_frame` one representative 64×64 compressed frame
+of each major pipeline; the frames are real reference-encoder output
+captured once and embedded inline as `const` byte arrays (the same
+self-contained, no-fixture-files, no-`docs/`-reads pattern the
+in-tree cross-decoder pin set uses). A pre-timing
+`decode_frame(...).is_ok()`
+assertion guards each fixture so a malformed embed cannot silently
+bench the error path. Indicative `--measurement-time 1` pixel rates
+on an Apple-silicon dev host: type-10 YV12 ≈ 43 Melem/s, type-3 YUY2
+≈ 28 Melem/s, type-4 RGB24 ≈ 20 Melem/s, type-8 RGBA ≈ 16 Melem/s,
+type-7 legacy ≈ 14 Melem/s (the most expensive entropy path), type-1
+uncompressed ≈ 25 Gelem/s (memcpy floor), and type-6 solid sub-µs.
+
 ### SIMD-vs-scalar predictor (`spec/06` §3.2)
 
 For frame types 2 / 4 / 8 the crate's predictor implements
 **Rule B** (`TL = plane[y-2][W-1]` for `y >= 2`, Rule A fallback
-at `y = 1`, per `spec/06` §3.2), the linear-memory walk
-*carry-equivalent* to the proprietary's SIMD inner-loop. No
-separate SIMD code path is required for byte-equivalent output.
-Frame type 7 (legacy RGB) uses the same Rule B (`spec/07` §9.1
-item 7b). YV12 (type 10) / YUY2 (type 3) / reduced-resolution
-(type 11) retain Rule A pending a clean ffmpeg pin (their planar
-scan order interacts with the DIB flip differently — see
-"Cross-decoder validation" below).
+at `y = 1`). `spec/06` §3 narrates the proprietary's SIMD inner-loop
+as a carry-equivalent of Rule A, but the **binary-resolved**
+`spec/07` §9.1 item 7b is authoritative (per the workspace's
+"`§9.1` Resolved-by-binary items override the §3 narrative"
+convention): reverse-engineering the proprietary's post-predictor
+pixel buffer back into per-plane residuals shows they match a
+**Rule-B** reconstruction bit-for-bit. The crate therefore walks the
+single linear-memory Rule-B form for the packed-RGB(A) families; no
+separate SIMD code path is required for byte-equivalent output. Frame
+type 7 (legacy RGB) inherits the same Rule B (`spec/07` §9.1 item 7b
++ §7.2). YV12 (type 10) / YUY2 (type 3) / reduced-resolution
+(type 11) use **Rule A unconditionally** — resolved in round 295
+from `spec/06` §3.8 (the `0x180009f30` chroma predictor takes the
+`TL = L = plane[y-1][W-1]` carry with no `width % 4` Rule-B branch,
+because the chroma-subsampled plane widths are always 4-byte-aligned
+at the natural subsampling); this is a spec basis, not a pin-pending
+deferral.
 
 ### Cross-decoder validation — ffmpeg black-box oracle
 
@@ -961,9 +992,12 @@ Extractor-round deliverable (disassemble + spec `0x180001050`).
 (b) Non-pow2 pixel counts compound (a) with a related pow2-total
 gap (rescale-to-next-pow2 partial-fix confirmed in r127 but not
 byte-exact); same docs gap blocks both. (c) YV12 / YUY2 planar
-scan-order vs the DIB flip needs a clean ffmpeg pin — round 127
-established YV12/YUY2 self-roundtrip is independent of Rule A vs
-Rule B, so the gap is downstream of the predictor. (d) ffmpeg does
+scan-order vs the DIB flip — the predictor first-column rule is
+**resolved** (Rule A, `spec/06` §3.8, round 295); round 127
+established YV12/YUY2 self-roundtrip is independent of the Rule A vs
+Rule B choice, so any remaining external-decoder divergence here is
+downstream of the predictor (scan-order/flip), not a predictor-rule
+question. (d) ffmpeg does
 not implement the type-1 Uncompressed path, so it cannot oracle
 that type. Byte-exact parity against a *proprietary-encoded* AVI
 still awaits a fixture (`samples.oxideav.org/lagarith/`, 404 per

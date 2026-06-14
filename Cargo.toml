@@ -22,3 +22,20 @@ registry = ["dep:oxideav-core"]
 
 [dependencies]
 oxideav-core = { version = "0.1", optional = true }
+
+[dev-dependencies]
+# Round 301 (depth-mode benchmarks): Criterion drives the `decode`
+# bench harness that future decoder-optimisation rounds use to A/B
+# their changes against a stable per-format pixel-rate baseline.
+# Pinned to the same 0.5 line the other OxideAV crates with benches
+# (flac, vp8, prores, tta) already track.
+criterion = "0.5"
+
+# Round 301 bench. Self-contained: every input is a real compressed
+# Lagarith frame embedded inline (captured once from the crate's own
+# reference encoder), decoded through the public `decode_frame`. No
+# committed fixture files, no `docs/` reads at bench time. Run with:
+#     cargo bench -p oxideav-lagarith --bench decode
+[[bench]]
+name = "decode"
+harness = false

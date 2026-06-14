@@ -6,7 +6,33 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- round 301 — **Criterion decode benchmark harness
+  (`benches/decode.rs`).** The crate is decode-saturated, so per the
+  workspace "saturated → fuzz / bench / profile" cadence this is a
+  depth-mode addition: a `cargo bench --bench decode` harness that
+  feeds the public `decode_frame` one representative 64×64 compressed
+  frame of each major pipeline (type-4 RGB24, type-8 RGBA, type-10
+  YV12, type-3 YUY2, type-7 legacy, type-6 solid, type-1
+  uncompressed). The frames are real reference-encoder output
+  captured once and embedded inline as `const` byte arrays (no
+  committed fixture files, no `docs/` reads at bench time); a
+  pre-timing `is_ok()` assertion guards each embed. `criterion`
+  joins as a `[dev-dependencies]` pin (`0.5`, matching the other
+  benched OxideAV crates). No production code changes.
+
 ### Changed
+
+- round 301 — README **stale-prose correction**: the SIMD-vs-scalar
+  predictor section now states the packed-RGB(A) Rule-B choice on the
+  authority of the binary-resolved `spec/07` §9.1 item 7b (which
+  overrides the `spec/06` §3 narrative per the workspace
+  Resolved-by-binary convention), and the YV12 / YUY2 /
+  reduced-resolution families are documented as **Rule A
+  unconditionally** (resolved round 295 from `spec/06` §3.8), not
+  "pending a clean pin". The matching open-item tail entry is updated
+  to mark the predictor-rule question resolved.
 
 - round 295 — **YV12 / YUY2 / reduced-res first-column predictor
   rule spec-anchored to Rule A (`spec/06` §3.8).** The YV12 (type
