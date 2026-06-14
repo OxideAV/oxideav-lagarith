@@ -5,6 +5,33 @@ Pure-Rust Lagarith lossless video codec for the
 
 ## Status
 
+**Round 295 — YV12 / YUY2 / reduced-res first-column predictor
+rule spec-anchored to Rule A (`spec/06` §3.8).** The README's
+long-standing "YV12/YUY2 retain Rule A pending a clean ffmpeg pin"
+note is now resolved from the spec, not deferred to a black-box
+oracle: `spec/06` §3.8 states the YV12 / YUY2 predictor at
+`lagarith.dll!0x180009f30` uses `TL = L = plane[y-1][W-1]`
+(Rule A) **unconditionally** — those families' chroma-subsampled
+plane widths are always 4-byte-aligned at the natural subsampling,
+so the predictor never takes the `width % 4` Rule-B branch the
+modern RGB(A) types do. The decode paths (`decode_arith_yv12`,
+`decode_arith_yuy2`, and reduced-res type 11 via the YV12 path)
+and the test-side encoder mirrors now select
+`FirstColRule::A` **explicitly** at every plane-predictor call
+site (previously they relied on the bare `apply_plane_inverse`
+default, which the doc comment incorrectly described as "not used
+by any shipping path"). Behaviour is unchanged — the bare wrapper
+already applied Rule A — but the spec basis is now anchored and
+the rule choice is visible at the call site, matching the modern
+RGB(A) paths' explicit `FirstColRule::B`. A new predict-level test
+pins the §3.8 invariant on a multi-row plane where Rule A and Rule
+B genuinely diverge: Rule-A residuals round-trip losslessly, and
+decoding them under Rule B corrupts rows ≥ 2 — so the YUV path's
+Rule-A choice is observable, not a degenerate coincidence. The
+bare `apply_plane_inverse` / `apply_plane_forward` wrappers become
+`#[cfg(test)]`-only convenience helpers. Brings the total
+unit-test count to **302**.
+
 **Round 276 — encoder frame-level solid-colour fast path
 (`spec/01` §3.1).** The test-side encoder gains the proprietary's
 solid-colour shortcut as two frame-level wrappers:
@@ -394,8 +421,14 @@ but is forbidden input.
    alike (`spec/06` §3.2 / `spec/07` §9.1 item 7b). Rule B was
    confirmed for the modern types byte-exactly against the
    independent ffmpeg `lagarith` decoder (round 124); the prior
-   Rule A choice mis-decoded real streams. YV12/YUY2 retain Rule A
-   pending a clean ffmpeg pin.
+   Rule A choice mis-decoded real streams. The **YV12 / YUY2 /
+   reduced-resolution** families (types 3 / 10 / 11) use **Rule A**
+   (`TL = L = plane[y-1][W-1]`) unconditionally per `spec/06` §3.8:
+   their chroma-subsampled plane widths are always 4-byte-aligned
+   at the natural subsampling, so the predictor at
+   `0x180009f30` takes the SIMD `TL = L` carry on every row with no
+   `width % 4` Rule-B branch. The decode + encode call sites now
+   pass this rule explicitly (round 295).
 7. **Cross-plane decorrelation** ([`spec/03` §4](https://github.com/OxideAV/docs/blob/master/video/lagarith/spec/03-channel-decorrelation-and-predictors.md)):
    RGB families only — `R += G; B += G` post-prediction; alpha is
    stored raw.

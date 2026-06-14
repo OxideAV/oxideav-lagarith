@@ -13,9 +13,15 @@
 //! §3.2 / `spec/07` §9.1 item 7b:
 //!
 //! - **Rule A** (`TL = L = plane[y-1][W-1]`): the simple "wrap
-//!   around" rule; the gradient collapses to `T`. Not used by any
-//!   frame type the decoder ships — retained for tests and for the
-//!   degenerate `y == 1` fallback of Rule B.
+//!   around" rule; the gradient collapses to `T`. This is the rule
+//!   the **YV12 / YUY2 / reduced-resolution** families (types 3 / 10
+//!   / 11) use unconditionally per `spec/06` §3.8: those plane
+//!   widths are always 4-byte-aligned at the natural chroma
+//!   subsampling, so the predictor at `lagarith.dll!0x180009f30`
+//!   takes the SIMD `TL = L = plane[y-1][W-1]` carry on every row
+//!   with no `width % 4` branch (and no Rule-B linear-memory step).
+//!   Rule A is also the `y == 1` fallback of Rule B (no `y - 2`
+//!   row).
 //! - **Rule B** (`TL = plane[y-2][W-1]` for `y >= 2`): the
 //!   linear-memory rule the proprietary's SIMD predictor walks one
 //!   step further back. This is the rule the **modern arithmetic
@@ -35,9 +41,12 @@
 /// Selects the first-column-of-row rule for the inverse predictor.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum FirstColRule {
-    /// `TL = L = plane[y-1][W-1]`. Degenerate "wrap-around" rule;
-    /// not used by any shipping decode path (kept for tests + the
-    /// `y == 1` fallback of Rule B).
+    /// `TL = L = plane[y-1][W-1]`. The "wrap-around" rule used
+    /// unconditionally by the YV12 / YUY2 / reduced-resolution
+    /// decode paths (types 3 / 10 / 11) per `spec/06` §3.8 — their
+    /// chroma-subsampled plane widths are always 4-byte-aligned, so
+    /// the `0x180009f30` predictor never takes a `width % 4` Rule-B
+    /// branch. Also the `y == 1` fallback of Rule B (no `y - 2` row).
     A,
     /// `TL = plane[y-2][W-1]` for `y >= 2` (Rule A for `y == 1`).
     /// The modern arithmetic RGB(A) path (types 2/4/8) and the
@@ -48,7 +57,13 @@ pub(crate) enum FirstColRule {
 
 /// Apply the in-place left-then-clamped-MED reconstruction to a
 /// single plane using **Rule A** first-column. `plane` is
-/// `width * height` bytes laid out row-major.
+/// `width * height` bytes laid out row-major. Test-only convenience
+/// wrapper: the shipping decode paths call
+/// [`apply_plane_inverse_with_rule`] with an explicit rule
+/// ([`FirstColRule::A`] for the YV12 / YUY2 / reduced-res families
+/// per `spec/06` §3.8, [`FirstColRule::B`] for the modern / legacy
+/// RGB(A) paths).
+#[cfg(test)]
 pub fn apply_plane_inverse(plane: &mut [u8], width: usize, height: usize) {
     apply_plane_inverse_with_rule(plane, width, height, FirstColRule::A);
 }
@@ -278,6 +293,44 @@ mod tests {
         let res_a = apply_plane_forward_with_rule(&plane, 8, 2, FirstColRule::A);
         let res_b = apply_plane_forward_with_rule(&plane, 8, 2, FirstColRule::B);
         assert_eq!(res_a, res_b);
+    }
+
+    /// `spec/06` §3.8: the YV12 / YUY2 / reduced-resolution families
+    /// decode their planes under Rule A unconditionally. This pins the
+    /// invariant that Rule-A reconstruction inverts Rule-A residuals
+    /// exactly (the decode path's selection), on a multi-row plane
+    /// whose first columns straddle so Rule A and Rule B genuinely
+    /// diverge — i.e. the choice is observable, not degenerate.
+    #[test]
+    fn rule_a_yuv_first_column_inverts_itself() {
+        // 4×4 plane like a chroma quadrant; first columns vary across
+        // rows so the rule choice matters (cf.
+        // `predictor_rule_b_diverges_from_rule_a_on_row_2`).
+        let plane: Vec<u8> = vec![
+            10, 20, 30, 40, // row 0
+            50, 60, 70, 80, // row 1
+            90, 100, 110, 120, // row 2
+            130, 140, 150, 160, // row 3
+        ];
+        // Encode + decode both under Rule A (the YUV-family selection).
+        let res_a = apply_plane_forward_with_rule(&plane, 4, 4, FirstColRule::A);
+        let mut recon = res_a.clone();
+        apply_plane_inverse_with_rule(&mut recon, 4, 4, FirstColRule::A);
+        assert_eq!(recon, plane, "Rule A round-trip must be lossless");
+        // And the residual stream genuinely differs from Rule B on this
+        // plane, so the YUV path's Rule-A choice is observable: decoding
+        // the Rule-A residuals under Rule B would corrupt rows >= 2.
+        let res_b = apply_plane_forward_with_rule(&plane, 4, 4, FirstColRule::B);
+        assert_ne!(
+            res_a, res_b,
+            "Rule A and Rule B must diverge so the §3.8 choice is testable"
+        );
+        let mut wrong = res_a.clone();
+        apply_plane_inverse_with_rule(&mut wrong, 4, 4, FirstColRule::B);
+        assert_ne!(
+            wrong, plane,
+            "decoding Rule-A residuals under Rule B must NOT reproduce the plane"
+        );
     }
 
     #[test]

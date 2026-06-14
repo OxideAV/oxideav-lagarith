@@ -6,6 +6,30 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- round 295 — **YV12 / YUY2 / reduced-res first-column predictor
+  rule spec-anchored to Rule A (`spec/06` §3.8).** The YV12 (type
+  10), YUY2 (type 3), and reduced-resolution (type 11) decode paths
+  — and their test-side encoder mirrors — now select
+  `FirstColRule::A` (`TL = L = plane[y-1][W-1]`) **explicitly** at
+  every plane-predictor call site, anchored in `spec/06` §3.8: the
+  predictor at `lagarith.dll!0x180009f30` for those families takes
+  the `TL = L` carry unconditionally because their
+  chroma-subsampled plane widths are always 4-byte-aligned at the
+  natural subsampling (no `width % 4` Rule-B branch). Previously the
+  call sites relied on the bare `apply_plane_inverse` default, whose
+  doc comment wrongly claimed Rule A was "not used by any shipping
+  path"; this resolves the README's "YV12/YUY2 retain Rule A pending
+  a clean ffmpeg pin" note from the spec rather than deferring it to
+  a black-box oracle. Behaviour is unchanged (the bare wrapper
+  already applied Rule A). The bare `apply_plane_inverse` /
+  `apply_plane_forward` wrappers are now `#[cfg(test)]`-only. New
+  `rule_a_yuv_first_column_inverts_itself` test pins the §3.8
+  invariant on a multi-row plane where Rule A and Rule B diverge:
+  Rule-A residuals round-trip losslessly and decoding them under
+  Rule B corrupts rows ≥ 2.
+
 ### Fixed
 
 - round 291 — **decode panic on overflowing probability table

@@ -13,8 +13,7 @@ use crate::legacy_range_coder::{
     build_legacy_cdf, encode_legacy_freq_table, is_rare_symbol_cluster, LegacyRangeEncoder,
 };
 use crate::predict::{
-    apply_plane_forward, apply_plane_forward_with_rule, cross_plane_decorrelate_rgb_forward,
-    FirstColRule,
+    apply_plane_forward_with_rule, cross_plane_decorrelate_rgb_forward, FirstColRule,
 };
 use crate::range_coder::{Cdf, RangeEncoder, TOP};
 use crate::rle::contract_raw;
@@ -482,18 +481,22 @@ pub fn encode_arith_yv12(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
     let plane_v = &pixels[y_pixels..y_pixels + c_pixels];
     let plane_u = &pixels[y_pixels + c_pixels..];
 
-    let res_y = apply_plane_forward(plane_y, w, h);
+    // First-column-of-row rule is Rule A per spec/06 §3.8 (the YV12
+    // plane widths are always 4-byte-aligned at the natural chroma
+    // subsampling, so the predictor is unconditional). Matches the
+    // decoder's `FirstColRule::A` selection in `decode_arith_yv12`.
+    let res_y = apply_plane_forward_with_rule(plane_y, w, h, FirstColRule::A);
     let cw = w / 2;
     let ch = h / 2;
     let (res_v, res_u) = if cw * ch == c_pixels {
         (
-            apply_plane_forward(plane_v, cw, ch),
-            apply_plane_forward(plane_u, cw, ch),
+            apply_plane_forward_with_rule(plane_v, cw, ch, FirstColRule::A),
+            apply_plane_forward_with_rule(plane_u, cw, ch, FirstColRule::A),
         )
     } else {
         (
-            apply_plane_forward(plane_v, c_pixels, 1),
-            apply_plane_forward(plane_u, c_pixels, 1),
+            apply_plane_forward_with_rule(plane_v, c_pixels, 1, FirstColRule::A),
+            apply_plane_forward_with_rule(plane_u, c_pixels, 1, FirstColRule::A),
         )
     };
 
@@ -533,9 +536,11 @@ pub fn encode_arith_yuy2(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
         }
     }
 
-    let res_y = apply_plane_forward(&plane_y, w, h);
-    let res_u = apply_plane_forward(&plane_u, cw, h);
-    let res_v = apply_plane_forward(&plane_v, cw, h);
+    // Rule A per spec/06 §3.8 — see `encode_arith_yv12`. The YUY2
+    // chroma plane width (W/2) is 4-byte-aligned at 4:2:2.
+    let res_y = apply_plane_forward_with_rule(&plane_y, w, h, FirstColRule::A);
+    let res_u = apply_plane_forward_with_rule(&plane_u, cw, h, FirstColRule::A);
+    let res_v = apply_plane_forward_with_rule(&plane_v, cw, h, FirstColRule::A);
 
     // Per-channel header-form selector — see `encode_channel_best`.
     let ch_y = encode_channel_best(&res_y);

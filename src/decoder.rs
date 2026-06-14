@@ -37,9 +37,7 @@
 use crate::channel::{decode_channel, decode_legacy_channel};
 use crate::error::{Error, Result};
 use crate::frame::{split_channels, FrameType};
-use crate::predict::{
-    apply_plane_inverse, apply_plane_inverse_with_rule, cross_plane_decorrelate_rgb, FirstColRule,
-};
+use crate::predict::{apply_plane_inverse_with_rule, cross_plane_decorrelate_rgb, FirstColRule};
 
 /// What pixel format the caller wants the decoder to produce.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -644,17 +642,21 @@ fn decode_arith_yv12(
     let mut plane_u = decode_channel(slices[2], c_pixels)?;
 
     // Per-plane spatial predictor reverse. Width/height for the
-    // chroma planes is W/2 × H/2 — but since `apply_plane_inverse`
-    // only uses width × height = pixel-count and the per-row /
-    // per-column offsets, integer-truncated sub-sample sizes
-    // (W/2, H/2) match what the proprietary's predictor at
-    // `lagarith.dll!0x180009f30` walks (spec/03 §6.1).
-    apply_plane_inverse(&mut plane_y, w, h);
+    // chroma planes is W/2 × H/2 — but since the predictor only uses
+    // width × height = pixel-count and the per-row / per-column
+    // offsets, integer-truncated sub-sample sizes (W/2, H/2) match
+    // what the proprietary's predictor at `lagarith.dll!0x180009f30`
+    // walks (spec/03 §6.1). The first-column-of-row rule is
+    // **Rule A** (`TL = L = plane[y-1][W-1]`) per spec/06 §3.8: the
+    // YV12 plane widths are always 4-byte-aligned at the natural
+    // chroma subsampling, so the predictor's dispatch is
+    // unconditional (no `width % 4` Rule-B branch).
+    apply_plane_inverse_with_rule(&mut plane_y, w, h, FirstColRule::A);
     let cw = w / 2;
     let ch = h / 2;
     if cw * ch == c_pixels {
-        apply_plane_inverse(&mut plane_v, cw, ch);
-        apply_plane_inverse(&mut plane_u, cw, ch);
+        apply_plane_inverse_with_rule(&mut plane_v, cw, ch, FirstColRule::A);
+        apply_plane_inverse_with_rule(&mut plane_u, cw, ch, FirstColRule::A);
     } else {
         // SPECGAP fallback: spec/03 §6.1.1 leaves the row/column
         // breakdown for odd-dimensioned chroma to host integration.
@@ -662,8 +664,8 @@ fn decode_arith_yv12(
         // bit-accurate for the cumulative-sum row-0 rule and a
         // best-effort placeholder for fractional rows. Tests in
         // round 2 use even dimensions only.
-        apply_plane_inverse(&mut plane_v, c_pixels, 1);
-        apply_plane_inverse(&mut plane_u, c_pixels, 1);
+        apply_plane_inverse_with_rule(&mut plane_v, c_pixels, 1, FirstColRule::A);
+        apply_plane_inverse_with_rule(&mut plane_u, c_pixels, 1, FirstColRule::A);
     }
 
     let mut pixels = Vec::with_capacity(y_pixels + 2 * c_pixels);
@@ -721,9 +723,14 @@ fn decode_arith_yuy2(
     let mut plane_u = decode_channel(slices[1], c_pixels)?;
     let mut plane_v = decode_channel(slices[2], c_pixels)?;
 
-    apply_plane_inverse(&mut plane_y, w, h);
-    apply_plane_inverse(&mut plane_u, cw, h);
-    apply_plane_inverse(&mut plane_v, cw, h);
+    // First-column-of-row rule is **Rule A** per spec/06 §3.8 — the
+    // YUY2 chroma plane width (W/2) is always 4-byte-aligned at 4:2:2
+    // subsampling, so the `0x180009f30` predictor takes the
+    // unconditional `TL = L = plane[y-1][W-1]` carry (no `width % 4`
+    // Rule-B branch).
+    apply_plane_inverse_with_rule(&mut plane_y, w, h, FirstColRule::A);
+    apply_plane_inverse_with_rule(&mut plane_u, cw, h, FirstColRule::A);
+    apply_plane_inverse_with_rule(&mut plane_v, cw, h, FirstColRule::A);
 
     // Pack Y/U/V into the YUY2 output. The output is a `W * H * 2`
     // byte buffer; we emit one full row at a time. Odd-width tail
