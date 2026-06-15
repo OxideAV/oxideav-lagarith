@@ -22,6 +22,52 @@ pub enum FrameType {
     ReducedResYv12,  // 11 (= type 10 at half-W/half-H + 2× upscale)
 }
 
+/// Semantic role of a single decoded plane (channel) in wire plane
+/// order, as it appears in the channel-offset table layout of an
+/// arithmetic-coded frame (`spec/01` §2.3) combined with the
+/// per-family plane ordering (`spec/03` §6.1 / §6.2 + §4).
+///
+/// The wire plane order is the order in which the per-channel slices
+/// are emitted into the frame body: plane 0 begins immediately after
+/// the channel-offset prefix (frame byte 9 for 3-channel frames, byte
+/// 13 for the 4-channel RGBA frame), and the `(n_channels − 1)` u32
+/// slots of the channel-offset table point to the start of planes
+/// `1..n_channels` in that same order (`spec/01` §2.3:
+/// "the offsets pointing to G/U and B/V; the R/Y channel starts at
+/// byte 9 … For RGBA, 3 offsets … pointing to G, B, and A").
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum WirePlaneRole {
+    /// Red plane — the wiki's "R" channel, wire plane 0 of the
+    /// packed-RGB(A) families (`spec/01` §2.3 "R/Y channel starts at
+    /// byte 9"; `spec/03` §5.3 audit-clarification on the BGR memory
+    /// inversion). Decoded into output position +0 of each pixel,
+    /// which under the Windows `BI_RGB` BGR memory convention is the
+    /// B byte (`spec/01` §2.2.1) — the *role* name follows the wiki's
+    /// channel labelling, not the output memory position.
+    Red,
+    /// Green plane — the cross-plane decorrelation pivot for the RGB
+    /// families (`spec/03` §4: `R += G; B += G`). Output position +1.
+    Green,
+    /// Blue plane — the wiki's "B/V" channel (`spec/01` §2.3). Output
+    /// position +2.
+    Blue,
+    /// Alpha plane — wire plane 3 of [`ArithmeticRgba`](FrameType::ArithmeticRgba)
+    /// only, stored raw with no cross-plane decorrelation against G
+    /// (`spec/03` §4.3). Output position +3.
+    Alpha,
+    /// Luma plane — wire plane 0 of the planar-YUV families (`spec/03`
+    /// §6.1 / §6.2), `W × H` bytes.
+    Luma,
+    /// Chroma-U plane — the `U` chroma channel. For YUY2 (`spec/03`
+    /// §6.2) it is wire plane 1 (U *before* V); for YV12 (`spec/03`
+    /// §6.1) it is wire plane 2 (V before U).
+    ChromaU,
+    /// Chroma-V plane — the `V` chroma channel. For YV12 it is wire
+    /// plane 1 (V before U — the YV12 plane order); for YUY2 it is
+    /// wire plane 2 (after U).
+    ChromaV,
+}
+
 impl FrameType {
     pub fn from_byte(b: u8) -> Result<Self> {
         match b {
@@ -478,6 +524,64 @@ impl FrameType {
                 Some(vec![y, c, c])
             }
             _ => None,
+        }
+    }
+
+    /// Semantic [`WirePlaneRole`] of each decoded plane in **wire
+    /// plane order** for the arithmetic-coded frame types — the
+    /// single structural source of truth for the channel-offset
+    /// table's slot → channel mapping (`spec/01` §2.3) combined with
+    /// the per-family plane ordering (`spec/03` §6.1 / §6.2 + §4).
+    ///
+    /// Wire plane order is the order the per-channel slices appear in
+    /// the frame body: plane 0 starts immediately after the
+    /// channel-offset prefix ([`prefix_size`](Self::prefix_size)
+    /// bytes), and the `(n_channels − 1)` u32 channel-offset slots
+    /// point to planes `1..n_channels` in this same order. The
+    /// returned slice therefore lines up element-for-element with the
+    /// slices [`split_channels`] yields and with
+    /// [`wire_plane_pixel_counts`](Self::wire_plane_pixel_counts) on
+    /// the planar-YUV families:
+    ///
+    /// | Frame type | Wire plane roles |
+    /// | ---------- | ---------------- |
+    /// | [`UnalignedRgb24`](Self::UnalignedRgb24) (2) / [`ArithmeticRgb24`](Self::ArithmeticRgb24) (4) / [`LegacyRgb`](Self::LegacyRgb) (7) | `[Red, Green, Blue]` — `spec/01` §2.3 ("R/Y channel starts at byte 9; offsets point to G/U and B/V"). |
+    /// | [`ArithmeticRgba`](Self::ArithmeticRgba) (8) | `[Red, Green, Blue, Alpha]` — `spec/01` §2.3 ("3 offsets … pointing to G, B, and A; R starts at byte 13"); `spec/03` §4.3 (alpha raw). |
+    /// | [`ArithmeticYv12`](Self::ArithmeticYv12) (10) | `[Luma, ChromaV, ChromaU]` — `spec/03` §6.1 (the YV12 plane order, V before U). |
+    /// | [`ArithmeticYuy2`](Self::ArithmeticYuy2) (3) | `[Luma, ChromaU, ChromaV]` — `spec/03` §6.2 (YUY2 stores U before V on the wire). |
+    /// | [`ReducedResYv12`](Self::ReducedResYv12) (11) | `[Luma, ChromaV, ChromaU]` — its wire body is a half-W / half-H YV12 frame (`spec/01` §2.4), so the embedded plane roles match type 10. |
+    ///
+    /// Returns `None` for the literal types (uncompressed and the
+    /// three solid-colour types) — they carry no channel-offset table
+    /// or per-plane wire layout ([`prefix_size`](Self::prefix_size)
+    /// is `1`, [`n_channels`](Self::n_channels) is `0`).
+    ///
+    /// The returned slice length always equals
+    /// [`n_channels`](Self::n_channels) for the arithmetic types
+    /// (`3` for the 3-channel families, `4` for RGBA), and the role
+    /// sequence is part of the public wire-format contract (callers
+    /// can index the channel-offset table slot `k` to the role of
+    /// plane `k + 1`).
+    pub fn wire_plane_roles(self) -> Option<&'static [WirePlaneRole]> {
+        use WirePlaneRole::*;
+        // §2.3: R/Y is wire plane 0; offset-table slots 1, 2 → G, B.
+        const RGB: &[WirePlaneRole] = &[Red, Green, Blue];
+        // §2.3: R is wire plane 0; offset-table slots 1, 2, 3 → G, B, A.
+        const RGBA: &[WirePlaneRole] = &[Red, Green, Blue, Alpha];
+        // §6.1: YV12 stores V before U on the wire.
+        const YV12: &[WirePlaneRole] = &[Luma, ChromaV, ChromaU];
+        // §6.2: YUY2 stores U before V on the wire.
+        const YUY2: &[WirePlaneRole] = &[Luma, ChromaU, ChromaV];
+        match self {
+            Self::UnalignedRgb24 | Self::ArithmeticRgb24 | Self::LegacyRgb => Some(RGB),
+            Self::ArithmeticRgba => Some(RGBA),
+            // §2.4: type 11's wire body is a half-resolution YV12
+            // frame, so its embedded plane roles equal type 10's.
+            Self::ArithmeticYv12 | Self::ReducedResYv12 => Some(YV12),
+            Self::ArithmeticYuy2 => Some(YUY2),
+            // Literal types (uncompressed / solid) carry no per-plane
+            // wire layout.
+            Self::Uncompressed | Self::SolidGrey | Self::SolidRgb | Self::SolidRgba => None,
         }
     }
 }
@@ -1440,6 +1544,136 @@ mod tests {
                 PixelKind::Yv12.buffer_len(w, h),
                 "{w}x{h}: YV12 plane counts must sum to the host buffer length"
             );
+        }
+    }
+
+    /// `wire_plane_roles` returns the exact per-family wire plane-role
+    /// sequence anchored in `spec/01` §2.3 (channel-offset table slot
+    /// → channel mapping) + `spec/03` §6.1 / §6.2 + §4: `[R, G, B]`
+    /// for the packed-RGB families, `[R, G, B, A]` for RGBA, the YV12
+    /// V-before-U order for types 10 / 11, and the YUY2 U-before-V
+    /// order for type 3. The slice sequence is part of the public
+    /// wire-format contract, so iteration order is pinned here.
+    #[test]
+    fn wire_plane_roles_exact_sequence_per_type() {
+        use WirePlaneRole::*;
+        // §2.3: R/Y is wire plane 0; slots 1, 2 point to G, B.
+        let rgb: &[WirePlaneRole] = &[Red, Green, Blue];
+        for ft in [
+            FrameType::UnalignedRgb24,
+            FrameType::ArithmeticRgb24,
+            FrameType::LegacyRgb,
+        ] {
+            assert_eq!(
+                ft.wire_plane_roles(),
+                Some(rgb),
+                "{ft:?}: packed-RGB families decode planes in [R, G, B] wire order"
+            );
+        }
+        // §2.3: R is wire plane 0; slots 1, 2, 3 point to G, B, A.
+        assert_eq!(
+            FrameType::ArithmeticRgba.wire_plane_roles(),
+            Some([Red, Green, Blue, Alpha].as_slice()),
+        );
+        // §6.1: YV12 stores V before U on the wire; §2.4: type 11's
+        // wire body is a half-resolution YV12 frame so it matches.
+        for ft in [FrameType::ArithmeticYv12, FrameType::ReducedResYv12] {
+            assert_eq!(
+                ft.wire_plane_roles(),
+                Some([Luma, ChromaV, ChromaU].as_slice()),
+                "{ft:?}: YV12 wire order is Y, V, U"
+            );
+        }
+        // §6.2: YUY2 stores U before V on the wire.
+        assert_eq!(
+            FrameType::ArithmeticYuy2.wire_plane_roles(),
+            Some([Luma, ChromaU, ChromaV].as_slice()),
+        );
+        // Literal types carry no per-plane wire layout.
+        for ft in [
+            FrameType::Uncompressed,
+            FrameType::SolidGrey,
+            FrameType::SolidRgb,
+            FrameType::SolidRgba,
+        ] {
+            assert_eq!(
+                ft.wire_plane_roles(),
+                None,
+                "{ft:?}: literal types have no channel-offset table"
+            );
+        }
+    }
+
+    /// `wire_plane_roles().is_some()` coincides exactly with
+    /// [`FrameType::is_arithmetic`], and on every arithmetic type the
+    /// role-slice length equals [`FrameType::n_channels`] — so the
+    /// roles line up element-for-element with the slices
+    /// [`split_channels`] yields (`spec/01` §2.3).
+    #[test]
+    fn wire_plane_roles_length_matches_n_channels() {
+        for byte in 1u8..=11 {
+            let ft = FrameType::from_byte(byte).unwrap();
+            match ft.wire_plane_roles() {
+                Some(roles) => {
+                    assert!(ft.is_arithmetic(), "{ft:?}: roles present iff arithmetic");
+                    assert_eq!(
+                        roles.len(),
+                        ft.n_channels(),
+                        "{ft:?}: one role per decoded channel"
+                    );
+                }
+                None => assert!(
+                    !ft.is_arithmetic(),
+                    "{ft:?}: roles absent iff non-arithmetic"
+                ),
+            }
+        }
+    }
+
+    /// The RGB(A) families' role sequences agree with the cross-plane
+    /// decorrelation contract (`spec/03` §4): Green sits at wire plane
+    /// 1 (the decorrelation pivot for R and B), and Alpha — present
+    /// only on RGBA — is the final wire plane (stored raw, §4.3). The
+    /// YUV families carry no Red/Green/Blue/Alpha role.
+    #[test]
+    fn wire_plane_roles_rgb_family_structure() {
+        use WirePlaneRole::*;
+        for ft in [
+            FrameType::UnalignedRgb24,
+            FrameType::ArithmeticRgb24,
+            FrameType::LegacyRgb,
+            FrameType::ArithmeticRgba,
+        ] {
+            let roles = ft.wire_plane_roles().unwrap();
+            assert_eq!(roles[0], Red, "{ft:?}: wire plane 0 is R");
+            assert_eq!(roles[1], Green, "{ft:?}: G is the decorrelation pivot");
+            assert_eq!(roles[2], Blue, "{ft:?}: wire plane 2 is B");
+            assert_eq!(
+                roles.contains(&Alpha),
+                ft.has_alpha_plane(),
+                "{ft:?}: Alpha role present iff has_alpha_plane"
+            );
+            if ft.has_alpha_plane() {
+                assert_eq!(
+                    *roles.last().unwrap(),
+                    Alpha,
+                    "{ft:?}: Alpha is the final plane"
+                );
+            }
+        }
+        // The YUV families never carry an RGB(A) role.
+        for ft in [
+            FrameType::ArithmeticYv12,
+            FrameType::ReducedResYv12,
+            FrameType::ArithmeticYuy2,
+        ] {
+            let roles = ft.wire_plane_roles().unwrap();
+            for r in roles {
+                assert!(
+                    matches!(r, Luma | ChromaU | ChromaV),
+                    "{ft:?}: YUV families carry only luma/chroma roles"
+                );
+            }
         }
     }
 }

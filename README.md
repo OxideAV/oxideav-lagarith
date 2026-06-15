@@ -5,6 +5,39 @@ Pure-Rust Lagarith lossless video codec for the
 
 ## Status
 
+**Round 310 — typed `FrameType::wire_plane_roles()` accessor: the
+channel-offset table slot → channel mapping in wire plane order
+(`spec/01` §2.3 + `spec/03` §6.1 / §6.2 + §4).** A new structural
+accessor on the public `FrameType` enum returns the semantic
+[`WirePlaneRole`] of each decoded plane in **wire plane order** — the
+order the per-channel slices appear in the frame body, with plane 0
+starting after the channel-offset prefix and the `(n_channels − 1)`
+u32 offset-table slots pointing to planes `1..n_channels` in the same
+order. The per-family role table: `[Red, Green, Blue]` for the three
+packed-RGB families (2 / 4 / 7 — `spec/01` §2.3 "R/Y channel starts
+at byte 9; offsets point to G/U and B/V"); `[Red, Green, Blue, Alpha]`
+for `ArithmeticRgba` (8 — three offsets to G / B / A, R at byte 13,
+alpha stored raw per `spec/03` §4.3); `[Luma, ChromaV, ChromaU]` for
+`ArithmeticYv12` (10) and `ReducedResYv12` (11, whose wire body is a
+half-W / half-H YV12 frame per `spec/01` §2.4) — the YV12 V-before-U
+plane order of `spec/03` §6.1; and `[Luma, ChromaU, ChromaV]` for
+`ArithmeticYuy2` (3 — U *before* V on the wire per `spec/03` §6.2).
+Returns `None` for the literal types (uncompressed + the three solid
+types) which carry no channel-offset table. The returned slice lines
+up element-for-element with the slices `split_channels` yields and
+complements `wire_plane_pixel_counts` (round 308; per-plane *counts*)
+and `n_channels` (count only) by naming each plane's *role*. New
+`WirePlaneRole` enum exported from the crate root. No wire-format or
+decode-behaviour change — the role sequence is exactly the order the
+per-frame-type decoders already consume. 3 new unit tests pin the
+exact per-type role sequence (so iteration order is part of the
+public contract), `is_some() ⟺ is_arithmetic` with slice length
+equal to `n_channels`, and the RGB(A) decorrelation-pivot structure
+(Green at wire plane 1, Alpha last iff `has_alpha_plane`).
+Brings the lib unit-test count to **309**.
+
+[`WirePlaneRole`]: https://docs.rs/oxideav-lagarith/latest/oxideav_lagarith/enum.WirePlaneRole.html
+
 **Round 308 — typed `FrameType::wire_plane_pixel_counts(width,
 height)` accessor: single source of truth for the planar-YUV
 chroma-subsampling geometry (`spec/03` §6.1 / §6.1.1 / §6.2).**

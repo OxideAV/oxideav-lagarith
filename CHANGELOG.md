@@ -8,6 +8,35 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- round 310 — **typed `FrameType::wire_plane_roles()` accessor +
+  `WirePlaneRole` enum.** Extends the public `FrameType` enum (rounds
+  242 / 253 / 261 / 262 / 308) with a structural accessor returning
+  the semantic role of each decoded plane in **wire plane order** —
+  the single source of truth for the channel-offset table's slot →
+  channel mapping (`spec/01` §2.3) combined with the per-family plane
+  ordering (`spec/03` §6.1 / §6.2 + §4). Returns
+  `Some([Red, Green, Blue])` for the three packed-RGB families (2 / 4
+  / 7), `Some([Red, Green, Blue, Alpha])` for `ArithmeticRgba` (8),
+  `Some([Luma, ChromaV, ChromaU])` for `ArithmeticYv12` (10) and
+  `ReducedResYv12` (11 — half-resolution YV12 body per `spec/01`
+  §2.4), `Some([Luma, ChromaU, ChromaV])` for `ArithmeticYuy2` (3 —
+  U before V on the wire), and `None` for the literal types
+  (uncompressed + the three solid types) which carry no channel-offset
+  table. The slice lines up element-for-element with `split_channels`
+  output and complements round 308's `wire_plane_pixel_counts`
+  (per-plane counts) by naming each plane's role. New public
+  `WirePlaneRole` enum (`Red` / `Green` / `Blue` / `Alpha` / `Luma`
+  / `ChromaU` / `ChromaV`) exported from the crate root. No
+  wire-format or decode-behaviour change. 3 new unit tests pin the
+  exact per-type role sequence
+  (`wire_plane_roles_exact_sequence_per_type`), the
+  `is_some() ⟺ is_arithmetic` + `roles.len() == n_channels` invariant
+  (`wire_plane_roles_length_matches_n_channels`), and the RGB(A)
+  decorrelation-pivot structure — Green at wire plane 1, Alpha last
+  iff `has_alpha_plane`, YUV families carry only luma/chroma roles
+  (`wire_plane_roles_rgb_family_structure`). Brings the lib unit-test
+  count from 306 to **309**.
+
 - round 301 — **Criterion decode benchmark harness
   (`benches/decode.rs`).** The crate is decode-saturated, so per the
   workspace "saturated → fuzz / bench / profile" cadence this is a
