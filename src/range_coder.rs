@@ -243,6 +243,20 @@ impl<'a> RangeDecoder<'a> {
         debug_assert!(total > 0, "Cdf::total must be non-zero");
         let q = self.range / total;
 
+        // `spec/02` §5 step 1 requires the quotient `q >= 1`; the
+        // legitimate wire total equals the per-channel symbol count
+        // (`spec/04` §5 validation correction), always ≤ pixel count
+        // ≤ `range` (range ∈ [2^23 + 1, 2^31] per `spec/02` §2). A
+        // malformed Fibonacci prefix can decode a `total > range`,
+        // making `q == 0`; the generic Step-C path below then divides
+        // `low / q`. Reject it as a wire error so attacker-supplied
+        // payloads can't panic the decoder (`Cdf::from_frequencies`
+        // accepts totals up to u32::MAX by design, so the bound check
+        // belongs here where `range` is in scope).
+        if q == 0 {
+            return Err(Error::ProbabilityTotalExceedsRange);
+        }
+
         // Step A — symbol 0 (zero) fast path. `freq[0] = cum[1]`,
         // so the test is `low < cum[1] * q`.
         let freq0_scaled = cdf.freq0 * q;
@@ -609,6 +623,71 @@ mod tests {
         freq[0] = u32::MAX;
         let cdf = Cdf::from_frequencies(&freq).expect("u32::MAX total must build");
         assert_eq!(cdf.total(), u32::MAX);
+    }
+
+    /// A CDF whose total exceeds the range coder's working `range`
+    /// makes the per-symbol quotient `q = range / total` collapse to
+    /// zero. The generic Step-C path divides `low / q`, so an
+    /// unguarded decode would panic with a divide-by-zero. The
+    /// decoder must surface [`Error::ProbabilityTotalExceedsRange`]
+    /// instead — a malformed Fibonacci probability prefix can encode
+    /// such a total (`Cdf::from_frequencies` accepts totals up to
+    /// `u32::MAX` by design; the `q >= 1` invariant of `spec/02` §5
+    /// is enforced at decode time where `range` is in scope).
+    #[test]
+    fn decode_symbol_rejects_total_above_range() {
+        // total = u32::MAX > INIT_RANGE (2^31), so the very first
+        // decode_symbol computes q = 2^31 / (2^32 - 1) = 0.
+        let mut freq = [0u32; 256];
+        freq[0] = u32::MAX - 1;
+        freq[1] = 1;
+        let cdf = Cdf::from_frequencies(&freq).expect("builds (total <= u32::MAX)");
+        assert!(
+            cdf.total() > INIT_RANGE,
+            "test premise: total must exceed range"
+        );
+
+        // Any four priming bytes give a valid RangeDecoder; the body
+        // content is irrelevant because the q == 0 guard fires first.
+        let body = [0u8; 8];
+        let mut dec = RangeDecoder::new(&body).expect("4 priming bytes present");
+        assert_eq!(
+            dec.decode_symbol(&cdf),
+            Err(Error::ProbabilityTotalExceedsRange),
+        );
+    }
+
+    /// The guard must NOT false-trigger on a legitimate total. The
+    /// minimum renormalised `range` is `TOP + 1` (`spec/02` §2), so
+    /// any `total <= TOP` keeps `q = range / total >= 1` at every
+    /// symbol — the regime the encoder's `MAX_MODERN_TOTAL = TOP`
+    /// cap (`spec/04` §5) guarantees. A `total == TOP` roundtrip
+    /// must decode cleanly with no `ProbabilityTotalExceedsRange`.
+    #[test]
+    fn decode_symbol_accepts_total_at_cap() {
+        let mut freq = [0u32; 256];
+        // total = TOP exactly: the largest total the encoder cap
+        // admits, and the boundary at which q stays >= 1 for every
+        // possible renormalised range.
+        freq[0] = TOP - 3;
+        freq[1] = 1;
+        freq[2] = 1;
+        freq[3] = 1;
+        let cdf = Cdf::from_frequencies(&freq).expect("builds");
+        assert_eq!(cdf.total(), TOP);
+
+        let symbols = vec![0u8, 0, 1, 0, 2, 3, 0, 0, 1, 0, 0, 2];
+        let mut enc = RangeEncoder::new();
+        for &s in &symbols {
+            enc.encode_symbol(&cdf, s as usize);
+        }
+        let bytes = enc.finish();
+        let mut dec = RangeDecoder::new(&bytes).unwrap();
+        let mut out = Vec::with_capacity(symbols.len());
+        for _ in 0..symbols.len() {
+            out.push(dec.decode_symbol(&cdf).expect("q >= 1, no rejection"));
+        }
+        assert_eq!(out, symbols);
     }
 
     /// Self-roundtrip: encode symbols and decode them back.

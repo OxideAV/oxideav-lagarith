@@ -6,6 +6,29 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- round 322 — **divide-by-zero panic in the modern range coder on a
+  malformed probability total.** `RangeDecoder::decode_symbol`
+  (`spec/02` §5) computes the per-symbol quotient `q = range / total`,
+  then the generic Step-C path divides `low / q`. The wire `total`
+  comes straight from the Fibonacci probability prefix
+  (`fibonacci::decode_freq_table` → `Cdf::from_frequencies`), which
+  accepts totals up to `u32::MAX` by design. A malformed prefix
+  encoding a `total` greater than the working `range` (range ∈
+  `[2^23 + 1, 2^31]` per `spec/02` §2) makes `q == 0`, so `low / q`
+  panicked — a fuzzer-reachable crash in the live decode hot path
+  (`channel.rs` header-`0x00`/`0x01..0x03` arithmetic bodies). The
+  decoder now checks `q == 0` up front and surfaces the new
+  `Error::ProbabilityTotalExceedsRange` wire error, restoring the
+  panic-freedom guarantee. The `spec/04` §5 validation correction
+  establishes the legitimate wire total = per-channel symbol count
+  (≤ pixel count ≤ `range`), so the guard never false-triggers on a
+  well-formed frame — proven by the new `decode_symbol_accepts_total_at_cap`
+  test (`total == TOP` roundtrips cleanly) alongside
+  `decode_symbol_rejects_total_above_range` (the panic regression).
+  Lib unit-test count 309 → **311**.
+
 ### Added
 
 - round 310 — **typed `FrameType::wire_plane_roles()` accessor +

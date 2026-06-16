@@ -43,6 +43,18 @@ pub enum Error {
     /// frequencies whose running total overflows 32 bits; the CDF
     /// build rejects it rather than wrapping or panicking.
     ProbabilityTableOverflow,
+    /// Decoded probability table's total exceeded the modern range
+    /// coder's working `range`, so the per-symbol quotient
+    /// `q = range / total` (`spec/02` §5 step 1) collapsed to zero.
+    /// The spec invariant requires `q >= 1` — established by
+    /// `spec/04` §5's validation correction (the legitimate wire
+    /// total equals the per-channel symbol count, always ≤ pixel
+    /// count ≤ `range`). A malformed Fibonacci prefix can encode a
+    /// total above `range` (range is in `[2^23 + 1, 2^31]` per
+    /// `spec/02` §2), which would make the generic Step-C path's
+    /// `low / q` divide by zero; the decoder rejects it as a wire
+    /// error instead of panicking.
+    ProbabilityTotalExceedsRange,
     /// Caller asked for a frame whose dimensions do not match a
     /// supported (width, height, pixel-format) tuple.
     BadDimensions {
@@ -118,6 +130,10 @@ impl core::fmt::Display for Error {
             Error::ProbabilityTableOverflow => {
                 f.write_str("Lagarith: probability table cumulative sum overflowed u32")
             }
+            Error::ProbabilityTotalExceedsRange => f.write_str(
+                "Lagarith: probability table total exceeds range coder range \
+                 (q = range / total collapsed to zero)",
+            ),
             Error::EmptyProbabilityTable => {
                 f.write_str("Lagarith: probability table summed to zero")
             }

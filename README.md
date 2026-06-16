@@ -109,7 +109,10 @@ The `FrameType` enum also exposes structural accessors:
   exercise the modern RGB(A) paths byte-exactly without that oracle in
   CI.
 - A `libFuzzer` harness in `fuzz/` asserts panic-freedom on
-  attacker-supplied payloads.
+  attacker-supplied payloads. The modern range coder rejects a
+  malformed probability total that exceeds the working `range`
+  (`q = range / total` → 0) as `Error::ProbabilityTotalExceedsRange`
+  rather than dividing by zero (`spec/02` §5 / `spec/04` §5).
 - Criterion benchmarks in `benches/decode.rs` time the decode hot path,
   and a SIMD-vs-scalar predictor bench tracks the `spec/06` §3.2 path.
 
