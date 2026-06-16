@@ -107,7 +107,11 @@ The `FrameType` enum also exposes structural accessors:
 - Unit + roundtrip tests cover every frame type and the predictor
   rules; cross-decoder pins (captured from a black-box binary oracle)
   exercise the modern RGB(A) paths byte-exactly without that oracle in
-  CI.
+  CI. The header-`0x01..0x03` u32 length-field dispatch boundary
+  (`spec/06` §1.4) is pinned at its exact edge values — `< n_pixels`
+  takes call site A (pre-RLE length, prefix at byte 5); `>= n_pixels`
+  diverts to the header-`0x00` Fibonacci fall-back; a `0` length field
+  surfaces a clean `Error::Truncated`.
 - A `libFuzzer` harness in `fuzz/` asserts panic-freedom on
   attacker-supplied payloads. The modern range coder rejects a
   malformed probability total that exceeds the working `range`

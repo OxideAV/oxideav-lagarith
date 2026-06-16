@@ -375,6 +375,127 @@ fn channel_header_01_arith_rle_roundtrip() {
     }
 }
 
+/// Overwrite the 4-byte little-endian u32 length field (channel
+/// bytes 1..=4) of a header-`0x01..0x03` channel with `value`,
+/// leaving every other byte untouched. Used to drive the
+/// dispatcher's `spec/06` §1.4 length-field comparison to exact
+/// boundary values without disturbing the Fibonacci prefix or the
+/// arithmetic body that follow at byte 5.
+fn splice_u32_length_field(channel: &mut [u8], value: u32) {
+    channel[1..5].copy_from_slice(&value.to_le_bytes());
+}
+
+/// `spec/06` §1.4 / §6.2: exhaustively pin the header-`0x01..0x03`
+/// u32 length-field dispatch boundary.
+///
+/// The dispatcher reads the 4-byte LE u32 at channel bytes 1..=4
+/// and compares it (unsigned) against the plane pixel count:
+///
+/// * `u32 < n_pixels`  → call site A: the field is a pre-RLE
+///   symbol-stream length; the Fibonacci prefix starts at byte 5;
+///   the range coder emits exactly `u32` symbols which are then
+///   RLE-expanded to `n_pixels`.
+/// * `u32 >= n_pixels` → call site B (fall-back): the four bytes
+///   are re-interpreted as the leading bytes of a header-`0x00`
+///   Fibonacci prefix beginning at byte 1; no RLE post-process.
+///
+/// §6.2 flags the exact-boundary values (`n_pixels`, `n_pixels-1`,
+/// `0`) as documented-in-prose-but-not-cross-tested. These cases
+/// close that.
+#[test]
+fn arith_rle_length_field_dispatch_boundary() {
+    // A residual sequence whose pre-RLE symbol count is strictly
+    // less than its expanded pixel count, so the genuine encoder
+    // emits a u32 length field below `n_pixels` and the natural
+    // dispatch takes call site A.
+    let mut plane = vec![5u8, 7, 11];
+    plane.extend(std::iter::repeat(0u8).take(6)); // one escape-able run
+    plane.extend_from_slice(&[13, 17]);
+    plane.extend(std::iter::repeat(0u8).take(10));
+    plane.push(29);
+    let n_pixels = plane.len();
+
+    for escape_len in 1u8..=3 {
+        let channel = encode_channel_arith_rle(&plane, escape_len as usize);
+        // The genuine encoder must take the arith+RLE wire form for
+        // this fixture (header byte == escape_len, u32 field present).
+        assert_eq!(
+            channel[0], escape_len,
+            "header byte (escape_len={escape_len})"
+        );
+        let genuine_len =
+            u32::from_le_bytes([channel[1], channel[2], channel[3], channel[4]]) as usize;
+        assert!(
+            genuine_len < n_pixels,
+            "fixture must keep the natural call-site-A path: \
+             pre_rle={genuine_len} n_pixels={n_pixels}"
+        );
+
+        // --- Natural below-boundary value (< n_pixels): call site A. ---
+        // The genuine pre-RLE count is what the body actually encodes,
+        // so we cannot rewrite it without corrupting the stream; assert
+        // that the real (< n_pixels) count round-trips bit-exactly,
+        // confirming the dispatcher classified it as call site A.
+        let decoded = decode_channel(&channel, n_pixels).unwrap();
+        assert_eq!(
+            decoded, plane,
+            "natural call-site-A path (escape_len={escape_len})"
+        );
+
+        // --- At-boundary value `== n_pixels`: fall-back to call site B. ---
+        // Splicing the length field up to exactly `n_pixels` forces the
+        // dispatcher onto the header-`0x00` fall-back, which re-reads
+        // bytes 1..=4 as the start of a Fibonacci prefix. Whatever the
+        // Fibonacci decoder makes of them, it must not panic and must
+        // not silently equal the RLE result it was diverted away from.
+        let mut spliced = channel.clone();
+        splice_u32_length_field(&mut spliced, n_pixels as u32);
+        if let Ok(out) = decode_channel(&spliced, n_pixels) {
+            assert_eq!(out.len(), n_pixels, "fall-back output length");
+            assert_ne!(
+                out, plane,
+                "u32 == n_pixels must divert OFF the RLE path \
+                 (escape_len={escape_len})"
+            );
+        }
+
+        // --- Above-boundary value `> n_pixels`: also call site B. ---
+        let mut high = channel.clone();
+        splice_u32_length_field(&mut high, n_pixels as u32 + 1);
+        if let Ok(out) = decode_channel(&high, n_pixels) {
+            assert_eq!(out.len(), n_pixels, "high fall-back output length");
+        }
+    }
+}
+
+/// `spec/06` §1.4 step 4 / §6.2: a length field of exactly `0`
+/// (`< n_pixels` for any non-empty plane) selects call site A with
+/// a **zero**-symbol pre-RLE stream. The range coder emits no
+/// symbols, so the RLE expander is handed an empty input but is
+/// still asked to fill `n_pixels` outputs — which `spec/05` §4.2's
+/// output-driven expander cannot do, yielding a clean `Truncated`
+/// error rather than a panic or an out-of-bounds read.
+#[test]
+fn arith_rle_zero_length_field_is_clean_error() {
+    let plane = vec![5u8, 0, 0, 0, 13, 0, 0, 17];
+    let n_pixels = plane.len();
+    for escape_len in 1u8..=3 {
+        let mut channel = encode_channel_arith_rle(&plane, escape_len as usize);
+        // Only meaningful when the encoder actually chose the arith+RLE
+        // wire form (header byte in 0x01..=0x03 carries the u32 field).
+        if !(0x01..=0x03).contains(&channel[0]) {
+            continue;
+        }
+        splice_u32_length_field(&mut channel, 0);
+        let r = decode_channel(&channel, n_pixels);
+        assert!(
+            matches!(r, Err(crate::Error::Truncated { .. })),
+            "zero-length call-site-A stream must surface Truncated, got {r:?} \
+             (escape_len={escape_len})"
+        );
+    }
+}
+
 #[test]
 fn channel_header_05_07_raw_rle_roundtrip() {
     // Same residual sequence, but emit via a hand-built channel

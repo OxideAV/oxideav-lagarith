@@ -6,6 +6,28 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Tested
+
+- round 326 — **pinned the header-`0x01..0x03` u32 length-field
+  dispatch boundary (`spec/06` §1.4, closing the §6.2 open item).**
+  The channel dispatcher (`channel::decode_channel`) reads the
+  little-endian u32 at channel bytes 1..=4 and compares it against the
+  plane pixel count: `< n_pixels` selects call site A (the field is a
+  pre-RLE symbol-stream length; the Fibonacci prefix starts at byte 5),
+  while `>= n_pixels` falls back to call site B (the four bytes are
+  re-read as the leading bytes of a header-`0x00` Fibonacci prefix at
+  byte 1, no RLE post-process). §6.2 flagged the exact-boundary values
+  as documented-in-prose-but-not-cross-tested. Two new tests close
+  that: `arith_rle_length_field_dispatch_boundary` round-trips the
+  natural `< n_pixels` call-site-A path, then splices the length field
+  to exactly `n_pixels` and to `n_pixels + 1` to assert the dispatcher
+  diverts onto call site B (panic-free, output never silently equal to
+  the RLE result it was diverted away from); and
+  `arith_rle_zero_length_field_is_clean_error` confirms a `0` length
+  field (call site A with a zero-symbol pre-RLE stream) surfaces a
+  clean `Error::Truncated` from the output-driven `spec/05` §4.2 RLE
+  expander rather than panicking. Lib unit-test count 311 → **313**.
+
 ### Fixed
 
 - round 322 — **divide-by-zero panic in the modern range coder on a
