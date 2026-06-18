@@ -19,11 +19,19 @@
 //! reversion of `decode_arith_rgb` / `decode_arith_rgba` back to the
 //! (wrong) Rule A predictor.
 //!
-//! Sizes use power-of-two pixel counts per plane so the modern range
-//! coder's `next_pow2` frequency normalisation lines up exactly with
-//! ffmpeg's; non-power-of-two pixel counts expose an independent
-//! range-coder framing divergence vs ffmpeg that is out of scope for
-//! this pin set (tracked separately).
+//! Sizes use power-of-two pixel counts per plane because at a pow2
+//! total the binary's `q = range >> shift` fast form (`spec/02` §5
+//! step 1, where `shift = log2(total)`) coincides exactly with the
+//! clean-room `q = range / total_freq` division (`spec/02` §5 invariant
+//! box). At a non-power-of-two total the two are not bit-identical, so
+//! the third-party oracle's `>> shift` framing diverges from the
+//! crate's exact-division decode on those sizes — an oracle-side
+//! framing property, **not** a clean-room decode gap: the crate's own
+//! decoder self-roundtrips non-pow2 totals byte-exactly (pinned by
+//! `roundtrip_tests::encoder_random_roundtrip_property::milestone_*`,
+//! and by every non-pow2 dim in the random-seeded roundtrip sweep).
+//! Holding the cross-oracle pins to pow2 sizes keeps them comparing
+//! like-for-like against the binary's fast path.
 //!
 //! ## Pattern sensitivity (round 127 finding)
 //!
@@ -37,16 +45,26 @@
 //! decode partially diverges (e.g. ~40% byte match at 16×16) —
 //! single-byte off-by-N residuals scattered through the planes.
 //! The crate's own decoder always self-roundtrips both pattern
-//! classes byte-exactly, so the divergence sits on ffmpeg's side of
-//! the wire-format interpretation. The most likely culprit is the
-//! channel-prefix probability-loader at `lagarith.dll!0x180001050`
-//! (referenced from `spec/02` §5 and `spec/04` §5/§6 but **not
-//! disassembled into cleanroom spec**), which converts the wire's
-//! raw frequency histogram into the internal cumulative + shift-
-//! exponent struct the modern range coder consumes. The
-//! random-pattern pins below sample that working subset; closing the
-//! structured-pattern gap is an Extractor-round deliverable
-//! (`0x180001050` disassembly).
+//! classes byte-exactly, so the divergence sits on the oracle's side
+//! of the wire-format interpretation. The clean-room decode contract
+//! itself is fully specified: the channel-prefix probability-loader at
+//! `lagarith.dll!0x180001050` derives the cumulative-frequency table
+//! and the range-coder shift exponent deterministically from the raw
+//! freq[] array (`spec/04` §6 + §8 item 2), and `spec/02` §5's
+//! invariant box pins the clean-room equivalent as a straight
+//! cumulative search with `cum[256] = total_freq` (the raw histogram
+//! sum, per the `spec/04` §5 / `audit/01` §3.2 validation correction
+//! — the wire total is the per-channel symbol count, not the
+//! internal-only 524288-normalised LUT total). The crate's
+//! `range_coder::RangeDecoder::decode_symbol` implements exactly that
+//! cumulative search, so it needs no further `0x180001050`
+//! disassembly to decode every documented mode sample-exactly. What
+//! remains open is byte-exact **cross-encoder parity** against a
+//! proprietary-encoded stream on structured residuals — an
+//! encoder-side / fixture matter (the public sample set 404s), not a
+//! decode-spec gap. The random-pattern pins below sample the subset
+//! where the binary's `>> shift` fast path and the exact division
+//! agree.
 
 use oxideav_lagarith::{decode_frame, PixelKind};
 

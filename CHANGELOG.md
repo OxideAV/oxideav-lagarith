@@ -6,6 +6,30 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- round 338 — **stale-prose correction: the modern-path
+  `raw-histogram → cumulative-frequency` derivation is fully specified
+  for the decoder; it is not an open Extractor blocker.** The README
+  "Known divergences" section and the `tests/ffmpeg_pins.rs` header
+  both still framed the channel-prefix probability-loader at
+  `lagarith.dll!0x180001050` as "not disassembled into cleanroom spec"
+  and described a `next_pow2` normalisation on the *modern* range coder.
+  Both are stale: `next_pow2` normalisation is the **legacy** (type-7)
+  coder's (`spec/07` §3.2, `legacy_range_coder.rs`); the modern coder
+  uses `q = range / total_freq` with the raw histogram total (`spec/02`
+  §5 invariant box + `spec/04` §5 / `audit/01` §3.2). `spec/04` §6 +
+  §8 item 2 establish the loader's cumulative table + shift exponent as
+  deterministic post-processing of the raw freq[] array, and `spec/02`
+  §5's cumulative-search equivalent is what `RangeDecoder::decode_symbol`
+  implements — so the **decode** contract needs no further
+  `0x180001050` disassembly. The genuinely-open item is byte-exact
+  **cross-encoder parity** against a proprietary-encoded stream
+  (fixture-blocked; the public sample set 404s) plus matching the
+  proprietary encoder's `>> shift` fast path on structured residuals at
+  non-pow2 totals — both encoder-side, not decode-spec, gaps. Comment /
+  doc only; no code or wire-format change.
+
 ### Tested
 
 - round 338 — **milestone lock: every documented colour mode decodes

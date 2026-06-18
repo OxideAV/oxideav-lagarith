@@ -127,15 +127,34 @@ The `FrameType` enum also exposes structural accessors:
   embedded fixture is byte-identical to the bench's and reads no files.
   Run with `cargo run --release --example profile_decode -- <iters>`.
 
-### Known divergences from a byte-exact third-party-encoded oracle
+### Decode coverage and the remaining cross-encoder-parity gap
 
-A clean byte-exact parity test against a *proprietary-encoded* stream
-awaits a fixture (the public sample set 404s). A residual normalisation
-step in the raw-histogram → cumulative-frequency conversion is not yet
-disassembled into clean-room spec, which is the remaining blocker for
-parity on certain power-of-two sizes; the crate's own decoder
-self-roundtrips those streams byte-exactly. Closing the gap is an
-extraction-round deliverable.
+Every documented colour mode decodes **sample-exactly** across the
+fixture class — RGB24 (types 2 / 4), RGBA (8), YV12 (10),
+reduced-resolution YV12 (11), YUY2 (3) and legacy RGB (7) — at both
+power-of-two and non-power-of-two plane pixel counts. The modern range
+coder narrows its interval with `q = range / total_freq` where
+`total_freq` is the raw histogram sum (= the per-channel symbol count),
+per `spec/02` §5's invariant box and `spec/04` §5 (the `audit/01` §3.2
+validation correction: the wire carries a raw byte-histogram table whose
+total is the pixel count, not the internal-only 524288-normalised LUT
+total). That division is exact for any `total_freq`, so the
+`raw-histogram → cumulative-frequency` derivation the proprietary loader
+performs at `lagarith.dll!0x180001050` — including its shift exponent —
+is fully covered for the **decoder** by `spec/04` §6 + §8 item 2 (the
+auxiliary fields are deterministic post-processing of the raw freq[]
+array) combined with `spec/02` §5's cumulative-search equivalent. The
+round-338 `milestone_*` tests pin the non-pow2 sample-exact decode of
+every mode as a single regression.
+
+What remains open is a clean byte-exact **cross-encoder parity** test
+against a *proprietary-encoded* stream. It awaits a fixture (the public
+sample set 404s); separately, on structured (non-random) residuals the
+proprietary's `q = range >> shift` fast path diverges from the exact
+division at non-power-of-two totals, so matching the proprietary
+**encoder** byte-for-byte on those residuals is an encoder-side parity
+item, not a decode-spec gap. The crate's own encode→decode round-trips
+all such streams byte-exactly.
 
 ## License
 
