@@ -6,6 +6,39 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Tested
+
+- round 338 — **milestone lock: every documented colour mode decodes
+  sample-exactly at a non-power-of-two plane pixel count.** The modern
+  range coder narrows the `[low, low + range)` interval with `q = range
+  / total_freq` where `total_freq` is the **raw histogram sum** (= the
+  per-channel symbol count), per `spec/02` §5's invariant box and
+  `spec/04` §5 (the `audit/01` §3.2 validation correction establishing
+  the wire carries a raw byte-histogram table whose total is the pixel
+  count, not the internal-only 524288-normalised LUT total). That
+  division is exact for any `total_freq`, so a plane whose pixel count
+  is not a power of two is decoded sample-exactly through the very same
+  path; the proprietary loader's `range >> shift` fast form and the
+  reciprocal-multiply LUT at `0x180001050` are bit-stream-independent
+  post-load artefacts (`spec/04` §6 / §8 item 2) the clean-room
+  cumulative-search decoder reproduces for every total. Two new tests
+  in `encoder_random_roundtrip_property` are the single named
+  regression guarding this: `milestone_all_modes_decode_sample_exact_non_pow2`
+  drives one representative frame of **every** modern colour family —
+  RGB24 type 2 (unaligned `width % 4 != 0`, 11×7), RGB24 type 4
+  (aligned, 12×12), RGBA type 8 (four planes incl. raw alpha, 13×5),
+  YV12 type 10 (planar Y/V/U, 10×6), YUY2 type 3 (packed `Y0 U Y1 V`,
+  14×6), and legacy RGB type 7 (adaptive-CDF coder, 13×5) — at
+  deliberately non-pow2 plane pixel counts, asserting byte-exact decode
+  of the input buffer plus the expected reclassified frame-type byte;
+  `milestone_reduced_res_type11_fixed_point_non_pow2_inner` pins the
+  type-11 reduced-resolution fixed point where the embedded
+  half-resolution luma plane the range coder decodes is 6×6 = 36
+  (non-pow2). A regression that reintroduced a power-of-two `total`
+  assumption (e.g. `q = range >> total.next_power_of_two().trailing_zeros()`)
+  would pass the pow2-sized `tests/ffmpeg_pins.rs` set yet fail here.
+  Lib unit-test count 313 → **315**. No production-code change.
+
 ### Added
 
 - round 335 — **profiling driver `examples/profile_decode.rs`

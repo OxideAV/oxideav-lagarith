@@ -3502,8 +3502,8 @@ mod decoder_deep_fuzz {
 mod encoder_random_roundtrip_property {
     use super::*;
     use crate::encoder::{
-        encode_arith_rgb24, encode_arith_rgba, encode_arith_yuy2, encode_arith_yv12,
-        encode_legacy_rgb,
+        encode_arith_reduced_res, encode_arith_rgb24, encode_arith_rgba, encode_arith_yuy2,
+        encode_arith_yv12, encode_legacy_rgb,
     };
 
     /// PCG-step LCG, deterministic. Same constants as
@@ -3763,6 +3763,143 @@ mod encoder_random_roundtrip_property {
                 "YUY2 extended-sweep mismatch at seed={seed:#x}",
             );
         }
+    }
+
+    // ─────────── milestone lock: every colour mode, non-pow2 total ───
+    //
+    // The crate's modern range coder narrows the `[low, low + range)`
+    // interval with `q = range / total_freq` where `total_freq` is the
+    // **raw histogram sum** (= the per-channel symbol count), per
+    // `spec/02` §5's invariant box + `spec/04` §5 (the audit/01 §3.2
+    // validation correction: the wire carries a raw byte-histogram
+    // table whose total is the pixel count, NOT the internal
+    // 524288-normalised LUT total). That division is exact for any
+    // `total_freq`, so a plane whose pixel count is **not** a power of
+    // two is decoded sample-exactly through the very same path. The
+    // proprietary's `range >> shift` fast form (`spec/02` §5 step 1)
+    // and the reciprocal-multiply LUT at `0x180001050` are
+    // bit-stream-independent post-load artefacts (`spec/04` §6 / §8
+    // item 2): the clean-room cumulative-search decoder reproduces
+    // their output for every total.
+    //
+    // These two tests are the single named regression guarding the
+    // round-338 milestone "all documented Lagarith colour-mode
+    // variants decode sample-exactly across the fixture class." Each
+    // drives one representative frame of **every** modern colour
+    // family — RGB24 (type 2, unaligned `width % 4 != 0`), RGB24
+    // (type 4, aligned), RGBA (type 8), YV12 (type 10),
+    // reduced-resolution YV12 (type 11 fixed-point lattice), YUY2
+    // (type 3), and legacy RGB (type 7) — at a deliberately
+    // non-power-of-two plane pixel count, asserting byte-exact decode
+    // of the input pixel buffer. A regression that reintroduced a
+    // power-of-two total assumption into the modern range coder (e.g.
+    // `q = range >> total.next_power_of_two().trailing_zeros()`) would
+    // pass the pow2-sized `ffmpeg_pins.rs` set yet fail here.
+
+    /// Non-power-of-two pixel counts spanning the modern RGB24 selector
+    /// boundary and the chroma-subsampled families. `11 * 7 = 77`,
+    /// `13 * 5 = 65`, `10 * 6 = 60`, `6 * 6 = 36`, `14 * 6 = 84`,
+    /// `12 * 12 = 144`, `10 * 10 = 100` — none a power of two, so the
+    /// modern range coder's `range / total` division lands on a
+    /// non-pow2 `total` on every plane.
+    const MILESTONE_SEED: u64 = 0xb16b_00b5_c0de_face;
+
+    #[test]
+    fn milestone_all_modes_decode_sample_exact_non_pow2() {
+        // RGB24 type 2 (unaligned: width % 4 != 0, 11*7 = 77 px/plane).
+        {
+            let (w, h) = (11, 7);
+            let pixels = random_bgr24(MILESTONE_SEED, w, h);
+            let frame = encode_arith_rgb24(&pixels, w, h);
+            assert_eq!(frame[0], 2, "expected type-2 unaligned RGB24");
+            let dec = decode_frame(&frame, w, h, PixelKind::Bgr24)
+                .expect("type-2 RGB24 must decode at non-pow2 size");
+            assert_eq!(dec.pixels, pixels, "RGB24 type-2 non-pow2 sample-exact");
+        }
+        // RGB24 type 4 (aligned: width % 4 == 0, 12*12 = 144 px/plane).
+        {
+            let (w, h) = (12, 12);
+            let pixels = random_bgr24(MILESTONE_SEED ^ 0x1, w, h);
+            let frame = encode_arith_rgb24(&pixels, w, h);
+            assert_eq!(frame[0], 4, "expected type-4 aligned RGB24");
+            let dec = decode_frame(&frame, w, h, PixelKind::Bgr24)
+                .expect("type-4 RGB24 must decode at non-pow2 size");
+            assert_eq!(dec.pixels, pixels, "RGB24 type-4 non-pow2 sample-exact");
+        }
+        // RGBA type 8 (four planes incl. raw alpha, 13*5 = 65 px/plane).
+        {
+            let (w, h) = (13, 5);
+            let pixels = random_bgra32(MILESTONE_SEED ^ 0x2, w, h);
+            let frame = encode_arith_rgba(&pixels, w, h);
+            assert_eq!(frame[0], 8, "expected type-8 RGBA");
+            let dec = decode_frame(&frame, w, h, PixelKind::Bgra32)
+                .expect("type-8 RGBA must decode at non-pow2 size");
+            assert_eq!(dec.pixels, pixels, "RGBA type-8 non-pow2 sample-exact");
+        }
+        // YV12 type 10 (planar Y/V/U, luma 10*6 = 60, chroma 15 px).
+        {
+            let (w, h) = (10, 6);
+            let pixels = random_yv12(MILESTONE_SEED ^ 0x3, w, h);
+            let frame = encode_arith_yv12(&pixels, w, h);
+            assert_eq!(frame[0], 10, "expected type-10 YV12");
+            let dec = decode_frame(&frame, w, h, PixelKind::Yv12)
+                .expect("type-10 YV12 must decode at non-pow2 size");
+            assert_eq!(dec.pixels, pixels, "YV12 type-10 non-pow2 sample-exact");
+        }
+        // YUY2 type 3 (packed Y0 U Y1 V, 14*6 = 84 px, even width).
+        {
+            let (w, h) = (14, 6);
+            let pixels = random_yuy2(MILESTONE_SEED ^ 0x4, w, h);
+            let frame = encode_arith_yuy2(&pixels, w, h);
+            assert_eq!(frame[0], 3, "expected type-3 YUY2");
+            let dec = decode_frame(&frame, w, h, PixelKind::Yuy2)
+                .expect("type-3 YUY2 must decode at non-pow2 size");
+            assert_eq!(dec.pixels, pixels, "YUY2 type-3 non-pow2 sample-exact");
+        }
+        // Legacy RGB type 7 (adaptive-CDF range coder, 13*5 = 65 px).
+        {
+            let (w, h) = (13, 5);
+            let pixels = random_bgr24(MILESTONE_SEED ^ 0x5, w, h);
+            let frame = encode_legacy_rgb(&pixels, w, h);
+            assert_eq!(frame[0], 7, "expected type-7 legacy RGB");
+            let dec = decode_frame(&frame, w, h, PixelKind::Bgr24)
+                .expect("type-7 legacy RGB must decode at non-pow2 size");
+            assert_eq!(
+                dec.pixels, pixels,
+                "legacy RGB type-7 non-pow2 sample-exact"
+            );
+        }
+    }
+
+    /// Reduced-resolution type 11 (`spec/01` §2.4): a half-W/half-H
+    /// YV12 body + 2× nearest-neighbour upscale. Host W and H must each
+    /// be a multiple of 4 (`spec/01` §2.4 / round-187 guard), so a
+    /// pure non-pow2 host size is impossible — but the *embedded
+    /// half-resolution plane* the modern range coder actually decodes
+    /// has pixel count `(W/2)*(H/2)`, which is non-pow2 here (`6*6 =
+    /// 36` luma at host 12×12). The type-11 round-trip is fixed-point
+    /// (downsample→upsample is lossy), so this pins that the
+    /// fixed-point lattice survives the modern non-pow2-total decode.
+    #[test]
+    fn milestone_reduced_res_type11_fixed_point_non_pow2_inner() {
+        let (w, h) = (12, 12); // inner half-res luma = 6×6 = 36 (non-pow2)
+                               // Encode a host-resolution YV12 buffer, downsample+re-encode as
+                               // type 11, decode, and re-encode the decoded output: the type-11
+                               // path is idempotent on its own fixed point.
+        let host = random_yv12(MILESTONE_SEED ^ 0x6, w, h);
+        let frame = encode_arith_reduced_res(&host, w, h);
+        assert_eq!(frame[0], 11, "expected type-11 reduced-resolution");
+        let dec = decode_frame(&frame, w, h, PixelKind::Yv12)
+            .expect("type-11 must decode at non-pow2 inner size");
+        // Re-encode the decoded output and decode again: the second
+        // decode must reproduce the first byte-exactly (fixed point).
+        let frame2 = encode_arith_reduced_res(&dec.pixels, w, h);
+        let dec2 =
+            decode_frame(&frame2, w, h, PixelKind::Yv12).expect("type-11 re-decode must succeed");
+        assert_eq!(
+            dec.pixels, dec2.pixels,
+            "type-11 reduced-res must be at its fixed point (non-pow2 inner)",
+        );
     }
 }
 
