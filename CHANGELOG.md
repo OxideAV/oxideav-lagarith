@@ -6,6 +6,30 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- round 335 — **profiling driver `examples/profile_decode.rs`
+  (depth-mode "profile" deliverable).** The crate is decode-saturated;
+  the one depth-mode capability not yet present was a *standalone
+  runnable* that loops the decode hot path long enough for an external
+  sampling/instrumenting profiler (`perf record`, `valgrind
+  --tool=callgrind`, macOS Instruments, `samply`, `dtrace`) to attach
+  with clean symbol attribution. It complements the r301 Criterion
+  bench (statistical timing, but wraps each iteration in a measurement
+  harness that pollutes a profiler's view) and the r291 libFuzzer
+  target (robustness, but mutates the input so each decode walks a
+  different path). `profile_decode` decodes a single fixed, valid
+  type-4 modern-arithmetic RGB24 frame (full pipeline: 3-channel
+  offset table, channel-header dispatcher, Fibonacci prefix, modern
+  range coder, RLE escape, JPEG-LS median predictor, RGB cross-plane
+  decorrelation) in a tight, harness-free loop. The iteration count is
+  a CLI arg (default 200_000); each decoded buffer is folded into an
+  index-mixed accumulating checksum (`black_box`-fenced) so the
+  optimiser cannot hoist or elide the decode. Fixture bytes are
+  embedded inline (byte-identical to the bench's `FRAME_RGB24_64`,
+  captured once from the crate's own reference encoder) — no committed
+  fixture files, no `docs/` reads at run time.
+
 ### Tested
 
 - round 326 — **pinned the header-`0x01..0x03` u32 length-field

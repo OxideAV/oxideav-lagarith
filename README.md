@@ -119,6 +119,13 @@ The `FrameType` enum also exposes structural accessors:
   rather than dividing by zero (`spec/02` §5 / `spec/04` §5).
 - Criterion benchmarks in `benches/decode.rs` time the decode hot path,
   and a SIMD-vs-scalar predictor bench tracks the `spec/06` §3.2 path.
+- A standalone profiling driver in `examples/profile_decode.rs` loops
+  the decode hot path (a type-4 modern-arithmetic RGB24 frame) in a
+  tight, harness-free loop so an external profiler (`perf`,
+  `callgrind`, Instruments, `samply`) can attach with clean symbol
+  attribution. Iteration count is a CLI arg (default 200k); the
+  embedded fixture is byte-identical to the bench's and reads no files.
+  Run with `cargo run --release --example profile_decode -- <iters>`.
 
 ### Known divergences from a byte-exact third-party-encoded oracle
 
