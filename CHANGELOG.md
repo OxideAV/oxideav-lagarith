@@ -6,6 +6,42 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Tested
+
+- round 341 — **encoder-completeness milestone: exhaustive
+  encoder → decoder self-roundtrip matrix + an in-crate encoder fuzz
+  harness.** Two new test modules drive the encoder far past the prior
+  property suites' handful of 8×8 seeds:
+  - `encoder_exhaustive_matrix` — a full cross-product of *colour
+    family* (RGB24 type 2 unaligned / type 4 aligned, RGBA type 8,
+    YV12 type 10, YUY2 type 3, legacy RGB type 7, reduced-res type 11)
+    × *dimensions* (spanning every selector boundary: `width % 4`,
+    even/odd, power-of-two vs non-power-of-two plane pixel counts, and
+    1-row / 1-col edges) × *data pattern* (random, gradient,
+    zero-heavy, constant, two-symbol, sparse-impulse, stripe). Every
+    cell asserts byte-exact recovery of the input pixel buffer (type 11
+    asserts fixed-point idempotence, since downsample→upscale is lossy
+    by construction). Two capstone coverage tests assert (a) the
+    minimum-byte `encode_channel_best` selector naturally reaches a
+    representative spread of sub-forms across the matrix, and (b) **all
+    nine** legal modern channel-header sub-forms — `0x00`,
+    `0x01`/`0x02`/`0x03`, `0x04`, `0x05`/`0x06`/`0x07`, `0xff` — are
+    independently encodable and byte-exact-decodable via the
+    explicit-escape-length channel encoders. This turns "every wire
+    type the decoder accepts is encodable" from prose into a
+    machine-checked invariant.
+  - `encoder_fuzz_harness` — the encoder is `#[cfg(test)]`-gated and so
+    not reachable from the separate cargo-fuzz decoder binary; this is
+    its in-crate counterpart. A deterministic-LCG high-iteration loop
+    fuzzes the encoder's *input* space (random legal dimensions ×
+    4-level content-entropy knob) and asserts on every iteration that
+    encode neither panics nor produces a frame that fails to decode
+    back to the exact input. 400 iters × 4 modern families + 300 legacy
+    = **1900 byte-exact encode→decode roundtrips**; failures reproduce
+    from the printed `(family, w, h, content_seed)` tuple.
+  - +13 lib tests (315 → 328). All-test-side — no `src/` logic,
+    range-coder, predictor, or wire-format change.
+
 ### Changed
 
 - round 338 — **stale-prose correction: the modern-path

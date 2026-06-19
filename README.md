@@ -8,12 +8,19 @@ clean-room from the specification and trace documents under
 ## Status
 
 The decoder handles **every Lagarith frame type**, and a test-side
-encoder mirrors the modern arithmetic paths. Decode is stateless per
-frame (with a stateful wrapper for NULL "JUMP" frames). The modern
-RGB(A) paths are byte-exact-validated against an independent third-party
-decoder used strictly as a black-box binary oracle in fixture
-generation (it never runs in CI; committed pins carry the captured
-results).
+encoder produces every encodable type — the modern arithmetic families
+(RGB24 type 2/4, RGBA type 8, YV12 type 10, YUY2 type 3,
+reduced-resolution type 11), the legacy adaptive-CDF RGB path (type 7),
+the literal / solid frames (types 1 / 5 / 6 / 9), and NULL "JUMP". A
+machine-checked invariant confirms **every one of the nine modern
+channel-header sub-forms the decoder accepts is encodable**, and an
+exhaustive encode→decode matrix plus a 1900-iteration encoder fuzz loop
+prove byte-exact self-roundtrip across every family, dimension class,
+and data pattern. Decode is stateless per frame (with a stateful
+wrapper for NULL "JUMP" frames). The modern RGB(A) paths are
+byte-exact-validated against an independent third-party decoder used
+strictly as a black-box binary oracle in fixture generation (it never
+runs in CI; committed pins carry the captured results).
 
 ### Frame-type coverage
 
@@ -112,11 +119,32 @@ The `FrameType` enum also exposes structural accessors:
   takes call site A (pre-RLE length, prefix at byte 5); `>= n_pixels`
   diverts to the header-`0x00` Fibonacci fall-back; a `0` length field
   surfaces a clean `Error::Truncated`.
-- A `libFuzzer` harness in `fuzz/` asserts panic-freedom on
-  attacker-supplied payloads. The modern range coder rejects a
-  malformed probability total that exceeds the working `range`
+- An **exhaustive encoder → decoder self-roundtrip matrix**
+  (`encoder_exhaustive_matrix`) drives every encodable colour family
+  through a full cross-product of *dimensions* (spanning the
+  `width % 4` type-2/type-4 split, even/odd, power-of-two vs
+  non-power-of-two plane pixel counts, and 1-row / 1-col edges) ×
+  *data pattern* (random, gradient, zero-heavy, constant, two-symbol,
+  sparse-impulse, stripe), asserting byte-exact recovery of the input
+  on every cell (type 11 asserts fixed-point idempotence, since its
+  downsample→upscale is lossy by construction). A capstone coverage
+  test proves **all nine** legal modern channel-header sub-forms —
+  `0x00`, `0x01`/`0x02`/`0x03`, `0x04`, `0x05`/`0x06`/`0x07`, `0xff` —
+  are independently encodable and byte-exact-decodable, so "every wire
+  type the decoder accepts is encodable" is a machine-checked
+  invariant.
+- Two `libFuzzer`-style harnesses guard robustness from both ends. The
+  decode-side harness in `fuzz/` (`cargo-fuzz`) asserts panic-freedom
+  on attacker-supplied payloads — the modern range coder rejects a
+  malformed probability total exceeding the working `range`
   (`q = range / total` → 0) as `Error::ProbabilityTotalExceedsRange`
-  rather than dividing by zero (`spec/02` §5 / `spec/04` §5).
+  rather than dividing by zero (`spec/02` §5 / `spec/04` §5). The
+  encode-side counterpart (`encoder_fuzz_harness`, in-crate because the
+  encoder is test-only) runs a deterministic-LCG high-iteration loop
+  over the encoder's *input* space (random legal dimensions × a 4-level
+  content-entropy knob): 1900 encode→decode roundtrips that must each
+  neither panic nor diverge from byte-exact recovery, with failures
+  reproducible from the printed `(family, w, h, content_seed)` tuple.
 - Criterion benchmarks in `benches/decode.rs` time the decode hot path,
   and a SIMD-vs-scalar predictor bench tracks the `spec/06` §3.2 path.
 - A standalone profiling driver in `examples/profile_decode.rs` loops
