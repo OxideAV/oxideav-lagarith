@@ -5572,3 +5572,175 @@ mod encoder_exhaustive_matrix {
         );
     }
 }
+
+/// Round-341 milestone — **encoder fuzz harness (in-crate).**
+///
+/// The crate's encoder is `#[cfg(test)]`-gated (it drives the
+/// self-roundtrip suite and makes no byte-equality claim against the
+/// proprietary), so it is not reachable from the separate `cargo-fuzz`
+/// binary in `fuzz/` (that binary fuzzes the public *decoder* against
+/// hostile wire bytes). This module is the encoder-side counterpart: a
+/// high-iteration deterministic-random loop that fuzzes the encoder's
+/// **input** space — random dimensions across each family's legal
+/// constraints, crossed with random pixel content of varied byte
+/// entropy — and asserts on every iteration that
+///
+/// 1. encoding does not panic / overflow / index out of bounds, and
+/// 2. the encoded frame decodes back to the **exact** input pixel
+///    buffer (the byte-exact self-roundtrip invariant).
+///
+/// Determinism comes from a single 64-bit LCG seed so any failure
+/// reproduces from the printed `(family, w, h, seed, content_seed)`
+/// tuple. Iteration counts are kept modest (a few hundred per family)
+/// so the suite stays inside the round's memory cap and CI budget while
+/// still covering far more `(dims, content)` combinations than the
+/// fixed-cell matrix above.
+#[cfg(test)]
+mod encoder_fuzz_harness {
+    use super::*;
+    use crate::encoder::{
+        encode_arith_rgb24, encode_arith_rgba, encode_arith_yuy2, encode_arith_yv12,
+        encode_legacy_rgb,
+    };
+
+    /// 64-bit LCG state stepper, returns the next state.
+    fn lcg_next(s: &mut u64) -> u64 {
+        *s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *s
+    }
+
+    /// Fill `n` bytes from the LCG, but with a content-entropy knob
+    /// (`entropy` 0..=3) so the encoder's header-form selector sees the
+    /// full spread from near-constant to uniform-random data on
+    /// successive iterations:
+    /// * 0 — constant (every byte the same) → solid-fill plane.
+    /// * 1 — few distinct values (mask 0x07) → tiny histograms +
+    ///   long predictor-residual zero runs.
+    /// * 2 — moderate (mask 0x3f).
+    /// * 3 — full 0..=255 uniform.
+    fn fuzz_bytes(state: &mut u64, n: usize, entropy: u8) -> Vec<u8> {
+        let mut out = Vec::with_capacity(n);
+        if entropy == 0 {
+            let v = (lcg_next(state) >> 32) as u8;
+            out.resize(n, v);
+            return out;
+        }
+        let mask: u8 = match entropy {
+            1 => 0x07,
+            2 => 0x3f,
+            _ => 0xff,
+        };
+        for _ in 0..n {
+            out.push(((lcg_next(state) >> 33) as u8) & mask);
+        }
+        out
+    }
+
+    /// Modern RGB24 (type 2 / type 4): widths 1..=20, heights 1..=12.
+    #[test]
+    fn fuzz_rgb24_roundtrip() {
+        let mut state = 0x1234_5678_9abc_def0u64;
+        for iter in 0..400u32 {
+            let w = 1 + (lcg_next(&mut state) % 20) as u32;
+            let h = 1 + (lcg_next(&mut state) % 12) as u32;
+            let entropy = (lcg_next(&mut state) % 4) as u8;
+            let content_seed = state;
+            let pixels = fuzz_bytes(&mut state, (w * h) as usize * 3, entropy);
+            let frame = encode_arith_rgb24(&pixels, w, h);
+            let dec = decode_frame(&frame, w, h, PixelKind::Bgr24).unwrap_or_else(|e| {
+                panic!("RGB24 fuzz iter {iter} w={w} h={h} seed={content_seed:#x}: {e:?}")
+            });
+            assert_eq!(
+                dec.pixels, pixels,
+                "RGB24 fuzz iter {iter} w={w} h={h} seed={content_seed:#x}: not byte-exact",
+            );
+        }
+    }
+
+    /// Modern RGBA (type 8): four planes incl. raw alpha.
+    #[test]
+    fn fuzz_rgba_roundtrip() {
+        let mut state = 0xa5a5_5a5a_a5a5_5a5au64;
+        for iter in 0..400u32 {
+            let w = 1 + (lcg_next(&mut state) % 20) as u32;
+            let h = 1 + (lcg_next(&mut state) % 12) as u32;
+            let entropy = (lcg_next(&mut state) % 4) as u8;
+            let content_seed = state;
+            let pixels = fuzz_bytes(&mut state, (w * h) as usize * 4, entropy);
+            let frame = encode_arith_rgba(&pixels, w, h);
+            let dec = decode_frame(&frame, w, h, PixelKind::Bgra32).unwrap_or_else(|e| {
+                panic!("RGBA fuzz iter {iter} w={w} h={h} seed={content_seed:#x}: {e:?}")
+            });
+            assert_eq!(
+                dec.pixels, pixels,
+                "RGBA fuzz iter {iter} w={w} h={h} seed={content_seed:#x}: not byte-exact",
+            );
+        }
+    }
+
+    /// YV12 (type 10): both dims even (4:2:0 chroma at half res).
+    #[test]
+    fn fuzz_yv12_roundtrip() {
+        let mut state = 0xfeed_face_dead_beefu64;
+        for iter in 0..400u32 {
+            let w = 2 * (1 + (lcg_next(&mut state) % 10) as u32); // even, 2..=20
+            let h = 2 * (1 + (lcg_next(&mut state) % 6) as u32); // even, 2..=12
+            let entropy = (lcg_next(&mut state) % 4) as u8;
+            let content_seed = state;
+            let pixels = fuzz_bytes(&mut state, PixelKind::Yv12.buffer_len(w, h), entropy);
+            let frame = encode_arith_yv12(&pixels, w, h);
+            let dec = decode_frame(&frame, w, h, PixelKind::Yv12).unwrap_or_else(|e| {
+                panic!("YV12 fuzz iter {iter} w={w} h={h} seed={content_seed:#x}: {e:?}")
+            });
+            assert_eq!(
+                dec.pixels, pixels,
+                "YV12 fuzz iter {iter} w={w} h={h} seed={content_seed:#x}: not byte-exact",
+            );
+        }
+    }
+
+    /// YUY2 (type 3): even width (the `Y0 U Y1 V` macropixel), any
+    /// height.
+    #[test]
+    fn fuzz_yuy2_roundtrip() {
+        let mut state = 0x0fed_cba9_8765_4321u64;
+        for iter in 0..400u32 {
+            let w = 2 * (1 + (lcg_next(&mut state) % 10) as u32); // even, 2..=20
+            let h = 1 + (lcg_next(&mut state) % 12) as u32;
+            let entropy = (lcg_next(&mut state) % 4) as u8;
+            let content_seed = state;
+            let pixels = fuzz_bytes(&mut state, PixelKind::Yuy2.buffer_len(w, h), entropy);
+            let frame = encode_arith_yuy2(&pixels, w, h);
+            let dec = decode_frame(&frame, w, h, PixelKind::Yuy2).unwrap_or_else(|e| {
+                panic!("YUY2 fuzz iter {iter} w={w} h={h} seed={content_seed:#x}: {e:?}")
+            });
+            assert_eq!(
+                dec.pixels, pixels,
+                "YUY2 fuzz iter {iter} w={w} h={h} seed={content_seed:#x}: not byte-exact",
+            );
+        }
+    }
+
+    /// Legacy RGB (type 7): the adaptive-CDF range coder.
+    #[test]
+    fn fuzz_legacy_rgb_roundtrip() {
+        let mut state = 0x5151_dead_c0de_0707u64;
+        for iter in 0..300u32 {
+            let w = 1 + (lcg_next(&mut state) % 18) as u32;
+            let h = 1 + (lcg_next(&mut state) % 10) as u32;
+            let entropy = (lcg_next(&mut state) % 4) as u8;
+            let content_seed = state;
+            let pixels = fuzz_bytes(&mut state, (w * h) as usize * 3, entropy);
+            let frame = encode_legacy_rgb(&pixels, w, h);
+            let dec = decode_frame(&frame, w, h, PixelKind::Bgr24).unwrap_or_else(|e| {
+                panic!("legacy fuzz iter {iter} w={w} h={h} seed={content_seed:#x}: {e:?}")
+            });
+            assert_eq!(
+                dec.pixels, pixels,
+                "legacy fuzz iter {iter} w={w} h={h} seed={content_seed:#x}: not byte-exact",
+            );
+        }
+    }
+}
