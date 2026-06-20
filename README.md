@@ -16,7 +16,13 @@ machine-checked invariant confirms **every one of the nine modern
 channel-header sub-forms the decoder accepts is encodable**, and an
 exhaustive encode→decode matrix plus a 1900-iteration encoder fuzz loop
 prove byte-exact self-roundtrip across every family, dimension class,
-and data pattern. Decode is stateless per frame (with a stateful
+and data pattern. The YUY2 (type 3) encoder closes the
+**odd-width** sub-form — it mirrors the decoder's floor-chroma
+layout (`spec/03` §6.2), unpacking the trailing luma column with no
+chroma counterpart and dropping the decoder-synthesised `0x80`
+neutral tail slot — so odd widths (incl. the degenerate `W = 1` with
+empty chroma planes) now self-roundtrip byte-exactly. Decode is
+stateless per frame (with a stateful
 wrapper for NULL "JUMP" frames). The modern RGB(A) paths are
 byte-exact-validated against an independent third-party decoder used
 strictly as a black-box binary oracle in fixture generation (it never
@@ -173,7 +179,14 @@ is fully covered for the **decoder** by `spec/04` §6 + §8 item 2 (the
 auxiliary fields are deterministic post-processing of the raw freq[]
 array) combined with `spec/02` §5's cumulative-search equivalent. The
 round-338 `milestone_*` tests pin the non-pow2 sample-exact decode of
-every mode as a single regression.
+every mode as a single regression. Round 352 closes the **YV12
+odd-dimension SPECGAP** path on the encode side: when
+`floor(W·H/4) != (W/2)·(H/2)` both `encode_arith_yv12` and
+`decode_arith_yv12` fall through to the `spec/03` §6.1.1 single-row
+chroma placeholder geometry, and the `arith_yv12_odd_dims_specgap
+_roundtrip` test pins that the two halves use the identical breakdown
+so the path self-roundtrips byte-exactly even though the per-row
+chroma layout itself is a host-integration placeholder.
 
 What remains open is a clean byte-exact **cross-encoder parity** test
 against a *proprietary-encoded* stream. It awaits a fixture (the public

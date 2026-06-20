@@ -571,6 +571,58 @@ fn arith_yv12_roundtrip_16x16() {
     assert_eq!(dec.pixels, pixels);
 }
 
+/// Odd-dimension YV12 SPECGAP closure (round 352). When the host
+/// dimensions are odd, `floor(W·H/4)` no longer factors as
+/// `(W/2)·(H/2)`, so both `encode_arith_yv12` and `decode_arith_yv12`
+/// fall through to the `spec/03` §6.1.1 placeholder geometry — they
+/// treat each chroma plane as a **single row** of `c_pixels` bytes
+/// (`apply_plane_*_with_rule(plane, c_pixels, 1, Rule A)`). The two
+/// halves use the identical row/column breakdown, so the path
+/// self-roundtrips byte-exactly even though the per-row chroma
+/// breakdown is a host-integration placeholder rather than a
+/// spec-pinned layout. This pins the previously-untested fallback
+/// branch on both sides as a single regression.
+fn yv12_odd_buffer(seed: u64, w: u32, h: u32) -> Vec<u8> {
+    let n = PixelKind::Yv12.buffer_len(w, h);
+    // Simple xorshift fill — arbitrary residual-rich content.
+    let mut s = seed | 1;
+    (0..n)
+        .map(|_| {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 24) as u8
+        })
+        .collect()
+}
+
+#[test]
+fn arith_yv12_odd_dims_specgap_roundtrip() {
+    // Each pair has odd W and/or odd H so c_pixels = floor(W·H/4)
+    // does NOT equal (W/2)·(H/2): the SPECGAP single-row fallback
+    // fires on both the encode and decode side.
+    for &(w, h) in &[(5u32, 4u32), (4, 5), (5, 5), (7, 3), (3, 7), (9, 9), (1, 8)] {
+        let cw = (w / 2) as usize;
+        let ch = (h / 2) as usize;
+        let c_pixels = (w as usize * h as usize) / 4;
+        // Sanity: confirm we are actually exercising the fallback.
+        assert_ne!(
+            cw * ch,
+            c_pixels,
+            "dims {w}×{h} do not trigger the SPECGAP fallback",
+        );
+        let pixels = yv12_odd_buffer(0xa17e_1234 ^ ((w as u64) << 8) ^ h as u64, w, h);
+        let frame = encode_arith_yv12(&pixels, w, h);
+        assert_eq!(frame[0], 10, "type 10 (YV12) expected for {w}×{h}");
+        let dec = decode_frame(&frame, w, h, PixelKind::Yv12)
+            .unwrap_or_else(|e| panic!("YV12 odd {w}×{h} decode failed: {e:?}"));
+        assert_eq!(
+            dec.pixels, pixels,
+            "YV12 odd-dim SPECGAP roundtrip not byte-exact at {w}×{h}",
+        );
+    }
+}
+
 #[test]
 fn arith_yv12_solid_planes_roundtrip() {
     // Each plane filled with a constant — exercises the encoder's
@@ -4439,6 +4491,30 @@ mod frame_uncompressed_size_guard {
                 let frame = encode_arith_yv12_or_uncompressed(&pixels, w, h);
                 let decoded = decode_frame(&frame, w, h, PixelKind::Yv12).unwrap();
                 assert_eq!(decoded.pixels, pixels);
+            }
+        }
+    }
+
+    /// Odd-dimension YV12 closure (round 352): the size-guarded
+    /// wrapper inherits the `spec/03` §6.1.1 SPECGAP single-row chroma
+    /// fallback that fires when `floor(W·H/4) != (W/2)·(H/2)`. No tail
+    /// normalisation is needed — both encode and decode reconstruct the
+    /// full `Y || V || U` buffer through the identical fallback
+    /// geometry. The high-entropy LCG fixtures drive the type-1
+    /// fall-through branch on these tiny frames.
+    #[test]
+    fn arith_yv12_or_uncompressed_odd_dims_roundtrips_byte_exact() {
+        for &(w, h) in &[(5u32, 4u32), (4, 5), (5, 5), (7, 3), (9, 9), (1, 8)] {
+            let n = PixelKind::Yv12.buffer_len(w, h);
+            for seed in [0xc0de_d00du64, 0x1234_5678] {
+                let pixels = lcg_bytes(seed, n);
+                let frame = encode_arith_yv12_or_uncompressed(&pixels, w, h);
+                let decoded = decode_frame(&frame, w, h, PixelKind::Yv12).unwrap();
+                assert_eq!(
+                    decoded.pixels, pixels,
+                    "yv12 odd guarded roundtrip mismatch at {w}×{h} seed {seed:#x} (byte0={:#x})",
+                    frame[0]
+                );
             }
         }
     }
