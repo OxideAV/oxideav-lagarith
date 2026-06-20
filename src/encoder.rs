@@ -511,18 +511,33 @@ pub fn encode_arith_yv12(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
 
 /// Encode an arithmetic YUY2 frame (type 3, round 3). Input is
 /// packed YUY2 (`Y0 U Y1 V` per pair of pixels at columns `2k,
-/// 2k+1`). Width must be even (the encoder mirrors the proprietary's
-/// macropixel constraint).
+/// 2k+1`).
+///
+/// **Odd-width support (round 352).** The chroma planes are
+/// `floor(W/2) × H` at 4:2:2 sub-sampling (`spec/03` §6.2), and the
+/// luma plane carries the full `W × H` grid — including the odd-tail
+/// luma column that has no matching chroma macropixel. The packed
+/// input's odd-tail chroma slot (at output byte `2·(W−1)+1`) is the
+/// decoder's neutral `0x80` fill (`decode_arith_yuy2` writes it from
+/// thin air, never from the wire) and so does **not** travel on the
+/// wire; the encoder therefore reads only the odd-tail luma byte and
+/// discards the tail chroma slot. A YUY2 buffer roundtrips byte-exact
+/// through `encode_arith_yuy2 → decode_arith_yuy2` iff its odd-tail
+/// chroma slot already holds `0x80` (always the case for buffers the
+/// decoder produced).
 pub fn encode_arith_yuy2(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
     let w = width as usize;
     let h = height as usize;
     debug_assert_eq!(pixels.len(), w * h * 2);
-    debug_assert_eq!(w % 2, 0, "encoder requires even width for YUY2");
     let cw = w / 2;
     let y_pixels = w * h;
     let c_pixels = cw * h;
+    let odd = w % 2 == 1;
 
-    // Unpack the packed YUY2 buffer into three planes (Y, U, V).
+    // Unpack the packed YUY2 buffer into three planes (Y, U, V). For
+    // odd widths the trailing luma column (`2·cw == W−1`) is pushed to
+    // the luma plane with no chroma counterpart, mirroring the
+    // decoder's floor-chroma pack loop.
     let mut plane_y = Vec::with_capacity(y_pixels);
     let mut plane_u = Vec::with_capacity(c_pixels);
     let mut plane_v = Vec::with_capacity(c_pixels);
@@ -534,7 +549,17 @@ pub fn encode_arith_yuy2(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
             plane_y.push(pixels[in_row + 4 * k + 2]);
             plane_v.push(pixels[in_row + 4 * k + 3]);
         }
+        if odd {
+            // Odd-tail luma at output byte `2·(W−1)`. The matching
+            // chroma slot (`+1`) is the decoder's `0x80` neutral fill
+            // and carries no wire data.
+            let last_x = w - 1;
+            plane_y.push(pixels[in_row + 2 * last_x]);
+        }
     }
+    debug_assert_eq!(plane_y.len(), y_pixels);
+    debug_assert_eq!(plane_u.len(), c_pixels);
+    debug_assert_eq!(plane_v.len(), c_pixels);
 
     // Rule A per spec/06 §3.8 — see `encode_arith_yv12`. The YUY2
     // chroma plane width (W/2) is 4-byte-aligned at 4:2:2.

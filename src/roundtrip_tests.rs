@@ -754,6 +754,83 @@ fn arith_yuy2_roundtrip_16x16() {
     assert_eq!(dec.pixels, pixels);
 }
 
+/// Build a packed YUY2 buffer at **odd** width. The decoder's
+/// floor-chroma layout (`spec/03` §6.2) gives the trailing luma
+/// column no chroma macropixel, so its chroma slot at output byte
+/// `2·(W−1)+1` is the neutral `0x80` fill the decoder synthesises.
+/// To roundtrip byte-exact, this helper seeds that tail slot with
+/// `0x80` (every other byte is arbitrary, mirroring `pattern_yuy2`).
+fn pattern_yuy2_odd(width: u32, height: u32) -> Vec<u8> {
+    debug_assert!(width % 2 == 1);
+    let w = width as usize;
+    let h = height as usize;
+    let cw = w / 2;
+    let mut out = vec![0u8; w * h * 2];
+    for y in 0..h {
+        let out_row = y * w * 2;
+        for k in 0..cw {
+            let yi = (y as u32).wrapping_mul(13).wrapping_add(k as u32);
+            out[out_row + 4 * k] = yi.wrapping_mul(31).wrapping_add(11) as u8; // Y0
+            out[out_row + 4 * k + 1] = yi.wrapping_mul(53).wrapping_add(101) as u8; // U
+            out[out_row + 4 * k + 2] = yi.wrapping_mul(31).wrapping_add(43) as u8; // Y1
+            out[out_row + 4 * k + 3] = yi.wrapping_mul(89).wrapping_add(151) as u8;
+            // V
+        }
+        // Odd-tail luma column (arbitrary) + neutral 0x80 chroma slot.
+        let last_x = w - 1;
+        out[out_row + 2 * last_x] = (y as u32).wrapping_mul(71).wrapping_add(17) as u8;
+        out[out_row + 2 * last_x + 1] = 0x80;
+    }
+    out
+}
+
+#[test]
+fn arith_yuy2_odd_width_roundtrip_5x4() {
+    let (w, h) = (5, 4);
+    let pixels = pattern_yuy2_odd(w, h);
+    let frame = encode_arith_yuy2(&pixels, w, h);
+    assert_eq!(frame[0], 3, "type 3 (YUY2) expected for odd width too");
+    let dec = decode_frame(&frame, w, h, PixelKind::Yuy2).unwrap();
+    assert_eq!(dec.pixels, pixels);
+    assert_eq!(dec.pixels.len(), (w * h * 2) as usize);
+}
+
+#[test]
+fn arith_yuy2_odd_width_roundtrip_7x5() {
+    let (w, h) = (7, 5);
+    let pixels = pattern_yuy2_odd(w, h);
+    let frame = encode_arith_yuy2(&pixels, w, h);
+    let dec = decode_frame(&frame, w, h, PixelKind::Yuy2).unwrap();
+    assert_eq!(dec.pixels, pixels);
+}
+
+#[test]
+fn arith_yuy2_odd_width_roundtrip_9x9() {
+    let (w, h) = (9, 9);
+    let pixels = pattern_yuy2_odd(w, h);
+    let frame = encode_arith_yuy2(&pixels, w, h);
+    let dec = decode_frame(&frame, w, h, PixelKind::Yuy2).unwrap();
+    assert_eq!(dec.pixels, pixels);
+}
+
+/// Width 1 is the degenerate odd case: the chroma planes are empty
+/// (`floor(1/2) = 0`), so the wire body carries only a luma plane and
+/// two zero-length chroma channels. The decoder fills the single
+/// pixel's chroma slot with the `0x80` neutral. Confirms the encoder
+/// does not panic on the zero-width chroma planes.
+#[test]
+fn arith_yuy2_width_1_roundtrip() {
+    let (w, h) = (1, 4);
+    let mut pixels = vec![0u8; (w * h * 2) as usize];
+    for y in 0..h as usize {
+        pixels[y * 2] = (y as u8).wrapping_mul(37).wrapping_add(5); // luma
+        pixels[y * 2 + 1] = 0x80; // neutral chroma
+    }
+    let frame = encode_arith_yuy2(&pixels, w, h);
+    let dec = decode_frame(&frame, w, h, PixelKind::Yuy2).unwrap();
+    assert_eq!(dec.pixels, pixels);
+}
+
 #[test]
 fn yuy2_pixel_kind_required_for_type_3() {
     let pixels = pattern_yuy2(4, 4);
@@ -5296,6 +5373,45 @@ mod encoder_exhaustive_matrix {
                 assert_eq!(
                     dec.pixels, pixels,
                     "YUY2 {w}×{h} {pat:?}: roundtrip not byte-exact",
+                );
+            }
+        }
+    }
+
+    /// YUY2 (type 3) **odd-width** exhaustive matrix (round 352). The
+    /// floor-chroma layout (`spec/03` §6.2) drops the trailing luma
+    /// column's chroma macropixel: the decoder synthesises a `0x80`
+    /// neutral at output byte `2·(W−1)+1`, so a byte-exact roundtrip is
+    /// only possible when the input already holds `0x80` there. We
+    /// normalise each pattern's odd-tail chroma slot to `0x80`, then
+    /// require byte-exact encode→decode across every pattern and a set
+    /// of odd widths (incl. the degenerate W=1 with empty chroma
+    /// planes).
+    #[test]
+    fn yuy2_odd_width_matrix_byte_exact() {
+        const ODD_DIMS: &[(u32, u32)] = &[(1, 4), (3, 3), (5, 4), (7, 5), (9, 9), (11, 6), (15, 7)];
+        for (pi, &pat) in Pattern::ALL.iter().enumerate() {
+            for &(w, h) in ODD_DIMS {
+                let n = PixelKind::Yuy2.buffer_len(w, h);
+                let seed = cell_seed(0x0353, pi, w, h);
+                let mut pixels = pat.bytes(seed, n);
+                // Force the odd-tail chroma slot to the decoder's neutral
+                // fill so the buffer is reproducible on roundtrip.
+                let last_x = (w - 1) as usize;
+                for y in 0..h as usize {
+                    let out_row = y * w as usize * 2;
+                    pixels[out_row + 2 * last_x + 1] = 0x80;
+                }
+                let frame = encode_arith_yuy2(&pixels, w, h);
+                assert_eq!(
+                    frame[0], 3,
+                    "YUY2 odd {w}×{h} {pat:?}: wrong frame-type byte"
+                );
+                let dec = decode_frame(&frame, w, h, PixelKind::Yuy2)
+                    .unwrap_or_else(|e| panic!("YUY2 odd {w}×{h} {pat:?} decode failed: {e:?}"));
+                assert_eq!(
+                    dec.pixels, pixels,
+                    "YUY2 odd {w}×{h} {pat:?}: roundtrip not byte-exact",
                 );
             }
         }
