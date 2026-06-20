@@ -432,7 +432,7 @@ fn decode_arith_rgb(
     // ffmpeg reproduces the original pixels byte-exactly only for
     // **Rule B** encodes (every power-of-two pixel-count RGB24 /
     // RGB32 / RGBA frame tested). Rule A mis-decodes the same
-    // streams. See `tests/ffmpeg_pins.rs`.
+    // streams. See `tests/reference_pins.rs`.
     apply_plane_inverse_with_rule(
         &mut plane_b,
         width as usize,

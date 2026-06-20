@@ -36,7 +36,7 @@
 //! resolves the cleanroom's open audit/01 §9.1 dispatch question — a
 //! horizontal-ramp fixture makes the two rules degenerate (first
 //! column constant ⇒ `TL == T`), so the static analysis could not
-//! distinguish them. See `tests/ffmpeg_pins.rs`.
+//! distinguish them. See `tests/reference_pins.rs`.
 
 /// Selects the first-column-of-row rule for the inverse predictor.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]

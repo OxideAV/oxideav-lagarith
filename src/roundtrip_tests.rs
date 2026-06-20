@@ -2042,7 +2042,7 @@ mod best_pipeline_size_delta {
     #[test]
     fn arith_rgb24_best_never_larger_than_simple() {
         // Probe several power-of-two-pixel sizes (the same regime
-        // `tests/ffmpeg_pins.rs` covers). On every probed size the
+        // `tests/reference_pins.rs` covers). On every probed size the
         // new pipeline must produce ≤ the simple-pipeline length.
         for &(w, h) in &[(4u32, 4u32), (8, 8), (8, 16), (16, 16)] {
             let pixels = pattern_bgr24(w, h);
@@ -3951,7 +3951,7 @@ mod encoder_random_roundtrip_property {
     // of the input pixel buffer. A regression that reintroduced a
     // power-of-two total assumption into the modern range coder (e.g.
     // `q = range >> total.next_power_of_two().trailing_zeros()`) would
-    // pass the pow2-sized `ffmpeg_pins.rs` set yet fail here.
+    // pass the pow2-sized `reference_pins.rs` set yet fail here.
 
     /// Non-power-of-two pixel counts spanning the modern RGB24 selector
     /// boundary and the chroma-subsampled families. `11 * 7 = 77`,
