@@ -3731,6 +3731,34 @@ mod encoder_random_roundtrip_property {
         }
     }
 
+    /// Modern YUY2 encoder roundtrips byte-equal on every seed at
+    /// **odd** widths too (round 352). The floor-chroma layout
+    /// (`spec/03` §6.2) drops the trailing luma column's chroma
+    /// macropixel, which the decoder fills with the `0x80` neutral, so
+    /// the random buffer's odd-tail chroma slot is normalised to `0x80`
+    /// before encoding. Dims 5 / 7 / 9 / 11 cross the macropixel-count
+    /// parity; `(1, 8)` is the empty-chroma degenerate case.
+    #[test]
+    fn arith_yuy2_odd_width_random_seeded_roundtrip() {
+        let dims: &[(u32, u32)] = &[(5, 4), (7, 5), (9, 9), (11, 6), (1, 8)];
+        for &seed in &SEEDS {
+            for &(w, h) in dims {
+                let mut pixels = lcg_bytes(seed, PixelKind::Yuy2.buffer_len(w, h));
+                let last_x = (w - 1) as usize;
+                for y in 0..h as usize {
+                    pixels[y * w as usize * 2 + 2 * last_x + 1] = 0x80;
+                }
+                let frame = encode_arith_yuy2(&pixels, w, h);
+                let decoded = decode_frame(&frame, w, h, PixelKind::Yuy2)
+                    .expect("encoder output must decode (YUY2 odd, randomised)");
+                assert_eq!(
+                    decoded.pixels, pixels,
+                    "YUY2 odd random roundtrip mismatch at seed={seed:#x} dims=({w}, {h})",
+                );
+            }
+        }
+    }
+
     // ─────────── legacy RGB (type 7) ───────────
 
     /// Legacy type-7 RGB encoder roundtrips byte-equal on every seed.
@@ -4424,6 +4452,33 @@ mod frame_uncompressed_size_guard {
                 let frame = encode_arith_yuy2_or_uncompressed(&pixels, w, h);
                 let decoded = decode_frame(&frame, w, h, PixelKind::Yuy2).unwrap();
                 assert_eq!(decoded.pixels, pixels);
+            }
+        }
+    }
+
+    /// Odd-width closure (round 352): the size-guarded YUY2 wrapper
+    /// inherits the floor-chroma odd-width support added to
+    /// `encode_arith_yuy2`. The odd-tail chroma slot is normalised to
+    /// `0x80` (the decoder's neutral fill) so the buffer is byte-exact
+    /// reproducible; both the type-1 fall-through branch (high-entropy
+    /// LCG fixtures) and the arithmetic-stays branch are exercised.
+    #[test]
+    fn arith_yuy2_or_uncompressed_odd_width_roundtrips_byte_exact() {
+        for &(w, h) in &[(5u32, 4u32), (7, 5), (9, 9), (1, 8)] {
+            let n = PixelKind::Yuy2.buffer_len(w, h);
+            let last_x = (w - 1) as usize;
+            for seed in [0xc0de_d00du64, 0x1234_5678] {
+                let mut pixels = lcg_bytes(seed, n);
+                for y in 0..h as usize {
+                    pixels[y * w as usize * 2 + 2 * last_x + 1] = 0x80;
+                }
+                let frame = encode_arith_yuy2_or_uncompressed(&pixels, w, h);
+                let decoded = decode_frame(&frame, w, h, PixelKind::Yuy2).unwrap();
+                assert_eq!(
+                    decoded.pixels, pixels,
+                    "yuy2 odd guarded roundtrip mismatch at {w}×{h} seed {seed:#x} (byte0={:#x})",
+                    frame[0]
+                );
             }
         }
     }
