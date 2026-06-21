@@ -443,7 +443,7 @@ pub fn encode_arith_rgb24(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
     cross_plane_decorrelate_rgb_forward(&mut plane_b, &plane_g, &mut plane_r);
 
     // Spatial predictor (forward) — **Rule B** first-column-of-row,
-    // matching the decoder (ffmpeg-confirmed; see `decode_arith_rgb`).
+    // matching the decoder (oracle-confirmed; see `decode_arith_rgb`).
     let res_b =
         apply_plane_forward_with_rule(&plane_b, width as usize, height as usize, FirstColRule::B);
     let res_g =

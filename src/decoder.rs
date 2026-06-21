@@ -427,9 +427,9 @@ fn decode_arith_rgb(
     // a horizontal-ramp fixture makes the two rules degenerate (the
     // first column is constant down its column, so `TL == T` and
     // both rules reduce to `T`). A black-box differential decode
-    // against the independent ffmpeg `lagarith` decoder — fed our
+    // against an independent third-party Lagarith decoder — fed our
     // own `LAGS`-wrapped frames built under each rule — resolves it:
-    // ffmpeg reproduces the original pixels byte-exactly only for
+    // the oracle reproduces the original pixels byte-exactly only for
     // **Rule B** encodes (every power-of-two pixel-count RGB24 /
     // RGB32 / RGBA frame tested). Rule A mis-decodes the same
     // streams. See `tests/reference_pins.rs`.
@@ -539,7 +539,7 @@ fn decode_arith_rgba(
         None
     };
 
-    // **Rule B** first-column-of-row predictor — ffmpeg-confirmed for
+    // **Rule B** first-column-of-row predictor — oracle-confirmed for
     // the modern RGBA arithmetic path; see `decode_arith_rgb`.
     apply_plane_inverse_with_rule(
         &mut plane_b,

@@ -6,6 +6,23 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Provenance hardening — neutral validator naming throughout.** The
+  cross-decoder regression pins are validated against an *independent
+  third-party Lagarith decoder used strictly as a black-box binary
+  oracle*; that validator's name no longer appears in any comment,
+  doc, test identifier, README, or changelog entry. The pin test
+  functions are renamed `*_reference_pin_*` (from the prior
+  validator-named form), and the module / source prose now refers to
+  "the oracle" / "the third-party decoder" uniformly. The black-box
+  validator invocation itself is unchanged — only the *naming* is
+  neutralised, matching the established README phrasing.
+- **`fuzz/Cargo.lock` is no longer tracked.** The decode fuzz crate is
+  a binary, but per the workspace library-crate convention its lockfile
+  is now untracked and `.gitignore`d under `fuzz/` so it cannot drift
+  into a committed pin.
+
 ### Tested
 
 - round 341 — **encoder-completeness milestone: exhaustive
@@ -47,7 +64,7 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - round 338 — **stale-prose correction: the modern-path
   `raw-histogram → cumulative-frequency` derivation is fully specified
   for the decoder; it is not an open Extractor blocker.** The README
-  "Known divergences" section and the `tests/ffmpeg_pins.rs` header
+  "Known divergences" section and the `tests/reference_pins.rs` header
   both still framed the channel-prefix probability-loader at
   `lagarith.dll!0x180001050` as "not disassembled into cleanroom spec"
   and described a `next_pow2` normalisation on the *modern* range coder.
@@ -96,7 +113,7 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   half-resolution luma plane the range coder decodes is 6×6 = 36
   (non-pow2). A regression that reintroduced a power-of-two `total`
   assumption (e.g. `q = range >> total.next_power_of_two().trailing_zeros()`)
-  would pass the pow2-sized `tests/ffmpeg_pins.rs` set yet fail here.
+  would pass the pow2-sized `tests/reference_pins.rs` set yet fail here.
   Lib unit-test count 313 → **315**. No production-code change.
 
 ### Added
@@ -238,7 +255,7 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   call sites relied on the bare `apply_plane_inverse` default, whose
   doc comment wrongly claimed Rule A was "not used by any shipping
   path"; this resolves the README's "YV12/YUY2 retain Rule A pending
-  a clean ffmpeg pin" note from the spec rather than deferring it to
+  a clean oracle pin" note from the spec rather than deferring it to
   a black-box oracle. Behaviour is unchanged (the bare wrapper
   already applied Rule A). The bare `apply_plane_inverse` /
   `apply_plane_forward` wrappers are now `#[cfg(test)]`-only. New
@@ -670,7 +687,7 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   decode invariant (`Some(_)` on Bgra32, `None` on Bgr24) is
   enforced exactly once per call rather than once per pixel. Output
   byte sequence is unchanged on every input; verified by the
-  existing 215 lib + 7 ffmpeg pin tests passing without modification.
+  existing 215 lib + 7 oracle pin tests passing without modification.
 
 ### Added
 
@@ -693,7 +710,7 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   still surface `PixelFormatMismatch` for `Bgr24` / `Bgra32`,
   confirming the hoist did not accidentally route them through the
   packed-RGB packer). Brings lib tests from 215 to 221, total to
-  **228** (221 lib + 7 ffmpeg pins).
+  **228** (221 lib + 7 oracle pins).
 - round 211 — lazy alpha-plane decode in `decode_arith_rgba` for the
   `PixelKind::Bgr24` host buffer, plus early pixel-kind validation
   on the modern `decode_arith_rgb` / `decode_arith_rgba` and legacy
@@ -715,7 +732,7 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   behaviour from both directions: the BGR portion must match the
   BGR-of-Bgra32 byte-for-byte; a frame whose only corruption is in
   the alpha channel body must decode cleanly as Bgr24 and surface
-  `BadChannelHeader` as Bgra32. 215 lib + 7 ffmpeg pin tests pass
+  `BadChannelHeader` as Bgra32. 215 lib + 7 oracle pin tests pass
   (+3 vs. round 204's 212).
 - round 204 — randomised encoder→decoder self-roundtrip property
   suite (9 new tests, module `encoder_random_roundtrip_property`).
@@ -756,8 +773,8 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - round 14 — per-channel header-form selection across all 8 wire forms
 - round 13 — modern probability-model write path: q>=1 frequency rescale
 - round 12 — encoder spec/02 §6.3 final-flush FF-chain bulk-fill
-- round 127 — extend ffmpeg pin set to 7 pow2 sizes + pattern-sensitivity characterisation
-- round 124 — modern RGB(A) predictor Rule B + ffmpeg pins
+- round 127 — extend oracle pin set to 7 pow2 sizes + pattern-sensitivity characterisation
+- round 124 — modern RGB(A) predictor Rule B + oracle pins
 - update is_rare_symbol_cluster doc for Strategy F
 - round 96 — pair-packed 513-entry CDF decode (Strategy F)
 - round 11 — encoder-side spec/02 §5 Step-C freqs[] cache
@@ -864,7 +881,7 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   table re-routed through the type-3 / -7 / -10 dispatchers. Every
   probe returns `Result`, none panics. Test count moves from 164 →
   186 (157 → 179 in the unit-test bin + 7 unchanged integration
-  tests in `tests/ffmpeg_pins.rs`). No production-code changes — the
+  tests in `tests/reference_pins.rs`). No production-code changes — the
   harness pins the existing decoder's defensive behaviour so any
   regression that introduces a panic on a malformed channel surfaces
   here as a concrete test failure rather than as a host-process
@@ -911,7 +928,7 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
   Wire compatibility unchanged: the per-channel choice is decoder-
   blind (`spec/03` §2.1 dispatcher routes on byte 0 alone), the
-  ffmpeg pins in `tests/ffmpeg_pins.rs` decode wires that this
+  oracle pins in `tests/reference_pins.rs` decode wires that this
   crate produced before the flip and still pass, and the existing
   157-test self-roundtrip suite remains byte-exact on every
   fixture.
@@ -1094,31 +1111,31 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- **Round 127 — extended ffmpeg cross-decoder pin set + pattern-
+- **Round 127 — extended oracle cross-decoder pin set + pattern-
   sensitivity characterisation.** The pin file now carries four new
   random-seeded committed frames in addition to round 124's three:
   RGB24 4×4 + 8×16 and RGBA 4×4 + 8×8, all built from the same LCG
   pixel source (`state * 0x9e37_79b9 + 0x12345`, seed `0xdeadbeef`,
   high byte per pixel) and all verified to decode byte-for-byte
-  through ffmpeg's `lagarith` decoder via a minimal `LAGS`-coded AVI
-  wrapper. Seven total pins now run in CI without ffmpeg.
+  through the third-party decoder via a minimal `LAGS`-coded AVI
+  wrapper. Seven total pins now run in CI without that binary.
 
   Round 127 also empirically characterises the residual gap: the
-  crate encoder's compatibility with ffmpeg is **pattern-sensitive
+  crate encoder's compatibility with the oracle is **pattern-sensitive
   even within the power-of-two-pixel-count regime**. The structured
   `i * 73 + 11 → bit-slice` test pattern (used by the existing
   self-roundtrip tests) at the same pow2 sizes that the random
-  patterns sweep cleanly produces ffmpeg-divergent frames (e.g.
+  patterns sweep cleanly produces oracle-divergent frames (e.g.
   ~40% byte match at 16×16, single-byte off-by-N residuals
   scattered through the planes). The crate's own decoder
   self-roundtrips both pattern classes byte-exactly, so the
-  divergence sits on ffmpeg's side of the wire-format interpretation.
+  divergence sits on the oracle side of the wire-format interpretation.
   The most likely root cause is the channel-prefix probability-loader
   at `lagarith.dll!0x180001050` (referenced from `spec/02` §5 and
   `spec/04` §5/§6 but **not disassembled into cleanroom spec**),
   which converts the wire's raw frequency histogram into the
   internal cumulative + shift-exponent struct the modern range
-  coder consumes. ffmpeg's implementation almost certainly mirrors a
+  coder consumes. The oracle implementation almost certainly mirrors a
   normalisation step that the crate's encoder/decoder pair collapses
   to identity (`q = range / total` with raw `total`).
 
@@ -1143,21 +1160,21 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Rule A. The cleanroom's audit/01 §9.1 had left the Rule A vs
   Rule B dispatch open because a horizontal-ramp fixture makes the
   two rules degenerate (first column constant ⇒ `TL == T`). A
-  black-box differential decode against the independent ffmpeg
-  `lagarith` decoder — feeding it `LAGS`-wrapped frames built under
-  each rule — resolves it: ffmpeg reproduces the original pixels
+  black-box differential decode against an independent third-party
+  Lagarith decoder — feeding it `LAGS`-wrapped frames built under
+  each rule — resolves it: the oracle reproduces the original pixels
   byte-exactly only for Rule B encodes (every power-of-two
   pixel-count RGB24 / RGB32 / RGBA frame tested). The prior Rule A
   decode produced wrong pixels for real Lagarith RGB streams.
 
 ### Added
 
-- **Round 124 — ffmpeg cross-decoder byte-exact pins.**
-  `tests/ffmpeg_pins.rs` commits three RGB24 (8×8, 16×16) and RGBA
+- **Round 124 — oracle cross-decoder byte-exact pins.**
+  `tests/reference_pins.rs` commits three RGB24 (8×8, 16×16) and RGBA
   (16×16) frames produced by the crate encoder and verified to
-  decode to their original pixels through ffmpeg's `lagarith`
-  decoder (used purely as a black-box oracle). The pins are
-  committed so the regression runs in CI without ffmpeg; they
+  decode to their original pixels through an independent third-party
+  Lagarith decoder (used purely as a black-box oracle). The pins are
+  committed so the regression runs in CI without that binary; they
   guard against any reversion of the modern path back to Rule A.
 
 - **Round 96 — pair-packed 513-entry CDF decode path (legacy

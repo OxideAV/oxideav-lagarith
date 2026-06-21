@@ -35,7 +35,7 @@
 //! 6. **Spatial predictor** ([`spec/03` §3]): left for row 0,
 //!    JPEG-LS clamped median for rows ≥ 1, with the **Rule B**
 //!    `TL = plane[y-2][W-1]` (for `y ≥ 2`) first-column rule —
-//!    ffmpeg-confirmed for the modern RGB(A) types (round 124).
+//!    oracle-confirmed for the modern RGB(A) types (round 124).
 //! 7. **Cross-plane decorrelation** ([`spec/03` §4]): RGB families
 //!    only — `R += G; B += G` after spatial prediction; alpha
 //!    plane (RGBA) is unchanged.

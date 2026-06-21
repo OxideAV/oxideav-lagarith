@@ -2,20 +2,19 @@
 //!
 //! These frames were produced by the crate's own encoder under the
 //! **Rule B** first-column-of-row predictor (`spec/06` §3.2 linear-
-//! memory `TL`), then validated against the independent **ffmpeg
-//! `lagarith` decoder** used purely as a black-box oracle: each frame
-//! was wrapped in a minimal `LAGS`-coded AVI and decoded with
-//! `ffmpeg -i frame.avi -f rawvideo -pix_fmt {bgr24,bgra}`; ffmpeg
-//! reproduced the original `*_PIXELS` buffer byte-for-byte (after the
-//! bottom-up DIB vertical flip ffmpeg applies for positive
-//! `biHeight`). The same frames decoded under **Rule A** produced
-//! different pixels in ffmpeg — this is the empirical resolution of
-//! the cleanroom's open audit/01 §9.1 dispatch question (Rule A vs
-//! Rule B for the modern arithmetic frame types): the wire format is
-//! Rule B.
+//! memory `TL`), then validated against an **independent third-party
+//! Lagarith decoder** used purely as a black-box binary oracle: each
+//! frame was wrapped in a minimal `LAGS`-coded AVI and decoded by that
+//! binary to raw `bgr24` / `bgra`; the oracle reproduced the original
+//! `*_PIXELS` buffer byte-for-byte (after the bottom-up DIB vertical
+//! flip it applies for positive `biHeight`). The same frames decoded
+//! under **Rule A** produced different pixels in the oracle — this is
+//! the empirical resolution of the cleanroom's open audit/01 §9.1
+//! dispatch question (Rule A vs Rule B for the modern arithmetic frame
+//! types): the wire format is Rule B.
 //!
 //! The pins below are committed so the regression runs in CI without
-//! requiring ffmpeg on the runner. They guard against any future
+//! requiring that binary on the runner. They guard against any future
 //! reversion of `decode_arith_rgb` / `decode_arith_rgba` back to the
 //! (wrong) Rule A predictor.
 //!
@@ -36,12 +35,12 @@
 //! ## Pattern sensitivity (round 127 finding)
 //!
 //! Even within the power-of-two-pixel-count regime, the crate
-//! encoder's compatibility with ffmpeg's lagarith decoder is
+//! encoder's compatibility with the third-party decoder is
 //! **pattern-sensitive**. Random-byte residuals (LCG seed material)
-//! produce frames ffmpeg decodes byte-exactly across the swept sizes
-//! 4×4, 4×8, 8×8, 8×16, 16×16, and 32×32 (RGB24 / RGBA both). A
+//! produce frames the oracle decodes byte-exactly across the swept
+//! sizes 4×4, 4×8, 8×8, 8×16, 16×16, and 32×32 (RGB24 / RGBA both). A
 //! structured "i × 73 + 11 → bit-slice" residual pattern at the
-//! *same* power-of-two-pixel sizes produces frames where ffmpeg's
+//! *same* power-of-two-pixel sizes produces frames where the oracle's
 //! decode partially diverges (e.g. ~40% byte match at 16×16) —
 //! single-byte off-by-N residuals scattered through the planes.
 //! The crate's own decoder always self-roundtrips both pattern
@@ -242,22 +241,22 @@ pub const RGBA_16X16_PIXELS: &[u8] = &[
 ];
 
 #[test]
-fn rgb24_16x16_ffmpeg_pin_rule_b() {
+fn rgb24_16x16_reference_pin_rule_b() {
     let dec = decode_frame(RGB24_16X16_FRAME, 16, 16, PixelKind::Bgr24).unwrap();
     assert_eq!(
         dec.pixels, RGB24_16X16_PIXELS,
-        "RGB24 16x16 decode must match the ffmpeg-validated original"
+        "RGB24 16x16 decode must match the oracle-validated original"
     );
 }
 
 #[test]
-fn rgb24_8x8_ffmpeg_pin_rule_b() {
+fn rgb24_8x8_reference_pin_rule_b() {
     let dec = decode_frame(RGB24_8X8_FRAME, 8, 8, PixelKind::Bgr24).unwrap();
     assert_eq!(dec.pixels, RGB24_8X8_PIXELS);
 }
 
 #[test]
-fn rgba_16x16_ffmpeg_pin_rule_b() {
+fn rgba_16x16_reference_pin_rule_b() {
     let dec = decode_frame(RGBA_16X16_FRAME, 16, 16, PixelKind::Bgra32).unwrap();
     // The pinned pixels carry a meaningful alpha plane; decode must
     // reproduce it exactly (RGBA, type 8).
@@ -270,12 +269,13 @@ fn rgba_16x16_ffmpeg_pin_rule_b() {
 // fed with pseudo-random pixels from a fixed LCG (state mutates as
 // `state * 0x9e37_79b9 + 0x12345`, seed `0xdeadbeef`, the high byte
 // `(state >> 24) as u8` becomes the next pixel byte). Each was
-// validated against ffmpeg's `lagarith` decoder via a minimal
-// `LAGS`-coded AVI wrapper: ffmpeg reproduces `*_PIXELS` byte-for-byte
-// (after the bottom-up DIB vertical flip for positive `biHeight`).
-// The same encoder fed structured residual patterns at *the same*
-// pow2 sizes produces ffmpeg-divergent output (see the module docs);
-// the random-pattern selection samples the well-behaved subset.
+// validated against the independent third-party decoder via a minimal
+// `LAGS`-coded AVI wrapper: the oracle reproduces `*_PIXELS`
+// byte-for-byte (after the bottom-up DIB vertical flip for positive
+// `biHeight`). The same encoder fed structured residual patterns at
+// *the same* pow2 sizes produces oracle-divergent output (see the
+// module docs); the random-pattern selection samples the well-behaved
+// subset.
 
 pub const RGB24_4X4_FRAME: &[u8] = &[
     0x04, 0x1a, 0x00, 0x00, 0x00, 0x2b, 0x00, 0x00, 0x00, 0x04, 0xf7, 0x1a, 0xbf, 0xea, 0xec, 0x52,
@@ -402,30 +402,30 @@ pub const RGB24_8X16_PIXELS: &[u8] = &[
 ];
 
 #[test]
-fn rgb24_4x4_ffmpeg_pin_random_seeded() {
+fn rgb24_4x4_reference_pin_random_seeded() {
     // 4×4 RGB24 — total per channel = 16 (2^4). Pseudo-random seeded
     // pixels (LCG state * 0x9e37_79b9 + 0x12345, seed 0xdeadbeef,
     // taking bits 31..24). Random-looking byte distributions avoid
-    // the structured-pattern divergence that affects ffmpeg even at
-    // power-of-two-pixel sizes (see module docs).
+    // the structured-pattern divergence that affects the oracle even
+    // at power-of-two-pixel sizes (see module docs).
     let dec = decode_frame(RGB24_4X4_FRAME, 4, 4, PixelKind::Bgr24).unwrap();
     assert_eq!(dec.pixels, RGB24_4X4_PIXELS);
 }
 
 #[test]
-fn rgba_4x4_ffmpeg_pin_random_seeded() {
+fn rgba_4x4_reference_pin_random_seeded() {
     let dec = decode_frame(RGBA_4X4_FRAME, 4, 4, PixelKind::Bgra32).unwrap();
     assert_eq!(dec.pixels, RGBA_4X4_PIXELS);
 }
 
 #[test]
-fn rgba_8x8_ffmpeg_pin_random_seeded() {
+fn rgba_8x8_reference_pin_random_seeded() {
     let dec = decode_frame(RGBA_8X8_FRAME, 8, 8, PixelKind::Bgra32).unwrap();
     assert_eq!(dec.pixels, RGBA_8X8_PIXELS);
 }
 
 #[test]
-fn rgb24_8x16_ffmpeg_pin_random_seeded() {
+fn rgb24_8x16_reference_pin_random_seeded() {
     // 8×16 — non-square pow2 pixel count (128 per channel) exercises
     // the row-major scan order with W != H.
     let dec = decode_frame(RGB24_8X16_FRAME, 8, 16, PixelKind::Bgr24).unwrap();

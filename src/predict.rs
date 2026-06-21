@@ -29,10 +29,10 @@
 //!   type-7 RGB path (`spec/07` §9.1 item 7b). For `y == 1` Rule B
 //!   falls back to Rule A because there is no `y - 2` row.
 //!
-//! Rule B for the modern types was confirmed against the independent
-//! ffmpeg `lagarith` decoder (black-box oracle): `LAGS`-wrapped
-//! frames built under Rule B decode to the original pixels
-//! byte-exactly in ffmpeg, whereas Rule A mis-decodes them. This
+//! Rule B for the modern types was confirmed against an independent
+//! third-party Lagarith decoder (black-box binary oracle): `LAGS`-
+//! wrapped frames built under Rule B decode to the original pixels
+//! byte-exactly in that oracle, whereas Rule A mis-decodes them. This
 //! resolves the cleanroom's open audit/01 §9.1 dispatch question — a
 //! horizontal-ramp fixture makes the two rules degenerate (first
 //! column constant ⇒ `TL == T`), so the static analysis could not
@@ -51,7 +51,7 @@ pub(crate) enum FirstColRule {
     /// `TL = plane[y-2][W-1]` for `y >= 2` (Rule A for `y == 1`).
     /// The modern arithmetic RGB(A) path (types 2/4/8) and the
     /// legacy type-7 path both use this (`spec/06` §3.2 /
-    /// `spec/07` §9.1 item 7b; ffmpeg-confirmed for the modern path).
+    /// `spec/07` §9.1 item 7b; oracle-confirmed for the modern path).
     B,
 }
 

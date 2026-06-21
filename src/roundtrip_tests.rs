@@ -3738,7 +3738,7 @@ mod encoder_random_roundtrip_property {
 
     /// Modern YV12 encoder roundtrips byte-equal on every seed. YV12
     /// is the only modern type whose first-column predictor still uses
-    /// Rule A (round 124 pinned Rule B for RGB24 / RGBA via ffmpeg;
+    /// Rule A (round 124 pinned Rule B for RGB24 / RGBA via the oracle;
     /// YV12's planar scan order vs. the DIB flip means the pinned
     /// fixture for YV12 is still self-roundtrip-only — see crate
     /// README "Open items (c)"). Randomised seeded inputs verify that
@@ -3763,7 +3763,7 @@ mod encoder_random_roundtrip_property {
     // ─────────── modern arithmetic YUY2 (type 3) ───────────
 
     /// Modern YUY2 encoder roundtrips byte-equal on every seed. YUY2
-    /// shares the Rule A pending-ffmpeg-pin status with YV12 (see
+    /// shares the Rule A pending-oracle-pin status with YV12 (see
     /// crate README "Open items (c)"). Width must be even for the
     /// macropixel boundary (`Y0 U Y1 V`); 4 / 6 / 8 / 16 cover that.
     #[test]
