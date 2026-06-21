@@ -6,6 +6,26 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Tested
+
+- **Decode-determinism property suite** (`decode_determinism_property`).
+  Three new properties pin that `decode_frame` is a pure function of its
+  inputs — a guard against any future change that smuggles in hidden
+  mutable state (reused scratch, an uninitialised read off the
+  predictor's edge):
+  - `well_formed_decode_is_byte_identical_on_repeat` — every modern
+    family (RGB24, RGBA, legacy RGB, YV12, YUY2, reduced-res type 11)
+    decodes byte-identically on two back-to-back calls, across a spread
+    of plane geometries.
+  - `arbitrary_payload_decode_is_deterministic` — 600 corrupt/arbitrary
+    payloads × all four host pixel formats: each must return the *same*
+    `Result` on repeat (same `Ok` bytes or same `Err` variant), so a
+    non-deterministic error path that read stale/uninitialised bytes is
+    caught. Complements the existing panic-freedom fuzz suites.
+  - `consecutive_null_replays_have_zero_drift` — 64 consecutive NULL
+    ("JUMP") frames through the stateful `Decoder` each replay the
+    keyframe byte-for-byte with zero accumulated drift (`spec/01` §1.1).
+
 ### Changed
 
 - **Provenance hardening — neutral validator naming throughout.** The

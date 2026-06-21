@@ -5991,3 +5991,203 @@ mod encoder_fuzz_harness {
         }
     }
 }
+
+/// Decode-determinism property suite.
+///
+/// `decode_frame` is documented (and relied on) as a *pure function of
+/// its inputs*: the same payload + dimensions + host pixel format must
+/// always yield byte-identical output (or the identical `Err`),
+/// independent of any allocator state, prior calls, or the contents the
+/// output buffer happened to start with. The decoder allocates fresh
+/// scratch and a fresh output `Vec` per call, so this should hold by
+/// construction — these tests pin it as a regression so a future change
+/// that smuggles in hidden mutable state (a reused thread-local scratch,
+/// an uninitialised-read off the predictor's edge, etc.) is caught
+/// immediately rather than surfacing as a flaky cross-platform decode.
+///
+/// Two complementary properties:
+///
+/// 1. **Well-formed determinism** — every modern family's encoder output
+///    decodes identically on two back-to-back calls.
+/// 2. **Malformed determinism** — a corrupt payload that the fuzz suites
+///    prove returns rather than panics must *return the same thing* every
+///    time: a non-deterministic error path (e.g. one that read past an
+///    allocation's logical end into whatever bytes were there) would show
+///    up as two diverging results here.
+///
+/// Plus a **stateful no-drift** property: N consecutive NULL ("JUMP")
+/// frames through the [`Decoder`] each replay the keyframe byte-for-byte
+/// with zero accumulated drift (`spec/01` §1.1).
+#[cfg(test)]
+mod decode_determinism_property {
+    use super::*;
+
+    /// 64-bit LCG stepper (same constants as the other property suites).
+    fn lcg_next(s: &mut u64) -> u64 {
+        *s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *s
+    }
+
+    fn lcg_bytes(seed: u64, n: usize) -> Vec<u8> {
+        let mut s = seed ^ 0x9e37_79b9_7f4a_7c15;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            out.push((lcg_next(&mut s) >> 33) as u8);
+        }
+        out
+    }
+
+    /// Each modern family: encode a frame, then decode it twice. The two
+    /// decoded buffers must be byte-identical (decode is a pure function
+    /// of the payload). Swept across a spread of dimensions per family
+    /// so the property holds at every plane geometry, not just one size.
+    #[test]
+    fn well_formed_decode_is_byte_identical_on_repeat() {
+        let rgb_dims: &[(u32, u32)] = &[(1, 1), (3, 3), (4, 4), (5, 7), (8, 8), (13, 3)];
+        let yuv_dims: &[(u32, u32)] = &[(2, 2), (4, 4), (6, 4), (8, 6), (16, 8)];
+
+        let mut seed = 0xd37e_8a1b_1573_0001u64;
+        for &(w, h) in rgb_dims {
+            // RGB24 (type 2/4).
+            let px = lcg_bytes(seed ^ ((w as u64) << 16 | h as u64), (w * h) as usize * 3);
+            let frame = encode_arith_rgb24(&px, w, h);
+            let a = decode_frame(&frame, w, h, PixelKind::Bgr24).expect("rgb24 decode A");
+            let b = decode_frame(&frame, w, h, PixelKind::Bgr24).expect("rgb24 decode B");
+            assert_eq!(a.pixels, b.pixels, "RGB24 {w}x{h} non-deterministic decode");
+            assert_eq!(a.pixels, px, "RGB24 {w}x{h} not byte-exact");
+
+            // RGBA (type 8).
+            let px = lcg_bytes(seed ^ 0xa1fa ^ (w as u64), (w * h) as usize * 4);
+            let frame = encode_arith_rgba(&px, w, h);
+            let a = decode_frame(&frame, w, h, PixelKind::Bgra32).expect("rgba decode A");
+            let b = decode_frame(&frame, w, h, PixelKind::Bgra32).expect("rgba decode B");
+            assert_eq!(a.pixels, b.pixels, "RGBA {w}x{h} non-deterministic decode");
+
+            // Legacy RGB (type 7, adaptive-CDF range coder).
+            let px = lcg_bytes(seed ^ 0x1e9a, (w * h) as usize * 3);
+            let frame = encode_legacy_rgb(&px, w, h);
+            let a = decode_frame(&frame, w, h, PixelKind::Bgr24).expect("legacy decode A");
+            let b = decode_frame(&frame, w, h, PixelKind::Bgr24).expect("legacy decode B");
+            assert_eq!(
+                a.pixels, b.pixels,
+                "legacy RGB {w}x{h} non-deterministic decode"
+            );
+            seed = seed.wrapping_add(0x1000);
+        }
+
+        for &(w, h) in yuv_dims {
+            // YV12 (type 10).
+            let px = lcg_bytes(seed ^ (w as u64), PixelKind::Yv12.buffer_len(w, h));
+            let frame = encode_arith_yv12(&px, w, h);
+            let a = decode_frame(&frame, w, h, PixelKind::Yv12).expect("yv12 decode A");
+            let b = decode_frame(&frame, w, h, PixelKind::Yv12).expect("yv12 decode B");
+            assert_eq!(a.pixels, b.pixels, "YV12 {w}x{h} non-deterministic decode");
+
+            // YUY2 (type 3).
+            let px = lcg_bytes(seed ^ 0x0303, PixelKind::Yuy2.buffer_len(w, h));
+            let frame = encode_arith_yuy2(&px, w, h);
+            let a = decode_frame(&frame, w, h, PixelKind::Yuy2).expect("yuy2 decode A");
+            let b = decode_frame(&frame, w, h, PixelKind::Yuy2).expect("yuy2 decode B");
+            assert_eq!(a.pixels, b.pixels, "YUY2 {w}x{h} non-deterministic decode");
+            seed = seed.wrapping_add(0x1000);
+        }
+
+        // Reduced-resolution (type 11): the dimension guard requires both
+        // dims to be a multiple of 4 (the half-res YV12 body is itself a
+        // 4:2:0 plane geometry — `spec/01` §2.4 / decoder guard). Sweep a
+        // dedicated set of 4-aligned dimensions.
+        let red_dims: &[(u32, u32)] = &[(4, 4), (8, 4), (8, 8), (12, 8), (16, 8)];
+        for &(w, h) in red_dims {
+            let px = lcg_bytes(seed ^ 0x0b0b ^ (w as u64), PixelKind::Yv12.buffer_len(w, h));
+            let frame = encode_arith_reduced_res(&px, w, h);
+            let a = decode_frame(&frame, w, h, PixelKind::Yv12).expect("type11 decode A");
+            let b = decode_frame(&frame, w, h, PixelKind::Yv12).expect("type11 decode B");
+            assert_eq!(
+                a.pixels, b.pixels,
+                "reduced-res {w}x{h} non-deterministic decode"
+            );
+            seed = seed.wrapping_add(0x1000);
+        }
+    }
+
+    /// Malformed / arbitrary payloads: the fuzz suites already prove
+    /// `decode_frame` *returns* (never panics) on hostile bytes; this
+    /// pins the stronger property that what it returns is *deterministic*.
+    /// A decoder that read uninitialised scratch off the end of an
+    /// allocation, or branched on stale buffer contents, would yield two
+    /// diverging `Result`s on the same input — caught here. We compare
+    /// the full `Result`: same `Ok(pixels)` byte-for-byte, or the same
+    /// `Err` variant. Driven across all four host pixel formats so every
+    /// wire-type → host dispatch is covered.
+    #[test]
+    fn arbitrary_payload_decode_is_deterministic() {
+        let kinds = [
+            PixelKind::Bgr24,
+            PixelKind::Bgra32,
+            PixelKind::Yv12,
+            PixelKind::Yuy2,
+        ];
+        let mut state = 0xbad0_c0de_5eed_0357u64;
+        for iter in 0..600u32 {
+            // Small even dims keep chroma math exact and the raster tiny.
+            let w = 2 * (1 + (lcg_next(&mut state) % 8) as u32);
+            let h = 2 * (1 + (lcg_next(&mut state) % 6) as u32);
+            let len = 1 + (lcg_next(&mut state) % 96) as usize;
+            let payload = lcg_bytes(state, len);
+            for &kind in &kinds {
+                let a = decode_frame(&payload, w, h, kind);
+                let b = decode_frame(&payload, w, h, kind);
+                match (&a, &b) {
+                    (Ok(da), Ok(db)) => assert_eq!(
+                        da.pixels, db.pixels,
+                        "iter {iter} {w}x{h} {kind:?}: Ok diverged on repeat",
+                    ),
+                    (Err(_), Err(_)) => {
+                        // Compare the Debug rendering: cheap structural
+                        // equality without requiring PartialEq on Error.
+                        assert_eq!(
+                            format!("{a:?}"),
+                            format!("{b:?}"),
+                            "iter {iter} {w}x{h} {kind:?}: Err variant diverged on repeat",
+                        );
+                    }
+                    _ => panic!(
+                        "iter {iter} {w}x{h} {kind:?}: Ok/Err disagreement on repeat: \
+                         {a:?} vs {b:?}",
+                    ),
+                }
+            }
+        }
+    }
+
+    /// Stateful no-drift: after one keyframe, N consecutive NULL ("JUMP")
+    /// frames must each replay the keyframe byte-for-byte. A replay path
+    /// that mutated its stored predecessor in place would accumulate
+    /// drift and diverge by the Nth frame; this pins zero drift across a
+    /// long run (`spec/01` §1.1).
+    #[test]
+    fn consecutive_null_replays_have_zero_drift() {
+        let (w, h) = (8u32, 8u32);
+        let px = lcg_bytes(0x4a4d_5021, (w * h) as usize * 4); // "JMP!"
+        let keyframe = encode_arith_rgba(&px, w, h);
+
+        let mut dec = Decoder::new();
+        let first = dec
+            .decode(&keyframe, w, h, PixelKind::Bgra32)
+            .expect("keyframe must decode");
+        let reference = first.pixels.clone();
+        assert_eq!(reference, px, "keyframe must be byte-exact");
+
+        for n in 0..64u32 {
+            let replay = dec
+                .decode(&[], w, h, PixelKind::Bgra32)
+                .unwrap_or_else(|e| panic!("NULL replay {n} must succeed: {e:?}"));
+            assert_eq!(
+                replay.pixels, reference,
+                "NULL replay {n} drifted from the keyframe",
+            );
+        }
+    }
+}

@@ -139,6 +139,14 @@ The `FrameType` enum also exposes structural accessors:
   are independently encodable and byte-exact-decodable, so "every wire
   type the decoder accepts is encodable" is a machine-checked
   invariant.
+- A **decode-determinism property suite** pins that `decode_frame` is a
+  pure function of its inputs: every modern family decodes
+  byte-identically on a repeat call; 600 arbitrary/corrupt payloads ×
+  all four host pixel formats each return the *same* `Result` on repeat
+  (same `Ok` bytes or same `Err` variant, complementing the
+  panic-freedom fuzz suites); and 64 consecutive NULL ("JUMP") frames
+  through the stateful `Decoder` replay the keyframe with zero
+  accumulated drift (`spec/01` §1.1).
 - Two `libFuzzer`-style harnesses guard robustness from both ends. The
   decode-side harness in `fuzz/` (`cargo-fuzz`) asserts panic-freedom
   on attacker-supplied payloads — the modern range coder rejects a
