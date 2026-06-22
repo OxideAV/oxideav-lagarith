@@ -152,7 +152,16 @@ The `FrameType` enum also exposes structural accessors:
   on attacker-supplied payloads — the modern range coder rejects a
   malformed probability total exceeding the working `range`
   (`q = range / total` → 0) as `Error::ProbabilityTotalExceedsRange`
-  rather than dividing by zero (`spec/02` §5 / `spec/04` §5). The
+  rather than dividing by zero (`spec/02` §5 / `spec/04` §5). Its
+  dimension selectors map onto `1..=64` at **both parities**, so the
+  decoder's documented odd-dimension branches are in-corpus: the YV12
+  `floor(W·H/4) != (W/2)·(H/2)` SPECGAP single-row chroma fallback
+  (`spec/03` §6.1.1) and the YUY2 odd-width luma-tail / `0x80`
+  neutral-chroma slot (`spec/03` §6.2). Because the fuzz binary is
+  out-of-CI, the in-crate panic-freedom sweeps additionally drive the
+  YV12/YUY2 dispatchers across a mixed-parity shape set (down to the
+  degenerate single-pixel `1×1` edge with empty chroma planes), so the
+  same odd-dimension geometry is panic-free-checked under CI. The
   encode-side counterpart (`encoder_fuzz_harness`, in-crate because the
   encoder is test-only) runs a deterministic-LCG high-iteration loop
   over the encoder's *input* space (random legal dimensions × a 4-level
