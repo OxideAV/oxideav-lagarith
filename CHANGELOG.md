@@ -8,6 +8,22 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Tested
 
+- **Odd-dimension decode fuzz coverage.** The `cargo-fuzz` decode
+  harness (`fuzz/fuzz_targets/decode_lagarith.rs`) previously mapped its
+  two dimension-selector bytes onto *even* widths/heights only, leaving
+  the decoder's documented odd-dimension branches unfuzzed: the YV12
+  `floor(W·H/4) != (W/2)·(H/2)` SPECGAP single-row chroma fallback
+  (`spec/03` §6.1.1) and the YUY2 odd-width luma-tail / `0x80`
+  neutral-chroma slot (`spec/03` §6.2). The selector now maps onto
+  `1..=64` (both parities), so those branches are reachable from a single
+  libFuzzer mutation. Because the fuzz binary does not run in CI, the
+  in-crate panic-freedom sweeps (`random_payload_no_panic_sweep`,
+  `random_channel_bodies_no_panic_sweep`) now additionally drive the YV12
+  and YUY2 dispatchers across a mixed-parity shape set — including the
+  degenerate single-pixel `(1, 1)` edge with empty chroma planes — giving
+  CI-enforced panic-freedom coverage of the same odd-dimension geometry
+  the fuzz harness reaches.
+
 - **Decode-determinism property suite** (`decode_determinism_property`).
   Three new properties pin that `decode_frame` is a pure function of its
   inputs — a guard against any future change that smuggles in hidden

@@ -2671,8 +2671,23 @@ mod decoder_defensive_harness {
     /// values + several lengths) through `decode_frame`. Each call
     /// must return `Ok` or `Err` — never panic. Reproducibility comes
     /// from the LCG seed.
+    ///
+    /// The `(W, H)` shapes deliberately span **both parities**. The
+    /// even shapes drive the natural-aligned YV12 / YUY2 chroma
+    /// geometry; the odd shapes reach the decoder's documented
+    /// odd-dimension branches — the YV12 `floor(W·H/4) != (W/2)·(H/2)`
+    /// SPECGAP single-row chroma fallback (`spec/03` §6.1.1) and the
+    /// YUY2 odd-width luma-tail / `0x80` neutral-chroma slot
+    /// (`spec/03` §6.2). Those branches run different predictor-geometry
+    /// and packing arithmetic than the even path, so their panic-freedom
+    /// is asserted here under CI rather than relying solely on the
+    /// out-of-CI `cargo-fuzz` harness.
     #[test]
     fn random_payload_no_panic_sweep() {
+        // Mixed-parity shapes: (3,3) and (5,3) exercise odd W and/or H;
+        // (1,1) is the degenerate single-pixel edge (empty YV12/YUY2
+        // chroma planes); (4,4) keeps the prior even baseline.
+        const SHAPES: [(u32, u32); 5] = [(4, 4), (3, 3), (5, 3), (4, 5), (1, 1)];
         for type_byte in 0u8..=12 {
             for &seed in &[0x1234_5678_9abc_def0u64, 0xfeed_face_dead_beef, 0] {
                 for &len in &[1usize, 2, 5, 9, 16, 33, 64, 128] {
@@ -2682,10 +2697,12 @@ mod decoder_defensive_harness {
                     // anything that returns Err is fine, anything that
                     // returns Ok is fine; the test fails only on
                     // panic.
-                    let _ = decode_frame(&payload, 4, 4, PixelKind::Bgr24);
-                    let _ = decode_frame(&payload, 4, 4, PixelKind::Bgra32);
-                    let _ = decode_frame(&payload, 4, 4, PixelKind::Yv12);
-                    let _ = decode_frame(&payload, 4, 4, PixelKind::Yuy2);
+                    for &(w, h) in &SHAPES {
+                        let _ = decode_frame(&payload, w, h, PixelKind::Bgr24);
+                        let _ = decode_frame(&payload, w, h, PixelKind::Bgra32);
+                        let _ = decode_frame(&payload, w, h, PixelKind::Yv12);
+                        let _ = decode_frame(&payload, w, h, PixelKind::Yuy2);
+                    }
                 }
             }
         }
@@ -2696,8 +2713,20 @@ mod decoder_defensive_harness {
     /// pattern in the channel body. Catches dispatcher-level
     /// regressions that would only surface against adversarial
     /// wire bytes.
+    ///
+    /// RGB / legacy types are driven at the even baseline; the YV12 and
+    /// YUY2 dispatchers are additionally driven at **odd** `(W, H)`
+    /// shapes so the random channel bytes reach the odd-dimension
+    /// chroma-geometry branches (`spec/03` §6.1.1 YV12 SPECGAP single-
+    /// row fallback and `spec/03` §6.2 YUY2 odd-width tail) under CI,
+    /// not just the out-of-CI `cargo-fuzz` harness.
     #[test]
     fn random_channel_bodies_no_panic_sweep() {
+        // Shapes the planar-YUV dispatchers are swept against. (3,3),
+        // (5,3), (4,5) hit odd W and/or H; (1,1) is the degenerate
+        // single-pixel edge with empty chroma planes; (4,4) is the
+        // even baseline.
+        const YUV_SHAPES: [(u32, u32); 5] = [(4, 4), (3, 3), (5, 3), (4, 5), (1, 1)];
         for &seed in &[0xa5a5_5a5a_a5a5_5a5au64, 0x0fed_cba9_8765_4321, 1] {
             for &per_channel_len in &[1usize, 4, 9, 17, 33, 80] {
                 let ch_b = lcg_bytes(seed, per_channel_len);
@@ -2712,14 +2741,17 @@ mod decoder_defensive_harness {
                 let mut t7_frame = frame.clone();
                 t7_frame[0] = 7;
                 let _ = decode_frame(&t7_frame, 4, 4, PixelKind::Bgr24);
-                // And the YV12 dispatcher (3 planes Y/V/U).
+                // The YV12 (3 planes Y/V/U) and YUY2 dispatchers are
+                // swept across both parities so the odd-dimension
+                // chroma-geometry branches see random channel bytes.
                 let mut t10_frame = frame.clone();
                 t10_frame[0] = 10;
-                let _ = decode_frame(&t10_frame, 4, 4, PixelKind::Yv12);
-                // And the YUY2 dispatcher.
                 let mut t3_frame = frame.clone();
                 t3_frame[0] = 3;
-                let _ = decode_frame(&t3_frame, 4, 4, PixelKind::Yuy2);
+                for &(w, h) in &YUV_SHAPES {
+                    let _ = decode_frame(&t10_frame, w, h, PixelKind::Yv12);
+                    let _ = decode_frame(&t3_frame, w, h, PixelKind::Yuy2);
+                }
             }
         }
     }

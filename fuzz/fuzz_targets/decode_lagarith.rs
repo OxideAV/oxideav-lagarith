@@ -48,22 +48,39 @@
 //! request a multi-gigabyte raster (a *resource* request, not a decoder
 //! bug); worse, libFuzzer would waste its budget on allocation churn
 //! rather than the parse/build/predictor logic this harness targets. We
-//! therefore map the two selector bytes onto small, even, chroma-safe
-//! dimensions (YV12 / YUY2 want even width and height), keeping the
-//! raster tiny while still reaching every code path. The library itself
-//! is deliberately left free of an arbitrary built-in size policy.
+//! therefore map the two selector bytes onto small dimensions in
+//! `1..=64`, keeping the raster tiny while still reaching every code
+//! path. The library itself is deliberately left free of an arbitrary
+//! built-in size policy.
+//!
+//! **Odd dimensions are in scope.** Earlier revisions of this harness
+//! mapped selectors onto *even* dimensions only ("YV12 / YUY2 want even
+//! width and height"). That left the decoder's documented odd-dimension
+//! branches unfuzzed: the YV12 `floor(W·H/4) != (W/2)·(H/2)` SPECGAP
+//! fallback (`spec/03` §6.1.1 — a single-row chroma placeholder
+//! geometry) and the YUY2 odd-width tail that emits the trailing luma
+//! column with a `0x80` neutral chroma slot (`spec/03` §6.2). Those
+//! paths run different predictor-geometry and packing arithmetic than
+//! the even path, so panic-freedom there must be exercised independently
+//! — which means the harness has to be able to *produce* odd widths and
+//! heights. The chroma math is not "exact" at odd dims (it is a
+//! host-integration placeholder per the spec), but the contract under
+//! test is panic-freedom, not chroma exactness, so odd dims belong in
+//! the corpus.
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_lagarith::{decode_frame, DecodedFrame, PixelKind};
 
-/// Map a fuzz selector byte onto a small, even dimension in `2..=64`.
-/// Even dimensions keep the YV12 / YUY2 chroma-subsampling math exact
-/// (those formats subsample 2:1 horizontally and, for YV12, vertically),
-/// and the small cap keeps the output raster tiny so libFuzzer spends
-/// its budget on logic paths rather than allocation.
+/// Map a fuzz selector byte onto a small dimension in `1..=64`,
+/// **including odd values**. Odd widths and heights reach the decoder's
+/// YV12 odd-dimension SPECGAP fallback (`spec/03` §6.1.1) and the YUY2
+/// odd-width tail (`spec/03` §6.2) — paths the prior even-only mapping
+/// never exercised. The small cap keeps the output raster tiny so
+/// libFuzzer spends its budget on logic paths rather than allocation.
 fn dim(selector: u8) -> u32 {
-    // 0..=31 → 2,4,6,…,64.
-    2 + 2 * u32::from(selector % 32)
+    // 0..=63 → 1,2,3,…,64 (both parities so the odd-dimension branches
+    // are reachable; the `% 64` keeps the raster bounded).
+    1 + u32::from(selector % 64)
 }
 
 fn drive(payload: &[u8], width: u32, height: u32) {
