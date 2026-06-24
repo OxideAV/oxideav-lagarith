@@ -624,6 +624,64 @@ fn arith_yv12_odd_dims_specgap_roundtrip() {
 }
 
 #[test]
+fn yv12_odd_dims_decode_consumes_floor_chroma_byte_counts() {
+    // Decode-direction wire-contract pin (`spec/03` §6.1.1 +
+    // `audit/00` §9.3): for an odd-dimensioned YV12 frame the wire
+    // carries exactly `W*H` luma bytes and `floor(W*H/4)` bytes for
+    // each of the V and U chroma planes — even when
+    // `(W/2)*(H/2) != floor(W*H/4)`. This reads the channel-offset
+    // table straight off the encoded frame and runs each plane slice
+    // through the channel dispatcher *independently of the decoder's
+    // own `wire_plane_pixel_counts` derivation*, so a future drift in
+    // the decoder's chroma byte-count formula (e.g. a "round up to
+    // even" regression) is caught here even though the encoder-mirror
+    // roundtrip — which would change both halves together — would
+    // still pass.
+    use crate::frame::split_channels;
+    for &(w, h) in &[(5u32, 4u32), (4, 5), (5, 5), (7, 3), (3, 7), (9, 9), (1, 8)] {
+        let cw = (w / 2) as usize;
+        let ch = (h / 2) as usize;
+        let y_pixels = w as usize * h as usize;
+        let c_pixels = y_pixels / 4; // floor(W*H/4) per audit/00 §9.3
+                                     // Confirm we are on the genuine non-divisible branch.
+        assert_ne!(cw * ch, c_pixels, "{w}×{h} should trigger the floor branch");
+
+        let pixels = yv12_odd_buffer(0x5f12_0c0d ^ ((w as u64) << 8) ^ h as u64, w, h);
+        let frame = encode_arith_yv12(&pixels, w, h);
+        assert_eq!(frame[0], 10, "type 10 (YV12) expected for {w}×{h}");
+
+        // Plane wire order is Y, V, U (3 channels) per spec/03 §6.1.
+        let slices = split_channels(&frame, 3).expect("YV12 frame has a 3-plane offset table");
+        assert_eq!(slices.len(), 3);
+        let plane_y = decode_channel(slices[0], y_pixels).expect("Y plane decodes");
+        let plane_v = decode_channel(slices[1], c_pixels).expect("V plane decodes");
+        let plane_u = decode_channel(slices[2], c_pixels).expect("U plane decodes");
+        assert_eq!(
+            plane_y.len(),
+            y_pixels,
+            "{w}×{h}: luma plane must be W*H bytes"
+        );
+        assert_eq!(
+            plane_v.len(),
+            c_pixels,
+            "{w}×{h}: V plane must be floor(W*H/4) bytes",
+        );
+        assert_eq!(
+            plane_u.len(),
+            c_pixels,
+            "{w}×{h}: U plane must be floor(W*H/4) bytes",
+        );
+        // The host YV12 buffer the decoder reconstructs is exactly the
+        // luma + two floor-sized chroma planes concatenated.
+        assert_eq!(
+            y_pixels + 2 * c_pixels,
+            PixelKind::Yv12.buffer_len(w, h),
+            "{w}×{h}: plane byte counts must sum to the YV12 host buffer length",
+        );
+    }
+}
+
+#[test]
 fn arith_yv12_solid_planes_roundtrip() {
     // Each plane filled with a constant — exercises the encoder's
     // header-0xff fast path for all three channels.

@@ -8,6 +8,24 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Tested
 
+- round 365 — **YV12 odd-dimension decode-direction wire-contract
+  pin** (`yv12_odd_dims_decode_consumes_floor_chroma_byte_counts`).
+  For an odd-dimensioned YV12 frame the wire carries exactly `W·H`
+  luma bytes and `floor(W·H/4)` bytes for each of the V and U chroma
+  planes (`spec/03` §6.1.1 + `audit/00` §9.3), even on the genuine
+  non-divisible branch where `(W/2)·(H/2) != floor(W·H/4)`. The new
+  test parses the channel-offset table straight off the encoded frame
+  and runs each plane slice through the channel dispatcher
+  *independently of the decoder's own `wire_plane_pixel_counts`
+  derivation*, then asserts the three plane lengths and that they sum
+  to the `PixelKind::Yv12` host buffer length. This guards the
+  documented decode-side byte-count contract against a future drift
+  (e.g. a "round chroma up to even" regression) that the existing
+  encoder-mirror `arith_yv12_odd_dims_specgap_roundtrip` — which
+  changes both halves of the round-trip together — could not catch.
+  All-test-side; no `src/` logic, range-coder, predictor, or
+  wire-format change. Lib unit-test count 340 → **341**.
+
 - **Odd-dimension decode fuzz coverage.** The `cargo-fuzz` decode
   harness (`fuzz/fuzz_targets/decode_lagarith.rs`) previously mapped its
   two dimension-selector bytes onto *even* widths/heights only, leaving
