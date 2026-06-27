@@ -6,6 +6,22 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Tested
+
+- round 376 — **encoder size-guard property suite**
+  (`encoder::tests::public_encode_frame_never_exceeds_uncompressed`).
+  Pins the encoder-quality invariant that `encode_frame` is **never
+  larger than the uncompressed (type-1) form** — `frame.len() <= raw +
+  1` — across a full cross-product of content patterns (zeros,
+  constant, gradient, two-symbol, random) × dimensions (the `width %
+  4` type-2/type-4 split, an odd width, 1-row and 1-col edges) × every
+  host pixel kind. Each cell also reconfirms byte-exact round-trip, so
+  the size bound never trades away correctness. This guards the
+  frame-level `*_or_uncompressed` size guard (`spec/01` §2.1) against a
+  regression that lets the arithmetic overhead exceed the raw payload
+  on adversarial (high-entropy / tiny) inputs. Lib unit-test count
+  352 → **353**.
+
 ### Added
 
 - round 376 — **encode hot-path Criterion benchmark**

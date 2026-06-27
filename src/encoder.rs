@@ -2146,6 +2146,81 @@ mod tests {
         assert!(encode_null().is_empty());
     }
 
+    /// `encode_frame` is **never larger than the uncompressed (type-1)
+    /// form** for any input, across a spread of content patterns ×
+    /// dimensions × pixel kinds — the frame-level size guard (`spec/01`
+    /// §2.1, the `*_or_uncompressed` wrappers) is correct on every
+    /// path. Also reconfirms byte-exact round-trip on each cell, so the
+    /// size bound never comes at the cost of correctness.
+    #[test]
+    fn public_encode_frame_never_exceeds_uncompressed() {
+        use crate::decoder::{decode_frame, PixelKind};
+        // (w, h): the width%4 split (8 vs 6), an odd width (5), a
+        // 1-row and a 1-col edge.
+        let dims = [(8u32, 8u32), (6, 6), (5, 4), (8, 1), (1, 8)];
+        let kinds = [
+            PixelKind::Bgr24,
+            PixelKind::Bgra32,
+            PixelKind::Yv12,
+            PixelKind::Yuy2,
+        ];
+        // Pattern generators over a buffer of `len` bytes.
+        type PatternGen = fn(usize) -> Vec<u8>;
+        let patterns: &[(&str, PatternGen)] = &[
+            ("zeros", |n| vec![0u8; n]),
+            ("constant", |n| vec![0x5au8; n]),
+            ("gradient", |n| (0..n).map(|i| (i % 256) as u8).collect()),
+            ("two_symbol", |n| {
+                (0..n).map(|i| if i % 2 == 0 { 3 } else { 200 }).collect()
+            }),
+            ("random", |n| {
+                let mut s = 0x1234_5678u64;
+                (0..n)
+                    .map(|_| {
+                        s = s.wrapping_mul(2862933555777941757).wrapping_add(3037000493);
+                        (s >> 40) as u8
+                    })
+                    .collect()
+            }),
+        ];
+
+        for kind in kinds {
+            for &(w, h) in &dims {
+                let len = kind.buffer_len(w, h);
+                if len == 0 {
+                    continue;
+                }
+                for (pname, gen) in patterns {
+                    let mut pixels = gen(len);
+                    // YUY2 odd-width: neutralise the odd-tail chroma slot
+                    // so the buffer is decoder-producible (round-trips).
+                    if kind == PixelKind::Yuy2 && w % 2 == 1 {
+                        for y in 0..h as usize {
+                            let row = y * w as usize * 2;
+                            pixels[row + 2 * (w as usize - 1) + 1] = 0x80;
+                        }
+                    }
+                    let frame = encode_frame(&pixels, w, h, kind).expect("encode");
+                    // Size guard: never larger than the 1-byte-prefixed
+                    // raw buffer (the type-1 form `encode_uncompressed`
+                    // emits).
+                    assert!(
+                        frame.len() <= len + 1,
+                        "{pname} {kind:?} {w}x{h}: encoded {} > raw {} + 1",
+                        frame.len(),
+                        len
+                    );
+                    // Correctness: byte-exact round-trip.
+                    let decoded = decode_frame(&frame, w, h, kind).expect("decode");
+                    assert_eq!(
+                        decoded.pixels, pixels,
+                        "{pname} {kind:?} {w}x{h}: round-trip mismatch"
+                    );
+                }
+            }
+        }
+    }
+
     /// Fixture set for the legacy selector tests — a mix of profiles
     /// that exercise both the bare-Fibonacci and the
     /// RLE-then-Fibonacci sub-paths. None of these residual
