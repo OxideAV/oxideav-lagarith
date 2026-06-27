@@ -13,7 +13,7 @@ use oxideav_core::{
     TimeBase, VideoFrame, VideoPlane,
 };
 
-use crate::decoder::{decode_frame, DecodedFrame, PixelKind};
+use crate::decoder::{decode_frame_with_prev, DecodedFrame, PixelKind};
 use crate::encoder::encode_frame;
 
 /// Canonical codec id. `oxideav-meta::register_all` calls
@@ -64,6 +64,7 @@ pub fn make_decoder(params: &CodecParameters) -> CoreResult<Box<dyn Decoder>> {
         height,
         pixel_kind,
         pending: None,
+        prev: None,
         eof: false,
     }))
 }
@@ -74,6 +75,14 @@ struct LagarithDecoder {
     height: u32,
     pixel_kind: PixelKind,
     pending: Option<Packet>,
+    /// Most-recently decoded frame, retained so a NULL ("JUMP") packet
+    /// (zero-byte payload) replays it per `spec/01` §1.1 — matching the
+    /// stateful standalone [`crate::Decoder`]. `reset` (via the trait
+    /// default's `flush` + drain) does not clear it, so callers that
+    /// seek should construct a fresh decoder; this mirrors the
+    /// intra-only nature of every *encoded* frame (only NULL frames are
+    /// inter-dependent).
+    prev: Option<DecodedFrame>,
     eof: bool,
 }
 
@@ -105,8 +114,18 @@ impl Decoder for LagarithDecoder {
                 "oxideav-lagarith: width/height must be set on CodecParameters",
             ));
         }
-        let frame = decode_frame(&pkt.data, self.width, self.height, self.pixel_kind)
-            .map_err(|e| CoreError::invalid(format!("oxideav-lagarith: {e}")))?;
+        // A zero-byte payload is a NULL ("JUMP") frame: replay the
+        // previous decoded frame (`spec/01` §1.1). Non-NULL frames
+        // decode normally and become the new `prev`.
+        let frame = decode_frame_with_prev(
+            &pkt.data,
+            self.width,
+            self.height,
+            self.pixel_kind,
+            self.prev.as_ref(),
+        )
+        .map_err(|e| CoreError::invalid(format!("oxideav-lagarith: {e}")))?;
+        self.prev = Some(frame.clone());
         Ok(Frame::Video(map_to_video_frame(frame, pkt.pts)))
     }
 
@@ -433,6 +452,54 @@ mod tests {
         }
     }
 
+    /// The framework `Decoder` replays a NULL ("JUMP") packet
+    /// (zero-byte payload) as the previous frame (`spec/01` §1.1),
+    /// matching the stateful standalone `Decoder`.
+    #[test]
+    fn framework_decoder_replays_null_jump_frame() {
+        use oxideav_core::PixelFormat;
+        let (w, h) = (4u32, 4u32);
+        let pixels: Vec<u8> = (0..(w * h * 4)).map(|i| (i * 13 % 251) as u8).collect();
+
+        let mut ctx = RuntimeContext::new();
+        register(&mut ctx);
+        let mut params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        params.media_type = MediaType::Video;
+        params.width = Some(w);
+        params.height = Some(h);
+        params.pixel_format = Some(PixelFormat::Bgra);
+
+        // Encode a real keyframe.
+        let mut enc = make_encoder(&params).unwrap();
+        enc.send_frame(&Frame::Video(VideoFrame {
+            pts: Some(0),
+            planes: vec![VideoPlane {
+                stride: (w * 4) as usize,
+                data: pixels.clone(),
+            }],
+        }))
+        .unwrap();
+        let key_pkt = enc.receive_packet().unwrap();
+
+        let mut dec = make_decoder(&params).unwrap();
+        // Decode the keyframe.
+        dec.send_packet(&key_pkt).unwrap();
+        let first = match dec.receive_frame().unwrap() {
+            Frame::Video(v) => v.planes[0].data.clone(),
+            other => panic!("expected video, got {other:?}"),
+        };
+        assert_eq!(first, pixels);
+
+        // A NULL ("JUMP") packet (empty payload) replays the keyframe.
+        let null_pkt = Packet::new(1, TimeBase::new(1, 30), Vec::new());
+        dec.send_packet(&null_pkt).unwrap();
+        let replayed = match dec.receive_frame().unwrap() {
+            Frame::Video(v) => v.planes[0].data.clone(),
+            other => panic!("expected video, got {other:?}"),
+        };
+        assert_eq!(replayed, pixels, "NULL frame must replay the predecessor");
+    }
+
     #[test]
     fn register_installs_encoder() {
         let mut ctx = RuntimeContext::new();
@@ -549,7 +616,7 @@ mod tests {
         enc.send_frame(&Frame::Video(vf)).unwrap();
         let pkt = enc.receive_packet().unwrap();
 
-        let decoded = decode_frame(&pkt.data, w, h, PixelKind::Yv12).unwrap();
+        let decoded = crate::decode_frame(&pkt.data, w, h, PixelKind::Yv12).unwrap();
         let mut expected = y.clone();
         expected.extend_from_slice(&v);
         expected.extend_from_slice(&u);

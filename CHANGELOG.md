@@ -6,6 +6,20 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- round 376 — **framework `Decoder` now handles NULL ("JUMP")
+  frames.** The registry `LagarithDecoder` previously called the
+  stateless `decode_frame`, which surfaces a zero-byte payload as
+  `Error::NullFrame` — so a NULL frame fed through the framework
+  errored instead of replaying the predecessor. It now retains the
+  last decoded frame and dispatches through `decode_frame_with_prev`,
+  replaying the previous frame on an empty packet (`spec/01` §1.1),
+  matching the stateful standalone `Decoder`. New
+  `framework_decoder_replays_null_jump_frame` test encodes a keyframe,
+  feeds an empty packet, and asserts the NULL frame replays the
+  keyframe byte-for-byte. Registry test count 9 → **10**.
+
 ### Added
 
 - round 376 — **dual-API direct factory endpoints.** Per the
