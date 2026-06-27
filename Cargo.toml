@@ -39,3 +39,12 @@ criterion = "0.5"
 [[bench]]
 name = "decode"
 harness = false
+
+# Encode hot-path benchmark (round 376). Times the public
+# `encode_frame` across every host pixel family on deterministically
+# synthesised gradient+noise input. No committed fixtures, no `docs/`
+# reads at bench time. Run with:
+#     cargo bench -p oxideav-lagarith --bench encode
+[[bench]]
+name = "encode"
+harness = false

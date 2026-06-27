@@ -6,6 +6,21 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- round 376 — **encode hot-path Criterion benchmark**
+  (`benches/encode.rs`). Now that `encode_frame` is public, the new
+  bench times it across every host pixel family (rgb24 / rgba / yv12 /
+  yuy2) at a 64×64 surface, throughput reported per source pixel — the
+  encode-side counterpart of `benches/decode.rs`. Inputs are
+  synthesised deterministically (a gradient + low-frequency-noise LCG)
+  so the encoder exercises its real arithmetic / predictor / RLE path
+  rather than the raw / solid fallbacks; no committed fixtures, no
+  `docs/` reads at bench time. Each case asserts an
+  encode→decode round-trip before timing so a regression can't
+  silently bench the error branch. Run with
+  `cargo bench -p oxideav-lagarith --bench encode`.
+
 ### Fixed
 
 - round 376 — **framework `Decoder` now handles NULL ("JUMP")

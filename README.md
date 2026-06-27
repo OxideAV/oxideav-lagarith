@@ -211,6 +211,10 @@ construction.
   reproducible from the printed `(family, w, h, content_seed)` tuple.
 - Criterion benchmarks in `benches/decode.rs` time the decode hot path,
   and a SIMD-vs-scalar predictor bench tracks the `spec/06` §3.2 path.
+  `benches/encode.rs` is the encode-side counterpart: it times the
+  public `encode_frame` across every host pixel family (rgb24 / rgba /
+  yv12 / yuy2) on deterministically synthesised gradient+noise input,
+  asserting an encode→decode round-trip before timing each case.
 - A standalone profiling driver in `examples/profile_decode.rs` loops
   the decode hot path (a type-4 modern-arithmetic RGB24 frame) in a
   tight, harness-free loop so an external profiler (`perf`,
