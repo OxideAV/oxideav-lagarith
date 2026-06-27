@@ -84,9 +84,7 @@ fn bench_encode(c: &mut Criterion) {
             "bench input {name} did not round-trip"
         );
         group.bench_with_input(BenchmarkId::from_parameter(name), pixels, |b, pixels| {
-            b.iter(|| {
-                encode_frame(black_box(pixels), black_box(W), black_box(H), *kind).unwrap()
-            });
+            b.iter(|| encode_frame(black_box(pixels), black_box(W), black_box(H), *kind).unwrap());
         });
     }
 
