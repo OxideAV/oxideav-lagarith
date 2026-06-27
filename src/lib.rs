@@ -1,4 +1,4 @@
-//! Pure-Rust Lagarith lossless video decoder.
+//! Pure-Rust Lagarith lossless video codec (decoder + encoder).
 //!
 //! **Rounds 1..5 of the clean-room rebuild.** Implements the modern
 //! arithmetic-coded RGB24 / RGB32 / RGBA decode pipeline plus the
@@ -43,8 +43,14 @@
 //! ## Public API
 //!
 //! - [`decode_frame`] — decode one Lagarith-encoded frame's bytes.
+//! - [`encode_frame`] — encode one raw frame into Lagarith bytes; the
+//!   symmetric counterpart of [`decode_frame`], with automatic
+//!   smallest-wire-form (solid / arithmetic / uncompressed)
+//!   selection. Round-trips byte-exactly back through `decode_frame`.
+//! - [`encode_null`] — the zero-byte NULL ("JUMP") payload
+//!   (`spec/01` §1.1).
 //! - [`PixelKind`] — host-side pixel format selector
-//!   (`Bgr24` / `Bgra32`).
+//!   (`Bgr24` / `Bgra32` / `Yv12` / `Yuy2`) shared by both directions.
 //! - [`Error`] / [`Result`] — crate-local error type.
 //!
 //! ## Cargo features
@@ -65,7 +71,6 @@
 
 mod channel;
 mod decoder;
-#[cfg(test)]
 mod encoder;
 mod error;
 mod fibonacci;
@@ -83,6 +88,7 @@ mod roundtrip_tests;
 
 pub use crate::channel::{ChannelHeader, LegacyChannelHeader};
 pub use crate::decoder::{decode_frame, decode_frame_with_prev, DecodedFrame, Decoder, PixelKind};
+pub use crate::encoder::{encode_frame, encode_null};
 pub use crate::error::{Error, Result};
 pub use crate::frame::{FrameType, WirePlaneRole};
 

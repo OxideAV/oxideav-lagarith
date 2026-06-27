@@ -645,11 +645,11 @@ pub fn split_channels(frame: &[u8], n_channels: usize) -> Result<Vec<&[u8]>> {
     Ok(slices)
 }
 
-/// Encoder-side helper (test-only): pack the channel-offset table
-/// plus per-channel bodies into one frame buffer with the type byte
-/// at position 0.
-#[cfg(test)]
-pub fn pack_channels(type_byte: u8, channels: &[&[u8]]) -> Vec<u8> {
+/// Encoder-side helper: pack the channel-offset table plus
+/// per-channel bodies into one frame buffer with the type byte at
+/// position 0. Encode-direction primitive (consumed by
+/// [`crate::encoder`]); the inverse of [`split_channels`].
+pub(crate) fn pack_channels(type_byte: u8, channels: &[&[u8]]) -> Vec<u8> {
     let n = channels.len();
     debug_assert!(n == 3 || n == 4);
     let prefix_size = 1 + (n - 1) * 4;

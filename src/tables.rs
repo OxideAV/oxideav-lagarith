@@ -26,9 +26,8 @@ const RLE_FWD_LUT_CSV: &str = include_str!(concat!(
 ));
 
 /// CSV source for the residual-RLE inverse LUT (256 × u8). Used by
-/// the test-only encoder to pick the supplement byte that decodes
-/// back to a desired run length.
-#[cfg(test)]
+/// the encoder to pick the supplement byte that decodes back to a
+/// desired run length.
 const RLE_INV_LUT_CSV: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tables/02-residual-rle-encoder-inv-lut.csv",
@@ -67,10 +66,8 @@ pub fn rle_fwd_lut() -> &'static [u8; 256] {
 /// `LUT[supplement_byte] = k - 2` for `k >= 2`. Indices `0..2` are
 /// padding and hold `0` (see `spec/05` §5.2).
 ///
-/// Test-only because the decoder side uses [`rle_fwd_lut`]; the
-/// encoder mirror is currently `#[cfg(test)]` (round 1 ships
-/// decoder + roundtrip tests only).
-#[cfg(test)]
+/// The encoder mirror of [`rle_fwd_lut`]: maps a desired run length
+/// back to the supplement byte the decoder expands to that run.
 pub fn rle_inv_lut() -> &'static [u8; 256] {
     static CACHE: OnceLock<[u8; 256]> = OnceLock::new();
     CACHE.get_or_init(|| parse_u8_csv::<256>(RLE_INV_LUT_CSV))
@@ -110,7 +107,6 @@ fn parse_u32_csv<const N: usize>(src: &str) -> [u32; N] {
     out
 }
 
-#[cfg(test)]
 fn parse_u8_csv<const N: usize>(src: &str) -> [u8; N] {
     let parsed = parse_u32_csv::<N>(src);
     let mut out = [0u8; N];

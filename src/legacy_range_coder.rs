@@ -549,8 +549,11 @@ impl<'a> LegacyRangeDecoder<'a> {
 
 /// Legacy range-coder encoder (`spec/07` §6.4). Structurally
 /// identical to the modern Subbotin encoder; only the wrapper
-/// (channel prefix layout) differs.
-#[cfg(test)]
+/// (channel prefix layout) differs. Encode-direction primitive
+/// (consumed by [`crate::encoder`]'s legacy type-7 path, which is
+/// reachable from the test suite and `encode_frame` is not routed to
+/// it — hence the `not(test)` dead-code allowance).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct LegacyRangeEncoder {
     out: Vec<u8>,
     pending_ffs: u32,
@@ -562,7 +565,7 @@ pub(crate) struct LegacyRangeEncoder {
     shift: u32,
 }
 
-#[cfg(test)]
+#[cfg_attr(not(test), allow(dead_code))]
 impl LegacyRangeEncoder {
     pub fn new(cdf: Vec<u32>, total: u32) -> Self {
         let shift = total.trailing_zeros();
@@ -665,7 +668,7 @@ impl LegacyRangeEncoder {
 /// Greedy Zeckendorf-style decomposition over the 8-value
 /// `LEGACY_FIB` series. Returns the bit-position list (ascending) of
 /// non-consecutive summands. `value >= 1`.
-#[cfg(test)]
+#[cfg_attr(not(test), allow(dead_code))]
 fn legacy_zeckendorf(value: u32) -> Vec<usize> {
     let mut positions: Vec<usize> = Vec::new();
     let mut remaining = value;
@@ -687,7 +690,7 @@ fn legacy_zeckendorf(value: u32) -> Vec<usize> {
 /// encoded bit stream length is a multiple of 8 bits — the
 /// channel-level encoder uses this to decide whether to emit the
 /// post-Fibonacci 1-byte reservation per audit/08 §3.2.
-#[cfg(test)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn encode_legacy_freq_table(freq: &[u32; 256]) -> (Vec<u8>, bool) {
     use crate::fibonacci::BitWriter;
     let mut bw = BitWriter::new();

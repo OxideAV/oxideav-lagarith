@@ -6,7 +6,53 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- round 376 — **public encoder API: [`encode_frame`] + [`encode_null`].**
+  The Lagarith frame encoder, previously gated `#[cfg(test)]` and
+  exercised only by the in-crate self-roundtrip suite, is now a real
+  public API. `encode_frame(pixels, w, h, kind)` is the symmetric
+  counterpart of `decode_frame`: it accepts the same `PixelKind`
+  (`Bgr24` / `Bgra32` / `Yv12` / `Yuy2`) host buffer the decoder
+  produces and emits a single self-contained Lagarith frame that
+  round-trips **byte-exactly** back through `decode_frame`. Frame-type
+  selection is automatic and always picks the smallest legal wire
+  form — the per-family solid-colour fast path (`spec/01` §3.1; types
+  5 / 6 / 9), the modern arithmetic body (types 2 / 4 / 8 / 10 / 3 by
+  `kind` and `width % 4`), and a frame-level uncompressed (type 1)
+  size guard (`spec/01` §2.1). Bad buffer lengths / zero dimensions
+  surface a clean `Error::BadDimensions` rather than a panic.
+  `encode_null` exposes the zero-byte NULL ("JUMP") payload
+  (`spec/01` §1.1). To make this compile outside the test build, the
+  encode-direction primitives in the supporting modules
+  (`range_coder::RangeEncoder` + the `Cdf` encoder caches,
+  `legacy_range_coder::{LegacyRangeEncoder, encode_legacy_freq_table}`,
+  `fibonacci::{BitWriter, encode_freq_table}`, `rle::contract_raw` +
+  `tables::rle_inv_lut`, `frame::pack_channels`,
+  `predict::{apply_plane_forward_with_rule,
+  cross_plane_decorrelate_rgb_forward}`) were un-gated from
+  `#[cfg(test)]` to always-compiled `pub(crate)`. The non-auto-path
+  helpers (legacy type-7 RGB, reduced-resolution type-11, the
+  channel-level builders) remain `pub(crate)` and carry
+  `#[cfg_attr(not(test), allow(dead_code))]` since they are reachable
+  from the test suite but not from `encode_frame`'s best-of dispatch.
+  No wire-format, range-coder, predictor, or decoder logic changed;
+  the existing decode + self-roundtrip suites are unaffected.
+
 ### Tested
+
+- round 376 — **public `encode_frame` dispatcher coverage**
+  (`encoder::tests::public_*`). Four new tests pin the new public
+  surface: `public_encode_frame_roundtrips_every_kind` drives all four
+  host pixel formats across the `width % 4` type-2/type-4 split and an
+  odd width (incl. the YUY2 floor-chroma odd-tail) through
+  `encode_frame → decode_frame` and asserts byte-exact recovery;
+  `public_encode_frame_solid_fast_path` pins that frame-wide-constant
+  inputs emit the exact 2/4/5-byte type-5/6/9 solid wire and decode
+  back to the constant buffer; `public_encode_frame_rejects_bad_input`
+  pins the `Error::BadDimensions` guard on mismatched length / zero
+  dimension; `public_encode_null_is_empty` pins the NULL payload. Lib
+  unit-test count 341 → **345**.
 
 - round 365 — **YV12 odd-dimension decode-direction wire-contract
   pin** (`yv12_odd_dims_decode_consumes_floor_chroma_byte_counts`).

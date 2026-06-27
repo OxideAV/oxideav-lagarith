@@ -121,8 +121,7 @@ pub fn apply_plane_forward(plane: &[u8], width: usize, height: usize) -> Vec<u8>
 }
 
 /// Forward predictor with configurable first-column-of-row rule.
-/// Test-only.
-#[cfg(test)]
+/// Encode-direction primitive (consumed by [`crate::encoder`]).
 pub(crate) fn apply_plane_forward_with_rule(
     plane: &[u8],
     width: usize,
@@ -191,10 +190,9 @@ pub fn cross_plane_decorrelate_rgb(r: &mut [u8], g: &[u8], b: &mut [u8]) {
     }
 }
 
-/// Forward G-pivot decorrelation (encoder-side, test-only): R -= G;
-/// B -= G.
-#[cfg(test)]
-pub fn cross_plane_decorrelate_rgb_forward(r: &mut [u8], g: &[u8], b: &mut [u8]) {
+/// Forward G-pivot decorrelation (encoder-side): R -= G; B -= G.
+/// Encode-direction primitive (consumed by [`crate::encoder`]).
+pub(crate) fn cross_plane_decorrelate_rgb_forward(r: &mut [u8], g: &[u8], b: &mut [u8]) {
     debug_assert_eq!(r.len(), g.len());
     debug_assert_eq!(b.len(), g.len());
     for i in 0..g.len() {

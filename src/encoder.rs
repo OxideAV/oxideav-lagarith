@@ -1,12 +1,22 @@
-//! Test-only encoder used to drive the self-roundtrip suite.
+//! Lagarith frame encoder (`spec/01`..`spec/07`).
 //!
-//! Not exposed in the public API (gated `#[cfg(test)]` from
-//! `lib.rs`). The encoder produces frames the decoder accepts but
-//! makes no claim to byte-equality with the proprietary's encoder
-//! output — that's an Auditor concern for later rounds.
+//! Produces frames every conformant Lagarith decoder accepts. The
+//! encoder makes no claim to *byte-equality* with the proprietary
+//! encoder's output (residual entropy-model choices are externally
+//! invisible — the decoder dispatches on the per-channel header byte,
+//! so any legal header form decodes byte-exactly); cross-encoder
+//! parity against a proprietary-encoded stream is a separate Auditor
+//! concern. Every public entry point here round-trips byte-exactly
+//! through [`crate::decode_frame`].
+//!
+//! The low-level per-channel / per-frame helpers (`encode_arith_*`,
+//! `encode_channel_*`, `encode_legacy_*`, the solid / uncompressed /
+//! NULL builders) are crate-internal; the public surface is the
+//! [`encode_frame`] dispatcher in [`crate::lib`] plus the
+//! [`EncodeInput`] descriptor.
 
-#![cfg(test)]
-
+use crate::decoder::PixelKind;
+use crate::error::{Error, Result};
 use crate::fibonacci::encode_freq_table;
 use crate::frame::pack_channels;
 use crate::legacy_range_coder::{
@@ -115,6 +125,8 @@ pub fn encode_uncompressed(payload: &[u8]) -> Vec<u8> {
 
 /// Encode a NULL ("JUMP") frame: an empty payload that signals to a
 /// stateful decoder to replay the previous frame (`spec/01` §1.1).
+///
+/// Re-exported from the crate root as [`crate::encode_null`].
 pub fn encode_null() -> Vec<u8> {
     Vec::new()
 }
@@ -139,6 +151,7 @@ pub fn encode_solid_rgba(b: u8, g: u8, r: u8, a: u8) -> Vec<u8> {
 /// path that produces the smallest bytes for the given plane.
 /// Round-1 strategy: try header-`0x00` (Fibonacci + range-coded) and
 /// header-`0x04` (raw memcpy), pick whichever is smaller.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn encode_channel_simple(plane: &[u8]) -> Vec<u8> {
     // Build the arithmetic-coded variant first (header 0x00).
     let mut freq = [0u32; 256];
@@ -193,6 +206,7 @@ pub fn encode_channel_simple(plane: &[u8]) -> Vec<u8> {
 
 /// Encode a single channel using header 0x01..0x03 (arithmetic +
 /// RLE). `escape_len` must be 1, 2, or 3.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn encode_channel_arith_rle(plane: &[u8], escape_len: usize) -> Vec<u8> {
     debug_assert!((1..=3).contains(&escape_len));
     // Build pre-RLE symbol stream.
@@ -589,6 +603,7 @@ pub fn encode_arith_yuy2(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
 /// the inverse of the decoder's nearest-neighbour upscaler) and
 /// re-routes through [`encode_arith_yv12`], rewriting byte 0 to
 /// `0x0b`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn encode_arith_reduced_res(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
     let w = width as usize;
     let h = height as usize;
@@ -663,6 +678,7 @@ pub fn encode_arith_reduced_res(pixels: &[u8], width: u32, height: u32) -> Vec<u
 /// uses `encode_legacy_channel`); this helper exists so the round-5
 /// roundtrip suite can exercise the RLE-then-Fibonacci sub-path
 /// end-to-end.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn encode_legacy_channel_rle(plane: &[u8], escape_len: usize) -> Vec<u8> {
     debug_assert!((1..=3).contains(&escape_len));
     debug_assert!(!plane.is_empty(), "encode_legacy_channel_rle: empty plane");
@@ -768,6 +784,7 @@ pub fn encode_legacy_channel_rle(plane: &[u8], escape_len: usize) -> Vec<u8> {
 /// what we do here — is to transmit the histogram counts directly;
 /// the decoder's `build_legacy_cdf` re-runs the same algorithm and
 /// produces the same CDF.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn encode_legacy_channel(plane: &[u8]) -> Vec<u8> {
     debug_assert!(!plane.is_empty(), "encode_legacy_channel: empty plane");
 
@@ -882,6 +899,7 @@ pub fn encode_legacy_channel(plane: &[u8]) -> Vec<u8> {
 /// (`spec/07` §1.3 / §6.3). Replacing `encode_legacy_channel` with
 /// `encode_legacy_channel_best` in [`encode_legacy_rgb`] cannot
 /// regress self-roundtrip correctness; it can only shrink output.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn encode_legacy_channel_best(plane: &[u8]) -> Vec<u8> {
     debug_assert!(!plane.is_empty(), "encode_legacy_channel_best: empty plane");
 
@@ -926,6 +944,7 @@ pub fn encode_legacy_channel_best(plane: &[u8]) -> Vec<u8> {
 /// `encode_legacy_rgb_best` and `encode_legacy_rgb` produce the
 /// same wire bytes today. This helper is retained as an explicit
 /// "always pick the best legacy sub-path" entry point.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn encode_legacy_rgb_best(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
     let n = width as usize * height as usize;
     debug_assert_eq!(pixels.len(), n * 3);
@@ -960,6 +979,7 @@ pub fn encode_legacy_rgb_best(pixels: &[u8], width: u32, height: u32) -> Vec<u8>
 }
 
 /// Compute a 256-entry histogram from a residual plane.
+#[cfg_attr(not(test), allow(dead_code))]
 fn histogram_from_plane(plane: &[u8]) -> [u32; 256] {
     let mut freq = [0u32; 256];
     for &b in plane {
@@ -976,6 +996,7 @@ fn histogram_from_plane(plane: &[u8]) -> [u32; 256] {
 /// is byte-exact on every fixture, sidestepping the
 /// flat-CDF / pair-packed-CDF wire-format divergence that
 /// `audit/12 §5..§6` localised to this fixture class.
+#[cfg_attr(not(test), allow(dead_code))]
 fn type7_residuals_need_strategy_e(res_b: &[u8], res_g: &[u8], res_r: &[u8]) -> bool {
     let fb = histogram_from_plane(res_b);
     let fg = histogram_from_plane(res_g);
@@ -1007,6 +1028,7 @@ fn type7_residuals_need_strategy_e(res_b: &[u8], res_g: &[u8], res_r: &[u8]) -> 
 /// Test-only — the proprietary build does not produce type 7
 /// (`spec/07` §6 + §9.2 item 8); cleanroom encoder ships only the
 /// bare-Fibonacci `header == 0` path.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn encode_legacy_rgb(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
     let n = width as usize * height as usize;
     debug_assert_eq!(pixels.len(), n * 3);
@@ -1065,6 +1087,7 @@ pub fn encode_legacy_rgb(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
 /// encoder to emit a type-1 (uncompressed) frame instead.
 /// Test-only — drives the round-5 roundtrip suite for the
 /// channel-header `0x01..=0x03` decode path.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn encode_legacy_rgb_rle(pixels: &[u8], width: u32, height: u32, escape_len: usize) -> Vec<u8> {
     debug_assert!((1..=3).contains(&escape_len));
     let n = width as usize * height as usize;
@@ -1253,6 +1276,7 @@ pub fn encode_arith_rgba_or_uncompressed(pixels: &[u8], width: u32, height: u32)
 /// returns a type-1 frame (byte 0 = `0x01`), and the size guard
 /// (`raw.len() == legacy.len()`) tie-breaks back to that already-
 /// type-1 wire, byte-identical.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn encode_legacy_rgb_or_uncompressed(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
     let legacy = encode_legacy_rgb(pixels, width, height);
     let raw = encode_uncompressed(pixels);
@@ -1328,6 +1352,7 @@ fn solid_colour_bgra(pixels: &[u8]) -> Option<(u8, u8, u8, u8)> {
 /// width split commits, so it applies to both `width % 4 == 0` and
 /// unaligned widths (`spec/01` §3 rows 2/4 vs rows 5/6 — the solid
 /// overwrite replaces whichever type byte the width split staged).
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn encode_arith_rgb24_or_solid(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
     if let Some((b, g, r)) = solid_colour_bgr(pixels) {
         return if b == g && g == r {
@@ -1351,11 +1376,85 @@ pub fn encode_arith_rgb24_or_solid(pixels: &[u8], width: u32, height: u32) -> Ve
 /// type 9, never type 5/6 (`spec/01` §3 lists the 5/6 overwrite
 /// sites on the RGB path only). Non-solid input falls through to
 /// [`encode_arith_rgba`] byte-identically.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn encode_arith_rgba_or_solid(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
     if let Some((b, g, r, a)) = solid_colour_bgra(pixels) {
         return encode_solid_rgba(b, g, r, a);
     }
     encode_arith_rgba(pixels, width, height)
+}
+
+// ───────────────────────── public dispatcher ─────────────────────────
+
+/// Encode one raw frame into a Lagarith-encoded byte buffer.
+///
+/// This is the symmetric counterpart of [`crate::decode_frame`]: the
+/// `kind` describes the host-side pixel layout of `pixels` (the same
+/// [`PixelKind`] the decoder is asked to produce), `width` × `height`
+/// are the frame dimensions, and the returned bytes are a single
+/// self-contained Lagarith frame that **round-trips byte-exactly**
+/// back through `decode_frame(.., kind)`.
+///
+/// Frame-type selection is automatic and always picks the **smallest**
+/// legal wire form for the input — the per-family solid-colour fast
+/// path (`spec/01` §3.1; types 5 / 6 / 9), the modern arithmetic body
+/// (types 2 / 4 / 8 / 10 / 3 by `kind` and `width % 4`), and a
+/// frame-level uncompressed (type 1) guard that wins on inputs whose
+/// residuals do not compress (`spec/01` §2.1). The choice is
+/// externally invisible: a conformant decoder dispatches on byte 0, so
+/// every emitted form decodes to the identical pixels.
+///
+/// # Errors
+///
+/// Returns [`Error::BadDimensions`] when `pixels.len()` does not
+/// equal `kind.buffer_len(width, height)`, or when `width` / `height`
+/// is zero.
+///
+/// # Pixel layouts
+///
+/// * [`PixelKind::Bgr24`] — packed `B G R`, `width·height·3` bytes →
+///   type 2 / 4 / 5 / 6 / 1.
+/// * [`PixelKind::Bgra32`] — packed `B G R A`, `·4` bytes → type
+///   8 / 9 / 1.
+/// * [`PixelKind::Yv12`] — concatenated `Y ‖ V ‖ U` planes,
+///   `n + 2·⌊n/4⌋` bytes → type 10 / 1.
+/// * [`PixelKind::Yuy2`] — packed `Y0 U Y1 V` macropixels, `·2` bytes
+///   → type 3 / 1. The odd-tail chroma slot must already hold the
+///   decoder's neutral `0x80` fill (always true for buffers the
+///   decoder produced); see [`encode_arith_yuy2`].
+pub fn encode_frame(pixels: &[u8], width: u32, height: u32, kind: PixelKind) -> Result<Vec<u8>> {
+    if width == 0 || height == 0 {
+        return Err(Error::BadDimensions { width, height });
+    }
+    let expected = kind.buffer_len(width, height);
+    if pixels.len() != expected {
+        return Err(Error::BadDimensions { width, height });
+    }
+    let frame = match kind {
+        PixelKind::Bgr24 => {
+            // Solid fast path first, then size-guard the arithmetic
+            // body against an uncompressed type-1 fallback.
+            if let Some((b, g, r)) = solid_colour_bgr(pixels) {
+                if b == g && g == r {
+                    encode_solid_grey(b)
+                } else {
+                    encode_solid_rgb(b, g, r)
+                }
+            } else {
+                encode_arith_rgb24_or_uncompressed(pixels, width, height)
+            }
+        }
+        PixelKind::Bgra32 => {
+            if let Some((b, g, r, a)) = solid_colour_bgra(pixels) {
+                encode_solid_rgba(b, g, r, a)
+            } else {
+                encode_arith_rgba_or_uncompressed(pixels, width, height)
+            }
+        }
+        PixelKind::Yv12 => encode_arith_yv12_or_uncompressed(pixels, width, height),
+        PixelKind::Yuy2 => encode_arith_yuy2_or_uncompressed(pixels, width, height),
+    };
+    Ok(frame)
 }
 
 #[cfg(test)]
@@ -1920,6 +2019,131 @@ mod tests {
             "Strategy E must propagate through encode_legacy_rgb_best (got type {})",
             frame[0],
         );
+    }
+
+    // ───────────── public `encode_frame` dispatcher ─────────────
+
+    /// Build a deterministic pseudo-random buffer of `len` bytes.
+    fn lcg_bytes(seed: u64, len: usize) -> Vec<u8> {
+        let mut s = seed | 1;
+        (0..len)
+            .map(|_| {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (s >> 33) as u8
+            })
+            .collect()
+    }
+
+    /// The public [`encode_frame`] entry round-trips byte-exactly for
+    /// every host pixel format, across the `width % 4` type-2/type-4
+    /// split and an odd width, on pseudo-random content.
+    #[test]
+    fn public_encode_frame_roundtrips_every_kind() {
+        use crate::decoder::{decode_frame, PixelKind};
+        // (w, h) chosen to span width%4==0 (8), width%4!=0 (6), and an
+        // odd width (5) — the latter drives the YUY2 floor-chroma /
+        // type-2 unaligned-RGB branches.
+        let dims = [(8u32, 8u32), (6, 4), (5, 4)];
+        for kind in [
+            PixelKind::Bgr24,
+            PixelKind::Bgra32,
+            PixelKind::Yv12,
+            PixelKind::Yuy2,
+        ] {
+            for &(w, h) in &dims {
+                let mut pixels = lcg_bytes(
+                    (w as u64) << 40 | (h as u64) << 8 | kind as u64,
+                    kind.buffer_len(w, h),
+                );
+                // YUY2's odd-tail chroma slot must carry the decoder's
+                // neutral 0x80 fill to round-trip (see encode_arith_yuy2).
+                if kind == PixelKind::Yuy2 && w % 2 == 1 {
+                    for y in 0..h as usize {
+                        let row = y * w as usize * 2;
+                        pixels[row + 2 * (w as usize - 1) + 1] = 0x80;
+                    }
+                }
+                let frame = encode_frame(&pixels, w, h, kind).expect("encode");
+                let decoded = decode_frame(&frame, w, h, kind).expect("decode");
+                assert_eq!(
+                    decoded.pixels, pixels,
+                    "round-trip mismatch for {kind:?} at {w}x{h}"
+                );
+            }
+        }
+    }
+
+    /// A frame-wide-constant input takes the solid-colour fast path:
+    /// the emitted frame is the 2/4/5-byte solid wire form and still
+    /// decodes to the constant buffer.
+    #[test]
+    fn public_encode_frame_solid_fast_path() {
+        use crate::decoder::{decode_frame, PixelKind};
+        // BGR grey (B==G==R) → type 5 (2 bytes).
+        let grey = vec![0x40u8; 4 * 4 * 3];
+        let f = encode_frame(&grey, 4, 4, PixelKind::Bgr24).unwrap();
+        assert_eq!(f, vec![5, 0x40]);
+        assert_eq!(
+            decode_frame(&f, 4, 4, PixelKind::Bgr24).unwrap().pixels,
+            grey
+        );
+
+        // BGR non-grey → type 6 (4 bytes).
+        let mut rgb = Vec::new();
+        for _ in 0..16 {
+            rgb.extend_from_slice(&[0x11, 0x22, 0x33]);
+        }
+        let f = encode_frame(&rgb, 4, 4, PixelKind::Bgr24).unwrap();
+        assert_eq!(f, vec![6, 0x11, 0x22, 0x33]);
+        assert_eq!(
+            decode_frame(&f, 4, 4, PixelKind::Bgr24).unwrap().pixels,
+            rgb
+        );
+
+        // BGRA constant → type 9 (5 bytes).
+        let mut rgba = Vec::new();
+        for _ in 0..16 {
+            rgba.extend_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+        }
+        let f = encode_frame(&rgba, 4, 4, PixelKind::Bgra32).unwrap();
+        assert_eq!(f, vec![9, 0x11, 0x22, 0x33, 0x44]);
+        assert_eq!(
+            decode_frame(&f, 4, 4, PixelKind::Bgra32).unwrap().pixels,
+            rgba
+        );
+    }
+
+    /// `encode_frame` rejects a mismatched buffer length / zero
+    /// dimension with [`Error::BadDimensions`] rather than panicking.
+    #[test]
+    fn public_encode_frame_rejects_bad_input() {
+        use crate::decoder::PixelKind;
+        // Wrong length.
+        let r = encode_frame(&[0u8; 10], 4, 4, PixelKind::Bgr24);
+        assert!(matches!(
+            r,
+            Err(Error::BadDimensions {
+                width: 4,
+                height: 4
+            })
+        ));
+        // Zero dimension.
+        let r = encode_frame(&[], 0, 4, PixelKind::Bgr24);
+        assert!(matches!(
+            r,
+            Err(Error::BadDimensions {
+                width: 0,
+                height: 4
+            })
+        ));
+    }
+
+    /// `encode_null` produces the zero-byte NULL ("JUMP") payload.
+    #[test]
+    fn public_encode_null_is_empty() {
+        assert!(encode_null().is_empty());
     }
 
     /// Fixture set for the legacy selector tests — a mix of profiles

@@ -169,16 +169,15 @@ pub fn decode_freq_table(src: &[u8]) -> Result<([u32; 256], usize)> {
 // ─────────────────────── MSB-first bit writer (test-only) ───────────────────────
 
 /// MSB-first bit writer used by the legacy type-7 Fibonacci freq-
-/// table encoder (round 4, test-only) and the modern coder's
-/// test-only roundtrip suite.
-#[cfg(test)]
+/// table encoder and the modern coder's probability-prefix encoder.
+/// Encode-direction primitive (consumed by [`crate::encoder`] via
+/// [`encode_freq_table`] and the legacy range coder).
 pub(crate) struct BitWriter {
     buf: Vec<u8>,
     cur: u8,
     mask: u8,
 }
 
-#[cfg(test)]
 impl BitWriter {
     pub fn new() -> Self {
         Self {
@@ -201,7 +200,11 @@ impl BitWriter {
     }
 
     /// True iff the next bit to be written would land at the start of
-    /// a fresh byte (i.e. no partial byte is in flight).
+    /// a fresh byte (i.e. no partial byte is in flight). Used by the
+    /// legacy type-7 freq-table encoder to decide the post-Fibonacci
+    /// reservation byte; reachable only via the (test-exercised)
+    /// legacy encode path.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_byte_aligned(&self) -> bool {
         self.mask == 0x80
     }
@@ -214,7 +217,6 @@ impl BitWriter {
     }
 }
 
-#[cfg(test)]
 fn write_fib(w: &mut BitWriter, value: u32) {
     // Greedy Zeckendorf decomposition: walk FIB high-to-low and
     // mark each summand position. `spec/04` §2.3 / §4.
@@ -248,8 +250,11 @@ fn write_fib(w: &mut BitWriter, value: u32) {
     w.write_bit(1);
 }
 
-#[cfg(test)]
-pub fn encode_freq_table(freq: &[u32; 256]) -> Vec<u8> {
+/// Encode a 256-entry frequency table into the MSB-first Fibonacci
+/// probability prefix (`spec/04`). Encode-direction primitive
+/// (consumed by [`crate::encoder`]); the inverse of
+/// [`decode_freq_table`].
+pub(crate) fn encode_freq_table(freq: &[u32; 256]) -> Vec<u8> {
     let mut w = BitWriter::new();
     let mut j: usize = 0;
     while j < 256 {

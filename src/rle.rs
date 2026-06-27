@@ -20,7 +20,6 @@
 
 use crate::error::{Error, Result};
 use crate::tables::rle_fwd_lut;
-#[cfg(test)]
 use crate::tables::rle_inv_lut;
 
 /// Expand an escaped byte sequence into a plane buffer of `n_pixels`
@@ -94,9 +93,9 @@ pub fn expand_raw(src: &[u8], escape_len: usize, n_pixels: usize) -> Result<(Vec
 }
 
 /// Encode a plane of residuals into the escape-byte form for a given
-/// escape length (test-only helper).
-#[cfg(test)]
-pub fn contract_raw(plane: &[u8], escape_len: usize) -> Vec<u8> {
+/// escape length. Encode-direction primitive (consumed by
+/// [`crate::encoder`]); the algebraic inverse of [`expand_raw`].
+pub(crate) fn contract_raw(plane: &[u8], escape_len: usize) -> Vec<u8> {
     debug_assert!((1..=3).contains(&escape_len));
     let inv = rle_inv_lut();
     let mut out = Vec::with_capacity(plane.len());

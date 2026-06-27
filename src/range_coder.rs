@@ -60,15 +60,12 @@ pub(crate) struct Cdf {
     /// `cum[255]` — boundary between symbol 254 and symbol 255.
     /// Cached for the §5 step-B **encoder** fast path landed in
     /// round 10. The decoder Step-B path keys off `total`, not
-    /// `cum[255]`, and the encoder lives behind `#[cfg(test)]` so
-    /// this field is only live in the test build.
-    #[cfg(test)]
+    /// `cum[255]`; this field is read only by the encoder.
     cum_top: u32,
     cum: [u32; 257],
     /// Per-symbol `freq[s] = cum[s+1] - cum[s]` cache. Encoder-only
     /// (the round-11 Step-C cache; the decoder's `find_symbol`
     /// walks the cum[] array directly).
-    #[cfg(test)]
     freqs: [u32; 256],
 }
 
@@ -91,7 +88,6 @@ impl Cdf {
         if acc == 0 {
             return Err(Error::EmptyProbabilityTable);
         }
-        #[cfg(test)]
         let freqs = {
             let mut f = [0u32; 256];
             for s in 0..256 {
@@ -101,9 +97,7 @@ impl Cdf {
         };
         Ok(Self {
             freq0: cum[1],
-            #[cfg(test)]
             cum_top: cum[255],
-            #[cfg(test)]
             freqs,
             total: acc,
             cum,
@@ -113,7 +107,6 @@ impl Cdf {
     /// Read the encoder's pre-computed frequency `freq[s] =
     /// cum[s+1] - cum[s]`. Used by the round-11 Step-C hot path
     /// to skip the subtraction.
-    #[cfg(test)]
     #[inline(always)]
     pub(crate) fn freq(&self, s: usize) -> u32 {
         self.freqs[s]
@@ -303,9 +296,8 @@ impl<'a> RangeDecoder<'a> {
     }
 }
 
-// ────────────────────── encoder (test-only) ──────────────────────
+// ──────────────────────────── encoder ────────────────────────────
 
-#[cfg(test)]
 pub(crate) struct RangeEncoder {
     /// Output bytes already committed (cannot be back-walked).
     buf: Vec<u8>,
@@ -335,7 +327,6 @@ pub(crate) struct RangeEncoder {
     range: u32,
 }
 
-#[cfg(test)]
 impl RangeEncoder {
     pub fn new() -> Self {
         Self {
