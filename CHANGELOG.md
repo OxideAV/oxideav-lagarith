@@ -24,6 +24,17 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- round 376 — **encode-side profiling driver**
+  (`examples/profile_encode.rs`). The encode counterpart of
+  `examples/profile_decode.rs`: it loops the public `encode_frame`
+  over one deterministically-synthesised 64×64 RGB24 frame in a tight,
+  harness-free loop so an external profiler (`perf`, `callgrind`,
+  Instruments, `samply`) attaches with clean symbol attribution.
+  Iteration count is a CLI arg (default 50k); it sanity-checks the
+  encode→decode round-trip once before the timed loop and folds a
+  checksum so the optimiser can't elide the work. Run with
+  `cargo run --release --example profile_encode -- <iters>`.
+
 - round 376 — **encode hot-path Criterion benchmark**
   (`benches/encode.rs`). Now that `encode_frame` is public, the new
   bench times it across every host pixel family (rgb24 / rgba / yv12 /

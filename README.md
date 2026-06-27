@@ -215,13 +215,16 @@ construction.
   public `encode_frame` across every host pixel family (rgb24 / rgba /
   yv12 / yuy2) on deterministically synthesised gradient+noise input,
   asserting an encode→decode round-trip before timing each case.
-- A standalone profiling driver in `examples/profile_decode.rs` loops
-  the decode hot path (a type-4 modern-arithmetic RGB24 frame) in a
-  tight, harness-free loop so an external profiler (`perf`,
-  `callgrind`, Instruments, `samply`) can attach with clean symbol
-  attribution. Iteration count is a CLI arg (default 200k); the
-  embedded fixture is byte-identical to the bench's and reads no files.
-  Run with `cargo run --release --example profile_decode -- <iters>`.
+- Standalone profiling drivers in `examples/profile_decode.rs` and
+  `examples/profile_encode.rs` loop the decode / encode hot path
+  (a type-4 modern-arithmetic RGB24 frame) in a tight, harness-free
+  loop so an external profiler (`perf`, `callgrind`, Instruments,
+  `samply`) can attach with clean symbol attribution. Iteration count
+  is a CLI arg (decode default 200k, encode default 50k); inputs are
+  self-contained (the decode fixture is byte-identical to the bench's;
+  the encode input is synthesised deterministically) and read no files.
+  Run with `cargo run --release --example profile_decode -- <iters>`
+  or `... --example profile_encode -- <iters>`.
 
 ### Decode coverage and the remaining cross-encoder-parity gap
 
