@@ -7,8 +7,14 @@ clean-room from the specification and trace documents under
 
 ## Status
 
-The decoder handles **every Lagarith frame type**, and a test-side
-encoder produces every encodable type — the modern arithmetic families
+The decoder handles **every Lagarith frame type**, and the encoder is a
+**public API** — [`encode_frame`] is the symmetric counterpart of
+[`decode_frame`], accepting the same [`PixelKind`] host buffer and
+emitting a single self-contained Lagarith frame that round-trips
+byte-exactly. Both directions are wired into `oxideav-core`'s codec
+registry (the `LAGS` `CodecInfo` carries `.with_decode()` **and**
+`.with_encode()`), so framework consumers can drive encode and decode
+end-to-end. The encoder produces every encodable type — the modern arithmetic families
 (RGB24 type 2/4, RGBA type 8, YV12 type 10, YUY2 type 3,
 reduced-resolution type 11), the legacy adaptive-CDF RGB path (type 7),
 the literal / solid frames (types 1 / 5 / 6 / 9), and NULL "JUMP". A
@@ -113,7 +119,42 @@ The `FrameType` enum also exposes structural accessors:
 `n_channels()`.
 
 `oxideav-core` framework registration is gated on the default-on
-`registry` Cargo feature and claims the `LAGS` FOURCC.
+`registry` Cargo feature and claims the `LAGS` FOURCC for **both** the
+decoder and the encoder.
+
+## Encode API
+
+Stateless encode of a single frame, the symmetric counterpart of
+`decode_frame`:
+
+```rust
+use oxideav_lagarith::{encode_frame, decode_frame, PixelKind};
+
+let frame = encode_frame(&pixels, width, height, PixelKind::Bgra32)?;
+// Round-trips byte-exactly back through the decoder.
+let decoded = decode_frame(&frame, width, height, PixelKind::Bgra32)?;
+assert_eq!(decoded.pixels, pixels);
+# Ok::<(), oxideav_lagarith::Error>(())
+```
+
+`encode_frame` picks the **smallest** legal wire form automatically —
+the per-family solid-colour fast path (`spec/01` §3.1; types 5 / 6 /
+9), the modern arithmetic body (types 2 / 4 / 8 / 10 / 3 by `kind` and
+`width % 4`), and a frame-level uncompressed (type 1) size guard
+(`spec/01` §2.1). The choice is externally invisible: a conformant
+decoder dispatches on byte 0, so every form decodes to the identical
+pixels. A bad buffer length or zero dimension surfaces a clean
+`Error::BadDimensions` rather than a panic. `encode_null()` produces
+the zero-byte NULL ("JUMP") payload (`spec/01` §1.1).
+
+Through the framework, `CodecRegistry::first_encoder` yields a
+`LagarithEncoder` (`oxideav_core::Encoder`): `send_frame` reassembles
+the packed host buffer from a `VideoFrame`'s planes (stride padding
+stripped; YV12's three `Y / V / U` planes concatenated), and
+`receive_packet` emits one keyframe packet per frame. The host pixel
+format is read from `CodecParameters::pixel_format` (`Bgr24`, `Bgra`,
+`Yuv420P`, `Yuyv422`); unsupported formats are rejected at encoder
+construction.
 
 ## Tests, benchmarks, fuzzing
 

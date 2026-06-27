@@ -8,6 +8,26 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- round 376 — **framework `Encoder` trait integration.** The codec now
+  registers an encoder factory alongside the decoder: the `LAGS`
+  `CodecInfo` carries `.with_encode()` + `.encoder(make_encoder)`, so
+  `CodecRegistry::has_encoder` / `first_encoder` resolve a Lagarith
+  encoder and `oxideav-core` consumers (pipelines, the CLI) can drive
+  encode end-to-end. `LagarithEncoder` implements
+  `oxideav_core::Encoder`: `send_frame` reassembles the packed host
+  buffer from a `VideoFrame`'s planes (the inverse of the decoder's
+  plane split, including stride-padding strip and the YV12 3-plane
+  `Y/V/U` concatenation), `receive_packet` emits one keyframe packet
+  (every Lagarith frame is intra-only). The host pixel format is taken
+  from `CodecParameters::pixel_format` via `pixel_kind_from_format`
+  (`Bgr24`→type 2/4/5/6, `Bgra`→8/9, `Yuv420P`→YV12 type 10,
+  `Yuyv422`→YUY2 type 3); an unsupported format is rejected at
+  `make_encoder` time with a clear error. Five new registry tests:
+  encoder-registration, a full framework `Encoder`→`Decoder` BGRA
+  round-trip, a YV12 round-trip through a stride-padded luma plane
+  (exercises `pack_planes`), unsupported-format rejection, and the
+  exhaustive pixel-format mapping. Registry test count 3 → **8**.
+
 - round 376 — **public encoder API: [`encode_frame`] + [`encode_null`].**
   The Lagarith frame encoder, previously gated `#[cfg(test)]` and
   exercised only by the in-crate self-roundtrip suite, is now a real
