@@ -8,6 +8,17 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- round 376 — **dual-API direct factory endpoints.** Per the
+  workspace convention (every codec crate exposes BOTH the
+  `oxideav_core::register!` registry path AND direct `make_` factory
+  endpoints), the crate now re-exports `make_decoder` and
+  `make_encoder` from the crate root (gated on the `registry`
+  feature). They return `Result<Box<dyn Decoder/Encoder>>` and build a
+  working codec without going through the registry — the same
+  factories the `CodecInfo` registers. A `direct_factories_roundtrip`
+  test drives a BGRA frame through `make_encoder` → `make_decoder`
+  byte-exactly. Registry test count 8 → **9**.
+
 - round 376 — **framework `Encoder` trait integration.** The codec now
   registers an encoder factory alongside the decoder: the `LAGS`
   `CodecInfo` carries `.with_encode()` + `.encoder(make_encoder)`, so

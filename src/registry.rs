@@ -50,7 +50,11 @@ pub fn register(ctx: &mut RuntimeContext) {
 
 // ──────────────────────── Decoder impl ────────────────────────
 
-fn make_decoder(params: &CodecParameters) -> CoreResult<Box<dyn Decoder>> {
+/// Direct decoder factory (the dual-API convention's historical
+/// endpoint). Builds a boxed [`Decoder`] for `params`; the host pixel
+/// format defaults to BGRA32. Re-exported as
+/// [`crate::make_decoder`].
+pub fn make_decoder(params: &CodecParameters) -> CoreResult<Box<dyn Decoder>> {
     let width = params.width.unwrap_or(0);
     let height = params.height.unwrap_or(0);
     let pixel_kind = PixelKind::Bgra32;
@@ -197,7 +201,12 @@ fn pixel_kind_from_format(fmt: PixelFormat) -> Option<PixelKind> {
     }
 }
 
-fn make_encoder(params: &CodecParameters) -> CoreResult<Box<dyn Encoder>> {
+/// Direct encoder factory (the dual-API convention's historical
+/// endpoint). Builds a boxed [`Encoder`] for `params`; the host pixel
+/// format is read from `CodecParameters::pixel_format` (defaulting to
+/// BGRA32) and an unsupported format is rejected here. Re-exported as
+/// [`crate::make_encoder`].
+pub fn make_encoder(params: &CodecParameters) -> CoreResult<Box<dyn Encoder>> {
     let width = params.width.unwrap_or(0);
     let height = params.height.unwrap_or(0);
     if width == 0 || height == 0 {
@@ -388,6 +397,40 @@ mod tests {
             .resolve_tag_ref(&ProbeContext::new(&tag))
             .map(|c| c.as_str());
         assert_eq!(resolved, Some(CODEC_ID_STR));
+    }
+
+    /// The dual-API direct factory endpoints (`make_decoder` /
+    /// `make_encoder`) are usable without the registry, and the codecs
+    /// they build round-trip a frame.
+    #[test]
+    fn direct_factories_roundtrip() {
+        use oxideav_core::PixelFormat;
+        let (w, h) = (4u32, 4u32);
+        let mut params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        params.media_type = MediaType::Video;
+        params.width = Some(w);
+        params.height = Some(h);
+        params.pixel_format = Some(PixelFormat::Bgra);
+
+        let pixels: Vec<u8> = (0..(w * h * 4)).map(|i| (i * 11 % 251) as u8).collect();
+
+        let mut enc = make_encoder(&params).expect("make_encoder");
+        enc.send_frame(&Frame::Video(VideoFrame {
+            pts: Some(0),
+            planes: vec![VideoPlane {
+                stride: (w * 4) as usize,
+                data: pixels.clone(),
+            }],
+        }))
+        .unwrap();
+        let pkt = enc.receive_packet().unwrap();
+
+        let mut dec = make_decoder(&params).expect("make_decoder");
+        dec.send_packet(&pkt).unwrap();
+        match dec.receive_frame().unwrap() {
+            Frame::Video(v) => assert_eq!(v.planes[0].data, pixels),
+            other => panic!("expected video frame, got {other:?}"),
+        }
     }
 
     #[test]

@@ -93,8 +93,10 @@ pub use crate::error::{Error, Result};
 pub use crate::frame::{FrameType, WirePlaneRole};
 
 // Framework integration — only when the `registry` feature is on.
+// `make_decoder` / `make_encoder` are the dual-API convention's direct
+// factory endpoints, exposed alongside the `register!` registry path.
 #[cfg(feature = "registry")]
-pub use crate::registry::{register, register_codecs, CODEC_ID_STR};
+pub use crate::registry::{make_decoder, make_encoder, register, register_codecs, CODEC_ID_STR};
 
 #[cfg(feature = "registry")]
 oxideav_core::register!("oxideav-lagarith", register);
