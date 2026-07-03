@@ -1,5 +1,7 @@
 # oxideav-lagarith
 
+[![CI](https://github.com/OxideAV/oxideav-lagarith/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-lagarith/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-lagarith.svg)](https://crates.io/crates/oxideav-lagarith) [![docs.rs](https://docs.rs/oxideav-lagarith/badge.svg)](https://docs.rs/oxideav-lagarith) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Pure-Rust Lagarith lossless video codec for the
 [oxideav](https://github.com/OxideAV/oxideav-workspace) framework. Built
 clean-room from the specification and trace documents under
