@@ -257,12 +257,26 @@ chroma layout itself is a host-integration placeholder.
 
 What remains open is a clean byte-exact **cross-encoder parity** test
 against a *proprietary-encoded* stream. It awaits a fixture (the public
-sample set 404s); separately, on structured (non-random) residuals the
-proprietary's `q = range >> shift` fast path diverges from the exact
-division at non-power-of-two totals, so matching the proprietary
-**encoder** byte-for-byte on those residuals is an encoder-side parity
-item, not a decode-spec gap. The crate's own encode→decode round-trips
-all such streams byte-exactly.
+sample set 404s); separately, the reciprocal-multiply quotient the
+proprietary loader derives (`spec/02` §5, via the
+`.rdata` table now bundled at
+`tables/00-rangecoder-reciprocal-multiply-lut.csv`) can differ from the
+crate's exact `q = range / total` at non-power-of-two totals. Round 398
+makes this **machine-checked** rather than prose: `tables::recip_lut()`
+loads the extracted 2048-entry table (numerically `floor(2^32 / i)`),
+and three characterisation tests pin that a naive reciprocal-multiply
+`(range * LUT[total]) >> 32` equals exact division across the operating
+band `[2^23 + 1, 2^31]` **iff** `total` is a power of two, and diverges
+by exactly 1 at every non-power-of-two total. This is why the byte-exact
+cross-decoder pins (`tests/reference_pins.rs`) are held to power-of-two
+pixel counts, and why the *exact* reference quotient at a
+non-power-of-two total remains an open item (the `0x180001050`
+cumulative-sum / shift derivation is not covered by the wire-format
+spec — `spec/02` §9 item 1, `spec/04` §9 item 2). Matching the
+proprietary **encoder** byte-for-byte on structured residuals is
+therefore blocked on that open derivation *and* a proprietary-encoded
+fixture; it is not a decode-spec gap. The crate's own encode→decode
+round-trips all such streams byte-exactly.
 
 ## License
 

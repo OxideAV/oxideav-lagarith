@@ -13,6 +13,19 @@ script's output for binary SHA-256
 
 ## Files
 
+- `00-rangecoder-reciprocal-multiply-lut.csv` — 2048 × u32
+  reciprocal-multiply table used by the modern range coder's generic
+  symbol-search path (`spec/02` §5 step C). Numerically
+  `LUT[i] = floor(2^32 / i)` for `i >= 2`; `LUT[0] = 0` and
+  `LUT[1] = 0xffffffff` (the exact `2^32` overflows a `u32`). Loaded
+  at module-init by `tables::recip_lut()`. The crate's own decoder
+  does **not** consult this table — it runs the `spec/02` §5
+  invariant-box cumulative search with exact `q = range / total`
+  instead — but the table is bundled and characterised here because
+  its numeric form pins **why** the crate's byte-exact cross-decoder
+  pins (`tests/reference_pins.rs`) are held to power-of-two pixel
+  counts: a naive reciprocal-multiply `(range * LUT[total]) >> 32`
+  coincides with exact division only when `total` is a power of two.
 - `01-residual-rle-decoder-lut.csv` — 256 × u32 forward LUT used by
   the decoder. `LUT[i] = 2*i` for `i < 128`, `511 - 2*i` for
   `i >= 128` (`spec/05` §3.2). Loaded at module-init by

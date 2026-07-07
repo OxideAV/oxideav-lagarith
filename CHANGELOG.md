@@ -6,7 +6,42 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- round 398 — **range-coder reciprocal-multiply LUT bundled +
+  characterised** (`tables/00-rangecoder-reciprocal-multiply-lut.csv`,
+  `tables::recip_lut`). The third `spec/` extraction artefact (the
+  2048-entry `.rdata` blob at RVA `0x1b9a0`, `spec/02` §5 step C) now
+  lives in the crate alongside the two residual-RLE LUTs, completing
+  the mirror of `docs/video/lagarith/tables/`. The decoder still does
+  not consult it — it runs the `spec/02` §5 invariant-box cumulative
+  search with exact `q = range / total` — but the table is bundled so
+  its numeric form is machine-checkable rather than only cited in
+  prose. `recip_lut()` is a lazily-parsed `&'static [u32; 2048]`.
+
 ### Tested
+
+- round 398 — **reciprocal-multiply parity characterisation**
+  (`tables::tests::recip_lut_matches_floor_reciprocal_form`,
+  `recip_multiply_equals_exact_division_at_power_of_two_totals`,
+  `recip_multiply_diverges_from_exact_division_at_non_power_of_two_totals`).
+  Pins three facts that were previously only asserted in
+  `tests/reference_pins.rs` prose: (1) the extracted LUT is exactly
+  `floor(2^32 / i)` for `i >= 2`, with `LUT[0] = 0` and
+  `LUT[1] = 0xffffffff` (the exact `2^32` overflows `u32`); (2) at
+  every power-of-two `total` (2..1024) a naive reciprocal-multiply
+  `(range * LUT[total]) >> 32` **equals** the crate's exact
+  `q = range / total` — and both equal `range >> log2(total)` —
+  across the coder's operating band `[2^23 + 1, 2^31]`; (3) at every
+  sampled non-power-of-two `total` the same reciprocal-multiply
+  **diverges** by exactly 1 (a floor-reciprocal under-estimate)
+  somewhere in that band. This is the machine-checked reason the
+  byte-exact cross-decoder pins are held to power-of-two pixel counts,
+  and it records why the *exact* reference quotient at a
+  non-power-of-two total is still an open item (`spec/02` §9 item 1,
+  `spec/04` §9 item 2 — the `0x180001050` cumulative-sum / shift
+  derivation is not covered by the wire-format spec). Lib unit-test
+  count 353 → **356**.
 
 - round 376 — **encoder size-guard property suite**
   (`encoder::tests::public_encode_frame_never_exceeds_uncompressed`).
