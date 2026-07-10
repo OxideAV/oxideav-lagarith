@@ -58,6 +58,22 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   normalizer panic-free with the `sum == 2^shift` invariant held on
   every non-wrapping success.
 
+### Changed
+
+- round 407 — **bench / profiling fixtures re-captured under the
+  normalized model** (`benches/decode.rs` `FRAME_RGB24_64` /
+  `FRAME_RGBA_64`, `examples/profile_decode.rs`). The pre-407
+  captures carried pre-RLE arithmetic channels with non-power-of-two
+  totals coded against the raw table — wire the normalized decoder
+  correctly rejects as non-conformant. Re-encoded from the identical
+  source pixels (same byte lengths; decode checksums unchanged). The
+  YV12 / YUY2 / legacy / uncompressed fixtures normalize on the
+  identity fast path and are byte-identical to their original
+  captures. Measured on the 64×64 profiling drivers, the
+  `q = range >> shift` quotient is ~3-4% faster than the previous
+  per-symbol division on both decode and encode, with bit-identical
+  output.
+
 ### Added
 
 - round 398 — **range-coder reciprocal-multiply LUT bundled +
