@@ -76,6 +76,7 @@ mod error;
 mod fibonacci;
 mod frame;
 mod legacy_range_coder;
+mod model;
 mod predict;
 mod range_coder;
 #[cfg(feature = "registry")]

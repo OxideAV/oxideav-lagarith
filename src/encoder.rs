@@ -177,30 +177,39 @@ pub fn encode_channel_simple(plane: &[u8]) -> Vec<u8> {
     // symbol count is <= TOP this is the raw histogram unchanged.
     let freq = rescale_to_max_total(&freq, MAX_MODERN_TOTAL);
 
-    // Encode arithmetic body. The CDF and the transmitted prefix come
-    // from the *same* rescaled table, so the decoder rebuilds the
-    // identical CDF and recovers the original bytes (`spec/04` §6).
-    let cdf = Cdf::from_frequencies(&freq).expect("CDF builds for non-empty plane");
-    let mut enc = RangeEncoder::new();
-    for &b in plane {
-        enc.encode_symbol(&cdf, b as usize);
-    }
-    let body = enc.finish();
-    let prefix = encode_freq_table(&freq);
+    // Encode arithmetic body. The transmitted prefix carries the RAW
+    // rescaled table (`spec/04` §5); the coding model is its
+    // `0x180001050`-normalized power-of-two-total form
+    // (`provenance/52`) — the decoder re-derives the identical model
+    // from the same wire bytes and recovers the original plane
+    // (`spec/04` §6). Normalization fails only on a histogram no
+    // conformant stream can carry (all mass in symbols 128..=255 at
+    // a non-power-of-two total — the reference's correction loop
+    // would never terminate); fall back to the raw wire form there.
+    let arith = Cdf::from_wire_frequencies(&freq).ok().map(|cdf| {
+        let mut enc = RangeEncoder::new();
+        for &b in plane {
+            enc.encode_symbol(&cdf, b as usize);
+        }
+        let body = enc.finish();
+        let prefix = encode_freq_table(&freq);
 
-    let mut out = Vec::with_capacity(1 + prefix.len() + body.len());
-    out.push(0x00);
-    out.extend_from_slice(&prefix);
-    out.extend_from_slice(&body);
+        let mut out = Vec::with_capacity(1 + prefix.len() + body.len());
+        out.push(0x00);
+        out.extend_from_slice(&prefix);
+        out.extend_from_slice(&body);
+        out
+    });
 
     // Compare against raw-memcpy alternative (header 0x04).
-    if 1 + plane.len() < out.len() {
-        let mut raw = Vec::with_capacity(1 + plane.len());
-        raw.push(0x04);
-        raw.extend_from_slice(plane);
-        raw
-    } else {
-        out
+    match arith {
+        Some(out) if out.len() <= 1 + plane.len() => out,
+        _ => {
+            let mut raw = Vec::with_capacity(1 + plane.len());
+            raw.push(0x04);
+            raw.extend_from_slice(plane);
+            raw
+        }
     }
 }
 
@@ -239,7 +248,14 @@ pub fn encode_channel_arith_rle(plane: &[u8], escape_len: usize) -> Vec<u8> {
     // RLE fixtures exercise.
     let freq = rescale_to_max_total(&freq, MAX_MODERN_TOTAL);
 
-    let cdf = Cdf::from_frequencies(&freq).unwrap();
+    // Wire-raw table on the prefix, `0x180001050`-normalized model
+    // for the coder (`provenance/52`). An unnormalizable pre-RLE
+    // histogram (upper-half-only mass at a non-pow2 total) has no
+    // conformant arithmetic wire form — divert to the simple path's
+    // raw/solid selection.
+    let Ok(cdf) = Cdf::from_wire_frequencies(&freq) else {
+        return encode_channel_simple(plane);
+    };
     let mut enc = RangeEncoder::new();
     for &b in &symbols {
         enc.encode_symbol(&cdf, b as usize);
@@ -342,8 +358,17 @@ pub fn encode_channel_best(plane: &[u8]) -> Vec<u8> {
         return vec![0xff, plane[0]];
     }
 
-    // Candidate 0x00 — Fibonacci-prefix + arithmetic, no RLE.
-    let mut best = build_header_zero(plane, &freq);
+    // Candidate 0x00 — Fibonacci-prefix + arithmetic, no RLE. `None`
+    // only for unnormalizable histograms (`provenance/52` §2 step 3),
+    // which the always-legal raw candidate below covers; seeding with
+    // raw there keeps the lower-header tie-break intact for every
+    // plane that has a legal 0x00 form.
+    let mut best = build_header_zero(plane, &freq).unwrap_or_else(|| {
+        let mut v = Vec::with_capacity(1 + plane.len());
+        v.push(0x04);
+        v.extend_from_slice(plane);
+        v
+    });
 
     // Candidates 0x01..=0x03 — Fibonacci-prefix + arithmetic with
     // pre-RLE contraction. Skipped when the dispatcher fall-back
@@ -382,10 +407,14 @@ pub fn encode_channel_best(plane: &[u8]) -> Vec<u8> {
 /// body for `plane`, given its pre-computed histogram. Used by
 /// `encode_channel_best` to keep the candidate construction in one
 /// place. Caller guarantees `plane` is non-empty and has at least
-/// two distinct symbols.
-fn build_header_zero(plane: &[u8], freq: &[u32; 256]) -> Vec<u8> {
+/// two distinct symbols. Returns `None` when the histogram has no
+/// conformant arithmetic wire form (the `0x180001050` model
+/// normalizer rejects upper-half-only mass at a non-power-of-two
+/// total — `provenance/52` §2 step 3); the caller's raw candidates
+/// cover such planes.
+fn build_header_zero(plane: &[u8], freq: &[u32; 256]) -> Option<Vec<u8>> {
     let freq = rescale_to_max_total(freq, MAX_MODERN_TOTAL);
-    let cdf = Cdf::from_frequencies(&freq).expect("CDF builds for non-empty plane");
+    let cdf = Cdf::from_wire_frequencies(&freq).ok()?;
     let mut enc = RangeEncoder::new();
     for &b in plane {
         enc.encode_symbol(&cdf, b as usize);
@@ -396,15 +425,16 @@ fn build_header_zero(plane: &[u8], freq: &[u32; 256]) -> Vec<u8> {
     out.push(0x00);
     out.extend_from_slice(&prefix);
     out.extend_from_slice(&body);
-    out
+    Some(out)
 }
 
 /// Build a header-`0x01..0x03` (Fibonacci + arithmetic with pre-RLE
 /// contraction) wire body. Returns `None` when the candidate is
 /// illegal under `spec/06` §1.5 (pre-RLE symbol count >= n_pixels
-/// would trip the dispatcher fall-back to header-0 semantics) or
-/// when the contracted symbol stream collapsed to a single symbol
-/// (the arithmetic coder requires `nonzero >= 2`).
+/// would trip the dispatcher fall-back to header-0 semantics), when
+/// the contracted symbol stream collapsed to a single symbol
+/// (the arithmetic coder requires `nonzero >= 2`), or when the
+/// pre-RLE histogram is unnormalizable (`provenance/52` §2 step 3).
 fn build_header_arith_rle(plane: &[u8], escape_len: usize) -> Option<Vec<u8>> {
     debug_assert!((1..=3).contains(&escape_len));
     let symbols = contract_raw(plane, escape_len);
@@ -421,7 +451,7 @@ fn build_header_arith_rle(plane: &[u8], escape_len: usize) -> Option<Vec<u8>> {
         return None;
     }
     let freq = rescale_to_max_total(&freq, MAX_MODERN_TOTAL);
-    let cdf = Cdf::from_frequencies(&freq).ok()?;
+    let cdf = Cdf::from_wire_frequencies(&freq).ok()?;
     let mut enc = RangeEncoder::new();
     for &b in &symbols {
         enc.encode_symbol(&cdf, b as usize);
@@ -1474,7 +1504,7 @@ mod tests {
             freq[b as usize] = freq[b as usize].saturating_add(1);
         }
         let freq = rescale_to_max_total(&freq, cap);
-        let cdf = Cdf::from_frequencies(&freq).unwrap();
+        let cdf = Cdf::from_wire_frequencies(&freq).unwrap();
         let mut enc = RangeEncoder::new();
         for &b in plane {
             enc.encode_symbol(&cdf, b as usize);

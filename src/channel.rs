@@ -458,7 +458,11 @@ fn decode_arith_no_rle(channel: &[u8], prefix_offset: usize, n_pixels: usize) ->
     }
     let prefix = &channel[prefix_offset..];
     let (freq, prefix_bytes) = fibonacci::decode_freq_table(prefix)?;
-    let cdf = Cdf::from_frequencies(&freq)?;
+    // The wire carries the RAW histogram (`spec/04` §5); the coder's
+    // model is the `0x180001050`-normalized power-of-two-total form
+    // (`provenance/52`), derived here exactly as the reference's
+    // model-init helper does after the prefix parse.
+    let cdf = Cdf::from_wire_frequencies(&freq)?;
 
     let body_offset = prefix_offset + prefix_bytes;
     if channel.len() < body_offset {
@@ -658,7 +662,10 @@ fn decode_arith_rle(
     }
     let prefix = &channel[prefix_offset..];
     let (freq, prefix_bytes) = fibonacci::decode_freq_table(prefix)?;
-    let cdf = Cdf::from_frequencies(&freq)?;
+    // Same wire-raw -> normalized-model derivation as the no-RLE
+    // path: the pre-RLE symbol histogram on the wire is normalized
+    // to a power-of-two total before any symbol is decoded.
+    let cdf = Cdf::from_wire_frequencies(&freq)?;
 
     let body_offset = prefix_offset + prefix_bytes;
     if channel.len() < body_offset {

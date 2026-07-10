@@ -8,6 +8,49 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- round 407 — **`0x180001050` model normalizer wired into the modern
+  range coder** (`src/model.rs`,
+  `provenance/52-extractor-round3-quotient-derivation.md`). The
+  recovered probability-model normalizer — smallest power-of-two
+  total `>= sum(freq)`, IEEE-754-double floor-rescale by
+  `pow2/total`, cumulative-sum correction distributing the deficit
+  `+1` round-robin over the nonzero low-128 symbol slots (cursor
+  masked `& 0x7f`, zero slots never resurrected, overshoot absorbed
+  into symbol 0), then `shift = log2(pow2)` — now runs on **both**
+  directions of the modern coder via `Cdf::from_wire_frequencies`:
+  the decoder normalizes the raw table parsed from the Fibonacci
+  prefix, and the encoder normalizes the raw histogram it transmits
+  (the wire still carries the raw table per `spec/04` §5). The
+  per-symbol quotient takes the reference's exact
+  `q = range >> shift` form (`spec/02` §5 step 1); at power-of-two
+  totals this is bit-identical to the previous exact division, so
+  every committed cross-decoder pin holds unchanged, while
+  non-power-of-two totals — the previously-open `spec/02` §9 item 1 /
+  `spec/04` §9 item 2 divergence — now follow the reference
+  derivation. New wire-error variant
+  `Error::ProbabilityTableUnnormalizable` rejects tables the
+  reference's correction loop could never terminate on (non-pow2
+  total with zero mass across symbols `0..=127`); the encoder falls
+  back to the raw wire forms for such planes instead of failing.
+
+### Tested
+
+- round 407 — normalizer unit suite (`model::tests`): pow2 identity
+  fast path (incl. `total = 1` and the `2^31` ceiling),
+  unit-frequency deficit distribution, `& 0x7f` cursor wrap, the
+  symbol-127-in / symbol-128-out window boundary, zero-slot
+  non-resurrection, a 500-case LCG sweep pinning `sum == 2^shift`
+  exactly + nonzero-set preservation, and every rejection path
+  (overflow, empty, `> 2^31`, unnormalizable). Range-coder suite
+  additions: shift-path == exact-division across the operating band,
+  wire-constructor normalization + roundtrip, pow2 wire/direct
+  bit-identity, and a load-bearing regression pinning that a
+  normalized-model stream does **not** decode against the raw-total
+  model at a non-pow2 total (so the normalization step can never
+  silently become dead code).
+
+### Added
+
 - round 398 — **range-coder reciprocal-multiply LUT bundled +
   characterised** (`tables/00-rangecoder-reciprocal-multiply-lut.csv`,
   `tables::recip_lut`). The third `spec/` extraction artefact (the

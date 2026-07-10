@@ -55,6 +55,16 @@ pub enum Error {
     /// `low / q` divide by zero; the decoder rejects it as a wire
     /// error instead of panicking.
     ProbabilityTotalExceedsRange,
+    /// Decoded probability table cannot be normalized by the
+    /// `lagarith.dll!0x180001050` model normalizer (`provenance/52`):
+    /// its total is not a power of two (so the floor-rescale runs and
+    /// leaves a deficit) yet every symbol in the correction window —
+    /// the low 128 model slots (symbols `0..=127`) — has zero
+    /// frequency, so the reference's round-robin `+1` distribution
+    /// loop (cursor masked `& 0x7f`, zero slots skipped) would never
+    /// terminate. No conformant stream can carry this shape; the
+    /// decoder rejects it as a wire error instead of hanging.
+    ProbabilityTableUnnormalizable,
     /// Caller asked for a frame whose dimensions do not match a
     /// supported (width, height, pixel-format) tuple.
     BadDimensions {
@@ -137,6 +147,11 @@ impl core::fmt::Display for Error {
             Error::EmptyProbabilityTable => {
                 f.write_str("Lagarith: probability table summed to zero")
             }
+            Error::ProbabilityTableUnnormalizable => f.write_str(
+                "Lagarith: probability table cannot be normalized to a power-of-two total \
+                 (non-pow2 total with no nonzero frequency among symbols 0..=127; the \
+                 reference model normalizer's correction loop would never terminate)",
+            ),
             Error::BadDimensions { width, height } => {
                 write!(f, "Lagarith: width={width} height={height} not supported")
             }

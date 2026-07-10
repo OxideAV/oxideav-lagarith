@@ -15,6 +15,13 @@
 //! The probability model the coder consumes is a 256-entry CDF —
 //! `cum[0] = 0`, `cum[256] = total`. Symbol `s` has frequency
 //! `cum[s+1] - cum[s]`.
+//!
+//! Production models are built with [`Cdf::from_wire_frequencies`],
+//! which first runs the `lagarith.dll!0x180001050` model normalizer
+//! ([`crate::model`], `provenance/52`) so the operative total is an
+//! exact power of two and the §5 step-1 quotient is the reference's
+//! `q = range >> shift`. [`Cdf::from_frequencies`] builds directly
+//! from a final table (tests; bit-identical at power-of-two totals).
 
 use crate::error::{Error, Result};
 
@@ -62,6 +69,16 @@ pub(crate) struct Cdf {
     /// round 10. The decoder Step-B path keys off `total`, not
     /// `cum[255]`; this field is read only by the encoder.
     cum_top: u32,
+    /// `Some(log2(total))` when `total` is a power of two — the shift
+    /// exponent the `0x180001050` model normalizer publishes at model
+    /// offset `+0x404` (`provenance/52` §2 step 4). The per-symbol
+    /// quotient then takes the reference's exact `q = range >> shift`
+    /// form (`spec/02` §5 step 1). `None` only for hand-built
+    /// non-power-of-two tables (test-only: every production model
+    /// comes through [`Cdf::from_wire_frequencies`], whose normalizer
+    /// guarantees a power-of-two total), where the coder falls back
+    /// to the bit-identical exact division `q = range / total`.
+    shift: Option<u8>,
     cum: [u32; 257],
     /// Per-symbol `freq[s] = cum[s+1] - cum[s]` cache. Encoder-only
     /// (the round-11 Step-C cache; the decoder's `find_symbol`
@@ -95,13 +112,55 @@ impl Cdf {
             }
             f
         };
+        let shift = if acc.is_power_of_two() {
+            Some(acc.trailing_zeros() as u8)
+        } else {
+            None
+        };
         Ok(Self {
             freq0: cum[1],
             cum_top: cum[255],
             freqs,
             total: acc,
+            shift,
             cum,
         })
+    }
+
+    /// Build the range-coder model from a **wire** frequency table:
+    /// run the `lagarith.dll!0x180001050` model normalizer
+    /// ([`crate::model::normalize_wire_freq_table`], `provenance/52`)
+    /// so the operative total is an exact power of two, then build
+    /// the cumulative table (the normalizer's step 5) and derive the
+    /// shift exponent (its step 4) from the normalized total.
+    ///
+    /// This is the production constructor for the modern coder on
+    /// BOTH directions: the decoder normalizes the table it parsed
+    /// from the Fibonacci probability prefix, and the encoder
+    /// normalizes the raw histogram it is about to transmit (the
+    /// wire still carries the RAW table per `spec/04` §5; the
+    /// normalized model is coder-internal on each side, derived
+    /// deterministically from the same wire bytes).
+    ///
+    /// [`Cdf::from_frequencies`] remains available for direct model
+    /// construction from an already-final table (unit tests and the
+    /// power-of-two fast path are bit-identical through either).
+    pub fn from_wire_frequencies(freq: &[u32; 256]) -> Result<Self> {
+        Self::from_frequencies(&crate::model::normalize_wire_freq_table(freq)?)
+    }
+
+    /// The per-symbol quotient of `spec/02` §5 step 1. On a
+    /// normalizer-built model the total is `2^shift` and this is the
+    /// reference's exact `q = range >> shift`; on a hand-built
+    /// non-power-of-two table it is the bit-identical exact division
+    /// (for a power-of-two divisor the two coincide on every `range`,
+    /// which `rangecoder_shift_quotient_equals_division` pins).
+    #[inline(always)]
+    fn quotient(&self, range: u32) -> u32 {
+        match self.shift {
+            Some(s) => range >> s,
+            None => range / self.total,
+        }
     }
 
     /// Read the encoder's pre-computed frequency `freq[s] =
@@ -231,10 +290,13 @@ impl<'a> RangeDecoder<'a> {
     /// case and short-circuits the 9-iteration binary search.
     #[inline]
     pub fn decode_symbol(&mut self, cdf: &Cdf) -> Result<u8> {
-        // Per `spec/02` §5: q = range / total.
+        // Per `spec/02` §5 step 1: q = range >> shift, where the
+        // `0x180001050` model normalizer guarantees total = 2^shift
+        // (`provenance/52`). Test-only non-pow2 tables fall back to
+        // the bit-identical exact division inside `Cdf::quotient`.
         let total = cdf.total();
         debug_assert!(total > 0, "Cdf::total must be non-zero");
-        let q = self.range / total;
+        let q = cdf.quotient(self.range);
 
         // `spec/02` §5 step 1 requires the quotient `q >= 1`; the
         // legitimate wire total equals the per-channel symbol count
@@ -454,7 +516,10 @@ impl RangeEncoder {
     pub fn encode_symbol(&mut self, cdf: &Cdf, s: usize) {
         let total = cdf.total();
         debug_assert!(total > 0, "Cdf::total must be non-zero");
-        let q = self.range / total;
+        // Symmetric to the decoder: `q = range >> shift` on a
+        // normalized (power-of-two-total) model, exact division on
+        // test-only non-pow2 tables — bit-identical either way.
+        let q = cdf.quotient(self.range);
 
         // Step A — symbol 0 fast path (`spec/02` §5; symmetric to
         // the decoder hot path landed in round 8).
@@ -1447,6 +1512,187 @@ mod tests {
         let mut out = Vec::with_capacity(symbols.len());
         for _ in 0..symbols.len() {
             out.push(dec.decode_symbol(&cdf).unwrap());
+        }
+        assert_eq!(out, symbols);
+    }
+
+    /// Round 407: on a power-of-two total, the `Cdf::quotient` shift
+    /// path (`q = range >> shift`, the reference form published by
+    /// the `0x180001050` normalizer per `provenance/52` §2 step 4 /
+    /// `spec/02` §5 step 1) equals exact division `range / total` at
+    /// every range in the coder's operating band — including both
+    /// band edges and the renormalisation cliff around TOP.
+    #[test]
+    fn rangecoder_shift_quotient_equals_division() {
+        for k in [0u32, 1, 4, 12, 23] {
+            let total = 1u32 << k;
+            let mut freq = [0u32; 256];
+            // Spread the pow2 total over a few symbols.
+            freq[0] = total - total / 2;
+            freq[1] = total / 4;
+            // (for total 1 / 2 the tail slots collapse to zero.)
+            freq[200] = total - freq[0] - freq[1];
+            let cdf = Cdf::from_frequencies(&freq).unwrap();
+            assert_eq!(cdf.total(), total);
+            assert_eq!(cdf.shift, Some(k as u8), "shift not derived at 2^{k}");
+            for range in [
+                TOP + 1,
+                TOP + 2,
+                INIT_RANGE,
+                INIT_RANGE - 1,
+                0x0100_0000,
+                0x12345678,
+                0x7fff_ffff,
+            ] {
+                assert_eq!(
+                    cdf.quotient(range),
+                    range / total,
+                    "shift path != division at total=2^{k}, range={range:#x}"
+                );
+            }
+        }
+        // Non-pow2 totals must NOT take the shift path.
+        let mut freq = [0u32; 256];
+        freq[0] = 2;
+        freq[1] = 1; // total = 3
+        let cdf = Cdf::from_frequencies(&freq).unwrap();
+        assert_eq!(cdf.shift, None);
+        assert_eq!(cdf.quotient(INIT_RANGE), INIT_RANGE / 3);
+    }
+
+    /// Round 407: `Cdf::from_wire_frequencies` runs the
+    /// `0x180001050` model normalizer — the built model's total is
+    /// the smallest power of two >= the raw wire total, the shift
+    /// exponent is derived, and a full encode -> decode self-roundtrip
+    /// through the normalized model recovers the symbols.
+    #[test]
+    fn cdf_from_wire_frequencies_normalizes_and_roundtrips() {
+        let mut freq = [0u32; 256];
+        freq[0] = 700;
+        freq[1] = 150;
+        freq[9] = 90;
+        freq[254] = 40;
+        freq[255] = 30; // raw total = 1010 (non-pow2)
+        let cdf = Cdf::from_wire_frequencies(&freq).unwrap();
+        assert_eq!(cdf.total(), 1024, "total must normalize to 2^10");
+        assert_eq!(cdf.shift, Some(10));
+
+        let mut symbols = Vec::with_capacity(3000);
+        for i in 0..3000u32 {
+            let r = i.wrapping_mul(2654435761) ^ (i >> 5);
+            symbols.push(match r % 101 {
+                0..=69 => 0u8,
+                70..=84 => 1u8,
+                85..=93 => 9u8,
+                94..=97 => 254u8,
+                _ => 255u8,
+            });
+        }
+        let mut enc = RangeEncoder::new();
+        for &s in &symbols {
+            enc.encode_symbol(&cdf, s as usize);
+        }
+        let bytes = enc.finish();
+        let mut dec = RangeDecoder::new(&bytes).unwrap();
+        let mut out = Vec::with_capacity(symbols.len());
+        for _ in 0..symbols.len() {
+            out.push(dec.decode_symbol(&cdf).unwrap());
+        }
+        assert_eq!(out, symbols);
+    }
+
+    /// Round 407: at a power-of-two raw total the wire constructor is
+    /// bit-identical to the direct one (the normalizer's step-1 fast
+    /// path skips the rescale entirely) — same cum[], same total,
+    /// same shift, same wire bytes for the same symbol stream.
+    #[test]
+    fn cdf_from_wire_frequencies_pow2_identity() {
+        let mut freq = [0u32; 256];
+        freq[0] = 900;
+        freq[3] = 100;
+        freq[200] = 24; // total = 1024 = 2^10
+        let wire = Cdf::from_wire_frequencies(&freq).unwrap();
+        let direct = Cdf::from_frequencies(&freq).unwrap();
+        assert_eq!(wire.total(), direct.total());
+        assert_eq!(wire.shift, direct.shift);
+        for s in 0..=256 {
+            assert_eq!(wire.lo(s), direct.lo(s), "cum[{s}] differs");
+        }
+        let symbols: Vec<u8> = (0..500u32)
+            .map(|i| match i % 10 {
+                0 => 3u8,
+                1 => 200u8,
+                _ => 0u8,
+            })
+            .collect();
+        let mut enc_w = RangeEncoder::new();
+        let mut enc_d = RangeEncoder::new();
+        for &s in &symbols {
+            enc_w.encode_symbol(&wire, s as usize);
+            enc_d.encode_symbol(&direct, s as usize);
+        }
+        assert_eq!(enc_w.finish(), enc_d.finish());
+    }
+
+    /// Round 407: the normalizer is load-bearing at non-power-of-two
+    /// totals — a stream coded against the normalized model does NOT
+    /// decode correctly against the raw-table model (the r398
+    /// characterisation showed the quotients diverge; this pins that
+    /// the divergence reaches the wire). Guards against a future
+    /// "simplification" that silently drops the normalization step.
+    #[test]
+    fn raw_model_misdecodes_normalized_stream_at_non_pow2_total() {
+        let mut freq = [0u32; 256];
+        freq[0] = 600;
+        freq[1] = 250;
+        freq[7] = 100;
+        freq[255] = 60; // raw total = 1010 (non-pow2)
+        let normalized = Cdf::from_wire_frequencies(&freq).unwrap();
+        let raw = Cdf::from_frequencies(&freq).unwrap();
+        assert_ne!(normalized.total(), raw.total());
+
+        let mut symbols = Vec::with_capacity(2000);
+        for i in 0..2000u32 {
+            let r = i.wrapping_mul(2654435761) ^ (i >> 3);
+            symbols.push(match r % 20 {
+                0..=11 => 0u8,
+                12..=16 => 1u8,
+                17..=18 => 7u8,
+                _ => 255u8,
+            });
+        }
+        let mut enc = RangeEncoder::new();
+        for &s in &symbols {
+            enc.encode_symbol(&normalized, s as usize);
+        }
+        let bytes = enc.finish();
+
+        // Decoding with the RAW model must not reproduce the stream
+        // (it may also surface a wire error mid-decode; either way it
+        // must not silently succeed byte-exactly).
+        let mut dec = RangeDecoder::new(&bytes).unwrap();
+        let mut out = Vec::with_capacity(symbols.len());
+        let mut errored = false;
+        for _ in 0..symbols.len() {
+            match dec.decode_symbol(&raw) {
+                Ok(s) => out.push(s),
+                Err(_) => {
+                    errored = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            errored || out != symbols,
+            "raw-total model decoded a normalized-model stream byte-exactly; \
+             the normalization step would be dead code"
+        );
+
+        // And the normalized model itself decodes it byte-exactly.
+        let mut dec = RangeDecoder::new(&bytes).unwrap();
+        let mut out = Vec::with_capacity(symbols.len());
+        for _ in 0..symbols.len() {
+            out.push(dec.decode_symbol(&normalized).unwrap());
         }
         assert_eq!(out, symbols);
     }
