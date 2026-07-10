@@ -29,28 +29,28 @@ use crate::range_coder::{Cdf, RangeEncoder, TOP};
 use crate::rle::contract_raw;
 
 /// Largest transmitted-frequency total the modern range coder can
-/// decode without the `q = range / total` quotient (`spec/02` §5)
+/// decode without the per-symbol quotient (`spec/02` §5 step 1)
 /// collapsing to zero.
 ///
 /// `spec/02` §2 puts the post-renormalisation `range` in
-/// `[TOP + 1, 2^31]` (TOP = `0x800000`). Step A/B/C all start from
-/// `q = range / total`; for the arithmetic to stay valid the
-/// quotient must be `>= 1` at the worst case `range = TOP + 1`,
-/// which requires `total <= TOP + 1`. We cap at `TOP` so the
-/// worst-case quotient is `(TOP + 1) / TOP = 1` with one bit of
-/// headroom.
+/// `[TOP + 1, 2^31]` (TOP = `0x800000` = 2^23). Since round 407 the
+/// coder's operative total is the `0x180001050`-normalized power of
+/// two (`provenance/52`), so the quotient is `q = range >> shift`
+/// with `2^shift = total.next_power_of_two()`; for `q >= 1` at the
+/// worst case `range = TOP + 1` the normalized total must satisfy
+/// `2^shift <= 2^23`, i.e. the raw wire total must be `<= TOP`.
+/// Capping at exactly `TOP` keeps the largest conformant raw total
+/// (its normalization is the identity, `shift = 23`, worst-case
+/// `q = (TOP + 1) >> 23 = 1`).
 ///
-/// `spec/04` §5 documents that the proprietary loader normalises the
-/// per-symbol histogram (its `0x180001530..0x18000158a` block) before
-/// building the reciprocal-multiply LUT — the same `q >= 1` guarantee,
-/// reached the same way. The validation correction in `spec/04` §5
-/// then establishes that the *wire* still carries a raw byte-histogram
-/// whose total equals the symbol count for the fixtures probed (16 for
-/// 4x4, 256 for 16x16, …) — all far below `TOP`. So this cap is a
-/// no-op for every plane the proprietary fixtures exercise; it only
-/// engages for planes whose symbol count exceeds `TOP` (> ~8.39M
-/// residuals, e.g. a single 4K+ plane), where a raw total would push
-/// `q` to zero and break the coder.
+/// The validation correction in `spec/04` §5 establishes that the
+/// *wire* carries a raw byte-histogram whose total equals the symbol
+/// count for the fixtures probed (16 for 4x4, 256 for 16x16, …) —
+/// all far below `TOP`. So this cap is a no-op for every plane the
+/// proprietary fixtures exercise; it only engages for planes whose
+/// symbol count exceeds `TOP` (> ~8.39M residuals, e.g. a single
+/// 4K+ plane), where the normalized total would push `q` to zero
+/// and break the coder.
 const MAX_MODERN_TOTAL: u32 = TOP;
 
 /// Rescale a 256-entry raw histogram so its total stays within

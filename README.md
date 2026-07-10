@@ -194,7 +194,7 @@ construction.
   decode-side harness in `fuzz/` (`cargo-fuzz`) asserts panic-freedom
   on attacker-supplied payloads — the modern range coder rejects a
   malformed probability total exceeding the working `range`
-  (`q = range / total` → 0) as `Error::ProbabilityTotalExceedsRange`
+  (per-symbol quotient → 0) as `Error::ProbabilityTotalExceedsRange`
   rather than dividing by zero (`spec/02` §5 / `spec/04` §5). Its
   dimension selectors map onto `1..=64` at **both parities**, so the
   decoder's documented odd-dimension branches are in-corpus: the YV12
@@ -233,21 +233,10 @@ construction.
 Every documented colour mode decodes **sample-exactly** across the
 fixture class — RGB24 (types 2 / 4), RGBA (8), YV12 (10),
 reduced-resolution YV12 (11), YUY2 (3) and legacy RGB (7) — at both
-power-of-two and non-power-of-two plane pixel counts. The modern range
-coder narrows its interval with `q = range / total_freq` where
-`total_freq` is the raw histogram sum (= the per-channel symbol count),
-per `spec/02` §5's invariant box and `spec/04` §5 (the `audit/01` §3.2
-validation correction: the wire carries a raw byte-histogram table whose
-total is the pixel count, not the internal-only 524288-normalised LUT
-total). That division is exact for any `total_freq`, so the
-`raw-histogram → cumulative-frequency` derivation the proprietary loader
-performs at `lagarith.dll!0x180001050` — including its shift exponent —
-is fully covered for the **decoder** by `spec/04` §6 + §8 item 2 (the
-auxiliary fields are deterministic post-processing of the raw freq[]
-array) combined with `spec/02` §5's cumulative-search equivalent. The
-round-338 `milestone_*` tests pin the non-pow2 sample-exact decode of
-every mode as a single regression. Round 352 closes the **YV12
-odd-dimension SPECGAP** path on the encode side: when
+power-of-two and non-power-of-two plane pixel counts. The round-338
+`milestone_*` tests pin the non-pow2 sample-exact decode of every mode
+as a single regression. Round 352 closes the **YV12 odd-dimension
+SPECGAP** path on the encode side: when
 `floor(W·H/4) != (W/2)·(H/2)` both `encode_arith_yv12` and
 `decode_arith_yv12` fall through to the `spec/03` §6.1.1 single-row
 chroma placeholder geometry, and the `arith_yv12_odd_dims_specgap
@@ -255,28 +244,43 @@ _roundtrip` test pins that the two halves use the identical breakdown
 so the path self-roundtrips byte-exactly even though the per-row
 chroma layout itself is a host-integration placeholder.
 
-What remains open is a clean byte-exact **cross-encoder parity** test
-against a *proprietary-encoded* stream. It awaits a fixture (the public
-sample set 404s); separately, the reciprocal-multiply quotient the
-proprietary loader derives (`spec/02` §5, via the
-`.rdata` table now bundled at
-`tables/00-rangecoder-reciprocal-multiply-lut.csv`) can differ from the
-crate's exact `q = range / total` at non-power-of-two totals. Round 398
-makes this **machine-checked** rather than prose: `tables::recip_lut()`
-loads the extracted 2048-entry table (numerically `floor(2^32 / i)`),
-and three characterisation tests pin that a naive reciprocal-multiply
-`(range * LUT[total]) >> 32` equals exact division across the operating
-band `[2^23 + 1, 2^31]` **iff** `total` is a power of two, and diverges
-by exactly 1 at every non-power-of-two total. This is why the byte-exact
-cross-decoder pins (`tests/reference_pins.rs`) are held to power-of-two
-pixel counts, and why the *exact* reference quotient at a
-non-power-of-two total remains an open item (the `0x180001050`
-cumulative-sum / shift derivation is not covered by the wire-format
-spec — `spec/02` §9 item 1, `spec/04` §9 item 2). Matching the
-proprietary **encoder** byte-for-byte on structured residuals is
-therefore blocked on that open derivation *and* a proprietary-encoded
-fixture; it is not a decode-spec gap. The crate's own encode→decode
-round-trips all such streams byte-exactly.
+**Round 407 lands the recovered `lagarith.dll!0x180001050` model
+normalizer** (`provenance/52`, closing `spec/02` §9 item 1 / `spec/04`
+§9 item 2). The wire carries a raw byte-histogram table whose total is
+the per-channel symbol count (`spec/04` §5, the `audit/01` §3.2
+validation correction), but the reference never codes against it
+directly: the recovered helper forces the model total to the smallest
+power of two `>=` the raw sum (IEEE-754-double floor-rescale +
+cumulative-sum correction over the nonzero low-128 slots, cursor
+masked `& 0x7f`) and publishes `shift = log2(pow2)`, so the per-symbol
+quotient is an exact `q = range >> shift` at **every** total.
+`src/model.rs` implements the recovery and both coder directions build
+their model through it (`Cdf::from_wire_frequencies`). At power-of-two
+totals the normalizer is the identity and the coder is bit-identical
+to the previous exact-division form — every oracle-captured
+cross-decoder pin (`tests/reference_pins.rs`) holds unchanged — while
+non-pow2 totals now follow the reference derivation. The round-398
+`tables::recip_lut()` characterisation (naive reciprocal-multiply ==
+exact division **iff** the total is a power of two) is exactly the
+regime the normalizer guarantees, so LUT, division, and shift coincide
+on every conformant model. The recovery also *explains* the round-127
+pattern-sensitivity finding: structured residuals route channels to
+the pre-RLE arithmetic headers whose totals are non-pow2 even at pow2
+pixel counts, which is where the oracle (normalizing) and the crate's
+old raw-total model diverged.
+
+What remains open is byte-exact **cross-parity re-confirmation**
+against a *proprietary-encoded* stream (and a re-capture of the
+round-127 structured-pattern class against the black-box oracle, now
+expected to pass). It awaits a fixture — the public sample set 404s
+(`provenance/52` §6). One recovered-trace caveat is also pinned there
+(§5): the i386 build's rescale converts with `fistp` (x87
+rounding-mode-dependent) where the x86-64 build truncates; this crate
+targets the x86-64 truncation semantics per the trace's
+recommendation, and only a real fixture can settle the i386 `cum[]`
+±1 question empirically. The crate's own encode→decode round-trips
+all such streams byte-exactly, and a wire-level self-pin freezes the
+normalized non-pow2 channel bytes against drift.
 
 ## License
 

@@ -18,52 +18,46 @@
 //! reversion of `decode_arith_rgb` / `decode_arith_rgba` back to the
 //! (wrong) Rule A predictor.
 //!
-//! Sizes use power-of-two pixel counts per plane because at a pow2
-//! total the binary's `q = range >> shift` fast form (`spec/02` §5
-//! step 1, where `shift = log2(total)`) coincides exactly with the
-//! clean-room `q = range / total_freq` division (`spec/02` §5 invariant
-//! box). At a non-power-of-two total the two are not bit-identical, so
-//! the third-party oracle's `>> shift` framing diverges from the
-//! crate's exact-division decode on those sizes — an oracle-side
-//! framing property, **not** a clean-room decode gap: the crate's own
-//! decoder self-roundtrips non-pow2 totals byte-exactly (pinned by
-//! `roundtrip_tests::encoder_random_roundtrip_property::milestone_*`,
-//! and by every non-pow2 dim in the random-seeded roundtrip sweep).
-//! Holding the cross-oracle pins to pow2 sizes keeps them comparing
-//! like-for-like against the binary's fast path.
+//! Sizes use power-of-two pixel counts per plane. Historically (up
+//! to round 406) that was load-bearing: the crate divided by the raw
+//! wire total, which matches the binary's `q = range >> shift` form
+//! (`spec/02` §5 step 1) only when the total is a power of two.
+//! Round 407 closed that gap by wiring the recovered
+//! `lagarith.dll!0x180001050` model normalizer (`provenance/52`) into
+//! both coder directions: the operative total is now forced to the
+//! smallest power of two >= the raw histogram sum (floor-rescale +
+//! cumulative-sum correction) and the quotient is the reference's
+//! exact `>> shift` at **every** total. The pins below remain
+//! byte-valid unchanged because a power-of-two raw total takes the
+//! normalizer's identity fast path — pre- and post-407 wire bytes
+//! coincide on exactly this fixture class (that is why they were
+//! captured at pow2 sizes in the first place).
 //!
-//! ## Pattern sensitivity (round 127 finding)
+//! ## Pattern sensitivity (round 127 finding; explained round 407)
 //!
 //! Even within the power-of-two-pixel-count regime, the crate
-//! encoder's compatibility with the third-party decoder is
+//! encoder's compatibility with the third-party decoder was
 //! **pattern-sensitive**. Random-byte residuals (LCG seed material)
 //! produce frames the oracle decodes byte-exactly across the swept
 //! sizes 4×4, 4×8, 8×8, 8×16, 16×16, and 32×32 (RGB24 / RGBA both). A
 //! structured "i × 73 + 11 → bit-slice" residual pattern at the
-//! *same* power-of-two-pixel sizes produces frames where the oracle's
-//! decode partially diverges (e.g. ~40% byte match at 16×16) —
+//! *same* power-of-two-pixel sizes produced frames where the oracle's
+//! decode partially diverged (e.g. ~40% byte match at 16×16) —
 //! single-byte off-by-N residuals scattered through the planes.
-//! The crate's own decoder always self-roundtrips both pattern
-//! classes byte-exactly, so the divergence sits on the oracle's side
-//! of the wire-format interpretation. The clean-room decode contract
-//! itself is fully specified: the channel-prefix probability-loader at
-//! `lagarith.dll!0x180001050` derives the cumulative-frequency table
-//! and the range-coder shift exponent deterministically from the raw
-//! freq[] array (`spec/04` §6 + §8 item 2), and `spec/02` §5's
-//! invariant box pins the clean-room equivalent as a straight
-//! cumulative search with `cum[256] = total_freq` (the raw histogram
-//! sum, per the `spec/04` §5 / `audit/01` §3.2 validation correction
-//! — the wire total is the per-channel symbol count, not the
-//! internal-only 524288-normalised LUT total). The crate's
-//! `range_coder::RangeDecoder::decode_symbol` implements exactly that
-//! cumulative search, so it needs no further `0x180001050`
-//! disassembly to decode every documented mode sample-exactly. What
-//! remains open is byte-exact **cross-encoder parity** against a
-//! proprietary-encoded stream on structured residuals — an
-//! encoder-side / fixture matter (the public sample set 404s), not a
-//! decode-spec gap. The random-pattern pins below sample the subset
-//! where the binary's `>> shift` fast path and the exact division
-//! agree.
+//! The `provenance/52` recovery explains the split: structured
+//! residuals route channels to the pre-RLE arithmetic headers
+//! (`0x01..0x03`), whose wire total is the pre-RLE symbol count —
+//! non-power-of-two even at pow2 pixel counts — so the oracle decoded
+//! them against the `0x180001050`-normalized model while the crate's
+//! encoder (then) coded against the raw table. Random residuals never
+//! win the RLE contraction, stay on header `0x00` with a pow2 pixel-
+//! count total, and the two models coincide. Round 407's encoder
+//! codes against the normalized model, so the divergence class is
+//! expected closed; byte-exact re-confirmation against the black-box
+//! oracle (or a proprietary-encoded fixture — the public sample set
+//! still 404s) has not yet been re-captured and remains the open
+//! cross-encoder-parity item. The random-pattern pins below sample
+//! the identity-fast-path subset where pre- and post-407 agree.
 
 use oxideav_lagarith::{decode_frame, PixelKind};
 

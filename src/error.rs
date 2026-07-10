@@ -45,15 +45,19 @@ pub enum Error {
     ProbabilityTableOverflow,
     /// Decoded probability table's total exceeded the modern range
     /// coder's working `range`, so the per-symbol quotient
-    /// `q = range / total` (`spec/02` §5 step 1) collapsed to zero.
-    /// The spec invariant requires `q >= 1` — established by
-    /// `spec/04` §5's validation correction (the legitimate wire
-    /// total equals the per-channel symbol count, always ≤ pixel
-    /// count ≤ `range`). A malformed Fibonacci prefix can encode a
-    /// total above `range` (range is in `[2^23 + 1, 2^31]` per
-    /// `spec/02` §2), which would make the generic Step-C path's
-    /// `low / q` divide by zero; the decoder rejects it as a wire
-    /// error instead of panicking.
+    /// (`spec/02` §5 step 1 — `q = range >> shift` on the
+    /// `0x180001050`-normalized model, `provenance/52`) collapsed to
+    /// zero. The spec invariant requires `q >= 1` — for conformant
+    /// streams the wire total equals the per-channel symbol count
+    /// (`spec/04` §5 validation correction) and its power-of-two
+    /// normalization stays ≤ `range` (range is in `[2^23 + 1, 2^31]`
+    /// per `spec/02` §2). A malformed Fibonacci prefix can encode a
+    /// total whose normalization exceeds `range` — or a raw total
+    /// above `2^31`, on which the reference normalizer's 32-bit
+    /// doubling register would wrap and never terminate — either
+    /// would make the generic Step-C path's `low / q` divide by
+    /// zero; the decoder rejects both as wire errors instead of
+    /// panicking or hanging.
     ProbabilityTotalExceedsRange,
     /// Decoded probability table cannot be normalized by the
     /// `lagarith.dll!0x180001050` model normalizer (`provenance/52`):
@@ -142,7 +146,7 @@ impl core::fmt::Display for Error {
             }
             Error::ProbabilityTotalExceedsRange => f.write_str(
                 "Lagarith: probability table total exceeds range coder range \
-                 (q = range / total collapsed to zero)",
+                 (per-symbol quotient collapsed to zero)",
             ),
             Error::EmptyProbabilityTable => {
                 f.write_str("Lagarith: probability table summed to zero")

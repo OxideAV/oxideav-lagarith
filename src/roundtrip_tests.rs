@@ -4014,20 +4014,19 @@ mod encoder_random_roundtrip_property {
 
     // ─────────── milestone lock: every colour mode, non-pow2 total ───
     //
-    // The crate's modern range coder narrows the `[low, low + range)`
-    // interval with `q = range / total_freq` where `total_freq` is the
-    // **raw histogram sum** (= the per-channel symbol count), per
-    // `spec/02` §5's invariant box + `spec/04` §5 (the audit/01 §3.2
-    // validation correction: the wire carries a raw byte-histogram
-    // table whose total is the pixel count, NOT the internal
-    // 524288-normalised LUT total). That division is exact for any
-    // `total_freq`, so a plane whose pixel count is **not** a power of
-    // two is decoded sample-exactly through the very same path. The
-    // proprietary's `range >> shift` fast form (`spec/02` §5 step 1)
-    // and the reciprocal-multiply LUT at `0x180001050` are
-    // bit-stream-independent post-load artefacts (`spec/04` §6 / §8
-    // item 2): the clean-room cumulative-search decoder reproduces
-    // their output for every total.
+    // The wire carries a **raw byte-histogram** table whose total is
+    // the per-channel symbol count (`spec/04` §5, the audit/01 §3.2
+    // validation correction — NOT the once-claimed internal 524288
+    // normalisation). Since round 407 the modern range coder derives
+    // its operative model from that raw table through the recovered
+    // `lagarith.dll!0x180001050` normalizer (`provenance/52`): the
+    // total is forced to the smallest power of two >= the raw sum
+    // (floor-rescale + cumulative-sum correction) and the per-symbol
+    // quotient is the reference's exact `q = range >> shift`
+    // (`spec/02` §5 step 1). A plane whose pixel count is **not** a
+    // power of two therefore exercises the full rescale + deficit-
+    // distribution path on every channel, on both the encode and the
+    // decode side of the roundtrip.
     //
     // These two tests are the single named regression guarding the
     // round-338 milestone "all documented Lagarith colour-mode
@@ -4038,17 +4037,18 @@ mod encoder_random_roundtrip_property {
     // reduced-resolution YV12 (type 11 fixed-point lattice), YUY2
     // (type 3), and legacy RGB (type 7) — at a deliberately
     // non-power-of-two plane pixel count, asserting byte-exact decode
-    // of the input pixel buffer. A regression that reintroduced a
-    // power-of-two total assumption into the modern range coder (e.g.
-    // `q = range >> total.next_power_of_two().trailing_zeros()`) would
-    // pass the pow2-sized `reference_pins.rs` set yet fail here.
+    // of the input pixel buffer. A regression that desynchronised the
+    // two sides of the normalizer (e.g. an encoder coding against the
+    // raw table while the decoder normalizes, or a drifted deficit-
+    // distribution order) would pass the pow2-sized
+    // `reference_pins.rs` set yet fail here.
 
     /// Non-power-of-two pixel counts spanning the modern RGB24 selector
     /// boundary and the chroma-subsampled families. `11 * 7 = 77`,
     /// `13 * 5 = 65`, `10 * 6 = 60`, `6 * 6 = 36`, `14 * 6 = 84`,
     /// `12 * 12 = 144`, `10 * 10 = 100` — none a power of two, so the
-    /// modern range coder's `range / total` division lands on a
-    /// non-pow2 `total` on every plane.
+    /// modern range coder's `0x180001050` normalization runs its
+    /// non-identity rescale path on every plane.
     const MILESTONE_SEED: u64 = 0xb16b_00b5_c0de_face;
 
     #[test]

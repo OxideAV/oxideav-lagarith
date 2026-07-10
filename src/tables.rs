@@ -15,19 +15,21 @@
 //! cumulative search" loop, which produces bit-identical output
 //! without depending on the LUT. The decoder uses the search loop.
 //! The table is nonetheless **bundled** (`tables/00-*.csv`) and
-//! exposed via [`recip_lut`] because its numeric form is what pins
-//! the power-of-two restriction on the crate's byte-exact
-//! cross-decoder pins (`tests/reference_pins.rs`): the characterisation
+//! exposed via [`recip_lut`] because its numeric form is what
+//! motivated the `0x180001050` recovery: the characterisation
 //! tests below prove that a naive reciprocal-multiply
-//! `(range * LUT[total]) >> 32` coincides with the crate's exact
+//! `(range * LUT[total]) >> 32` coincides with exact
 //! `q = range / total` division only when `total` is a power of two,
 //! and diverges by ±1 at every non-power-of-two `total` somewhere in
-//! the coder's operating range `[2^23 + 1, 2^31]`. This makes
-//! machine-checked what `reference_pins.rs` previously only asserted
-//! in prose, and records why the *exact* reference quotient at a
-//! non-power-of-two total is still an open item (`spec/02` §9 item 1,
-//! `spec/04` §9 item 2 — the `0x180001050` cumulative-sum / shift
-//! derivation is not covered by the wire-format spec).
+//! the coder's operating range `[2^23 + 1, 2^31]`. That divergence
+//! was the `spec/02` §9 item 1 / `spec/04` §9 item 2 open item —
+//! **resolved in round 407** by `provenance/52`: the reference's
+//! model normalizer (`crate::model`) forces the operative total to a
+//! power of two, exactly the regime in which these tests prove the
+//! LUT, the exact division, and the `range >> shift` form all
+//! coincide. The LUT itself remains consistent with the coder by
+//! construction and stays bundled as the machine-checked record of
+//! that argument.
 
 use std::sync::OnceLock;
 
@@ -99,13 +101,15 @@ pub fn rle_inv_lut() -> &'static [u8; 256] {
 /// `u32`, so the reference stores `2^32 − 1`).
 ///
 /// The crate's decoder does not consult this table — it runs the
-/// `spec/02` §5 invariant-box cumulative search with exact
-/// `q = range / total`. The table is bundled purely so its numeric
-/// form is machine-checkable (see the module-level tests): a naive
-/// reciprocal-multiply built from it, `(range * LUT[total]) >> 32`,
-/// equals exact division **iff** `total` is a power of two, which is
-/// what pins the power-of-two restriction on the byte-exact
-/// cross-decoder pins in `tests/reference_pins.rs`.
+/// `spec/02` §5 invariant-box cumulative search with the
+/// `q = range >> shift` quotient of the `0x180001050`-normalized
+/// model (`crate::model`, round 407). The table is bundled purely so
+/// its numeric form is machine-checkable (see the module-level
+/// tests): a naive reciprocal-multiply built from it,
+/// `(range * LUT[total]) >> 32`, equals exact division **iff**
+/// `total` is a power of two — the regime the model normalizer
+/// guarantees, so LUT, division, and shift all coincide on every
+/// conformant model.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn recip_lut() -> &'static [u32; 2048] {
     static CACHE: OnceLock<[u32; 2048]> = OnceLock::new();

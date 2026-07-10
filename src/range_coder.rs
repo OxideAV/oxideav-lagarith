@@ -298,16 +298,20 @@ impl<'a> RangeDecoder<'a> {
         debug_assert!(total > 0, "Cdf::total must be non-zero");
         let q = cdf.quotient(self.range);
 
-        // `spec/02` §5 step 1 requires the quotient `q >= 1`; the
+        // `spec/02` §5 step 1 requires the quotient `q >= 1`. The
         // legitimate wire total equals the per-channel symbol count
-        // (`spec/04` §5 validation correction), always ≤ pixel count
-        // ≤ `range` (range ∈ [2^23 + 1, 2^31] per `spec/02` §2). A
-        // malformed Fibonacci prefix can decode a `total > range`,
-        // making `q == 0`; the generic Step-C path below then divides
-        // `low / q`. Reject it as a wire error so attacker-supplied
-        // payloads can't panic the decoder (`Cdf::from_frequencies`
-        // accepts totals up to u32::MAX by design, so the bound check
-        // belongs here where `range` is in scope).
+        // (`spec/04` §5 validation correction) and normalizes to at
+        // most `2 * symbol_count` rounded to a power of two — for
+        // every conformant stream that stays ≤ `range` (range ∈
+        // [2^23 + 1, 2^31] per `spec/02` §2; the encoder cap keeps
+        // the normalized total ≤ 2^23). A malformed Fibonacci prefix
+        // can still decode a table whose (normalized) total exceeds
+        // `range`, making `q == 0`; the generic Step-C path below
+        // then divides `low / q`. Reject it as a wire error so
+        // attacker-supplied payloads can't panic the decoder
+        // (`Cdf::from_frequencies` accepts totals up to u32::MAX by
+        // design, so the bound check belongs here where `range` is
+        // in scope).
         if q == 0 {
             return Err(Error::ProbabilityTotalExceedsRange);
         }
