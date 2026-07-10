@@ -72,7 +72,12 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   captures. Measured on the 64×64 profiling drivers, the
   `q = range >> shift` quotient is ~3-4% faster than the previous
   per-symbol division on both decode and encode, with bit-identical
-  output.
+  output. The embedded fixtures now live in a single shared source
+  (`benches/fixtures_64.rs`, `include!`d by the bench and the
+  profiling example), and a new CI-run guard
+  (`tests/embedded_fixture_conformance.rs`) decodes every one of
+  them under `cargo test` — the staleness was previously observable
+  only at out-of-CI bench/example run time.
 
 ### Added
 
