@@ -1617,6 +1617,70 @@ mod tests {
         assert_eq!(decoded, plane, "large-plane roundtrip mismatch");
     }
 
+    // ────────── round 407 — normalized-model wire regressions ──────────
+
+    /// Byte-exact **self-pin** of the modern header-0x00 wire at a
+    /// non-power-of-two total (raw total 37 -> normalized 64). The
+    /// prefix carries the RAW histogram; the arithmetic body is coded
+    /// against the `0x180001050`-normalized model (`provenance/52`).
+    /// Any accidental change to the normalizer (rescale rounding,
+    /// deficit distribution order, window mask) or to the coder's
+    /// `q = range >> shift` derivation shows up here as a wire diff.
+    /// Unlike `tests/reference_pins.rs` this pin is NOT oracle-
+    /// captured — it freezes the crate's own (reference-derivation)
+    /// output so conformance-relevant bytes cannot drift silently.
+    #[test]
+    fn modern_wire_non_pow2_total_channel_self_pin() {
+        let plane: Vec<u8> = vec![
+            0, 0, 0, 1, 0, 0, 7, 0, 0, 0, 1, 0, 0, 0, 255, 0, 0, 0, 0, 1, 0, 0, 9, 0, 0, 0, 0, 254,
+            0, 0, 1, 0, 0, 0, 0, 7, 0,
+        ];
+        let channel = encode_channel_simple(&plane);
+        assert_eq!(
+            channel,
+            [
+                0, 30, 155, 154, 254, 216, 125, 25, 128, 94, 147, 211, 200, 26, 250, 122, 230, 192,
+                0
+            ],
+            "normalized-model header-0x00 wire drifted at a non-pow2 total"
+        );
+        let decoded = decode_channel(&channel, plane.len()).unwrap();
+        assert_eq!(decoded, plane);
+    }
+
+    /// A histogram the `0x180001050` normalizer rejects (all mass in
+    /// symbols 128..=255 at a non-power-of-two total — the
+    /// reference's correction loop would never terminate,
+    /// `provenance/52` §2 step 3) has no conformant arithmetic wire
+    /// form; `encode_channel_simple` must fall back to the raw
+    /// header-0x04 form and still roundtrip.
+    #[test]
+    fn unnormalizable_histogram_falls_back_to_raw() {
+        let plane = vec![200u8, 200, 201]; // total 3, upper-half only
+        let channel = encode_channel_simple(&plane);
+        assert_eq!(channel[0], 0x04, "expected raw-memcpy fallback");
+        let decoded = decode_channel(&channel, plane.len()).unwrap();
+        assert_eq!(decoded, plane);
+    }
+
+    /// `encode_channel_best` on an unnormalizable-histogram plane:
+    /// the 0x00 candidate is skipped (None), the raw seed covers it,
+    /// and the emitted channel roundtrips.
+    #[test]
+    fn best_handles_unnormalizable_histogram() {
+        // Long upper-half-only plane at a non-pow2 total (no zeros,
+        // so the RLE candidates can never contract below n_pixels
+        // and are skipped too).
+        let mut plane = Vec::with_capacity(97);
+        for i in 0..97u32 {
+            plane.push(200 + (i % 3) as u8);
+        }
+        let channel = encode_channel_best(&plane);
+        assert_eq!(channel[0], 0x04, "expected raw-memcpy candidate");
+        let decoded = decode_channel(&channel, plane.len()).unwrap();
+        assert_eq!(decoded, plane);
+    }
+
     // ─────────── encode_channel_best — header-form selection ───────────
 
     /// `encode_channel_best` never produces a larger wire body than

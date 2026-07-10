@@ -735,6 +735,49 @@ mod tests {
         assert_eq!(fill.to_byte(), 0xff);
     }
 
+    /// Round 407: a wire table the `0x180001050` model normalizer
+    /// cannot terminate on — non-power-of-two total with every
+    /// low-128 symbol at zero frequency (`provenance/52` §2 step 3's
+    /// correction loop would spin forever skipping zero slots) — is
+    /// rejected as [`Error::ProbabilityTableUnnormalizable`] before
+    /// any symbol is decoded, on both the no-RLE (header 0x00) and
+    /// the arith+RLE (header 0x01..0x03) dispatch paths.
+    #[test]
+    fn decode_rejects_unnormalizable_wire_table() {
+        let mut freq = [0u32; 256];
+        freq[200] = 1;
+        freq[201] = 1;
+        freq[202] = 1; // total 3 -> pow2 4, deficit 1, low half empty
+        let prefix = fibonacci::encode_freq_table(&freq);
+
+        // Header 0x00: prefix at byte 1. (The prefix must not begin
+        // with a zero u32 — that would trip the `spec/06` §1.3
+        // empty-channel short-circuit instead of reaching the model.)
+        let mut channel = vec![0x00u8];
+        channel.extend_from_slice(&prefix);
+        channel.extend_from_slice(&[0u8; 8]); // dummy arithmetic body
+        assert_ne!(
+            u32::from_le_bytes([channel[1], channel[2], channel[3], channel[4]]),
+            0,
+            "test premise: prefix must not look like the empty-channel escape"
+        );
+        assert_eq!(
+            decode_channel(&channel, 3),
+            Err(Error::ProbabilityTableUnnormalizable)
+        );
+
+        // Header 0x01 (arith + RLE): u32 pre-RLE count at bytes 1..5
+        // (must be < n_pixels to take the RLE dispatch), prefix at 5.
+        let mut channel = vec![0x01u8];
+        channel.extend_from_slice(&2u32.to_le_bytes());
+        channel.extend_from_slice(&prefix);
+        channel.extend_from_slice(&[0u8; 8]);
+        assert_eq!(
+            decode_channel(&channel, 3),
+            Err(Error::ProbabilityTableUnnormalizable)
+        );
+    }
+
     #[test]
     fn channel_header_rejects_out_of_range_bytes() {
         // `spec/06` §1.1: anything not in {0x00..=0x07, 0xff} is

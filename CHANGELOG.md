@@ -47,7 +47,16 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   bit-identity, and a load-bearing regression pinning that a
   normalized-model stream does **not** decode against the raw-total
   model at a non-pow2 total (so the normalization step can never
-  silently become dead code).
+  silently become dead code). End-to-end wire regressions: a
+  byte-exact **self-pin** of the header-0x00 channel at a non-pow2
+  total (raw 37 -> normalized 64) freezing the normalizer-derived
+  wire against drift, encoder raw-form fallback on unnormalizable
+  histograms (`encode_channel_simple` + `encode_channel_best`), and
+  the decoder surfacing `ProbabilityTableUnnormalizable` on both the
+  header-0x00 and header-0x01 dispatch paths before any symbol is
+  decoded. A local 200k-case arbitrary-table sweep exercised the
+  normalizer panic-free with the `sum == 2^shift` invariant held on
+  every non-wrapping success.
 
 ### Added
 
