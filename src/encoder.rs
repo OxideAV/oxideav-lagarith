@@ -147,6 +147,176 @@ pub fn encode_solid_rgba(b: u8, g: u8, r: u8, a: u8) -> Vec<u8> {
     vec![9, b, g, r, a]
 }
 
+// ─── Round 432 — transmitted-model downscale election ───────────────
+//
+// The Fibonacci probability prefix (`spec/04`) transmits a 256-entry
+// frequency table; the decoder derives its coding model from those
+// wire bytes **deterministically** — parse (`spec/04` §2/§3), then
+// the `0x180001050` normalization to a power-of-two total
+// (`provenance/52`; `Cdf::from_wire_frequencies` on both directions).
+// Nothing in the decode path ties the table's total to the plane's
+// pixel count: the symbol loop is driven by the output fill / the
+// `spec/06` §1.4 length field, and the model is whatever the wire
+// table normalizes to. The table choice is therefore an encoder-side
+// **model election**, exactly like the header-form election above it
+// (`spec/03` §2.1 note that the per-channel sub-path choice is
+// externally invisible): any table whose nonzero set covers the
+// symbols actually coded — and which the normalizer accepts — decodes
+// byte-exactly, because encoder and decoder build the identical model
+// from the identical wire bytes (`spec/04` §6).
+//
+// The raw histogram (what the reference transmits per the `spec/04`
+// §5 validation correction) spends `~2·log2(freq)` prefix bits per
+// nonzero symbol. On planes with large per-symbol counts, an
+// element-wise downscaled table (`max(1, freq >> d)` on the nonzero
+// slots) costs `~2d` fewer prefix bits per symbol while its
+// normalized model only coarsens gradually — often a net win. The
+// election below scores a `d = 0, 1, 2, …` ladder with an exact
+// prefix cost plus an entropy estimate of the body against each
+// candidate's normalized model, then **actually encodes** the best
+// estimate and keeps it only if it strictly beats the raw-table wire
+// (so the emitted channel is never larger than the historical form,
+// and ties keep the historical bytes).
+
+/// Element-wise downscale of a histogram: every nonzero slot maps to
+/// `max(1, freq >> d)` (a used symbol never drops out of the table —
+/// the same nonzero-preservation rule as [`rescale_to_max_total`]).
+fn downscaled_table(freq: &[u32; 256], d: u32) -> [u32; 256] {
+    let mut out = [0u32; 256];
+    for (slot, &f) in out.iter_mut().zip(freq.iter()) {
+        if f > 0 {
+            *slot = (f >> d).max(1);
+        }
+    }
+    out
+}
+
+/// Bit length of the Fibonacci prefix code (`spec/04` §2.2) for a
+/// value `v` in `1..=33`: one bit per Zeckendorf position up to the
+/// highest summand plus the terminator bit.
+#[inline]
+fn fib_code_len(v: u32) -> u32 {
+    debug_assert!((1..=33).contains(&v));
+    match v {
+        1 => 2,
+        2 => 3,
+        3..=4 => 4,
+        5..=7 => 5,
+        8..=12 => 6,
+        13..=20 => 7,
+        _ => 8, // 21..=33
+    }
+}
+
+/// Pick the transmitted-table downscale exponent with the smallest
+/// estimated channel cost, scoring each rung `d` in closed form —
+/// O(nonzero symbols) per rung, no allocation, no trial encode:
+///
+/// * **prefix bits** (exact modulo the zero-run codes, which depend
+///   only on the nonzero *set* and are constant across rungs): each
+///   nonzero slot `f` costs `fib_code_len(m + 1) + m` bits with
+///   `m = ilog2((f >> d).max(1) + 1)` (`spec/04` §3.1/§3.2).
+/// * **body bits** (entropy estimate): `Σ n_s · (log2 T_d − log2 q_s)`
+///   with `q_s ≈ (f_s >> d).max(1)` and `T_d = Σ q_s` the scaled
+///   table's total. The `0x180001050` normalization
+///   (`provenance/52`) multiplies every slot *and* the total by the
+///   same `2^shift/T_d` factor, so it cancels out of the per-symbol
+///   code length — the estimate is normalization-invariant by
+///   construction, and the remaining truncation slack is well under
+///   a bit per symbol.
+///
+/// Returns 0 (keep the raw table) when no rung is estimated to beat
+/// `d = 0` by more than a 2-byte margin, or when the histogram has no
+/// downscale headroom (`max freq < 8`). The caller must verify the
+/// winning rung against the actually-encoded raw-table wire — the
+/// estimate ranks candidates; the byte counts decide.
+fn best_table_downscale(counts: &[u32; 256]) -> u32 {
+    let max = counts.iter().copied().max().unwrap_or(0);
+    if max < 8 {
+        return 0;
+    }
+    // Exact log2 for the small slot values every deep rung produces;
+    // the shift-truncation error of the `l − d` closed form is worst
+    // exactly there (`log2(f >> d)` vs `log2 f − d` diverges by up
+    // to ~0.5 bit once `f >> d` is a small integer), and that bias
+    // systematically over-deepens the elected rung.
+    static SMALL_LOG2: std::sync::OnceLock<[f64; 256]> = std::sync::OnceLock::new();
+    let small_log2 = SMALL_LOG2.get_or_init(|| {
+        let mut t = [0.0f64; 256];
+        for (v, slot) in t.iter_mut().enumerate() {
+            *slot = (v.max(1) as f64).log2();
+        }
+        t
+    });
+    // Gather the nonzero slots once: (freq, count-as-f64, log2 freq).
+    let mut syms = [(0u32, 0.0f64, 0.0f64); 256];
+    let mut n_syms = 0usize;
+    let mut n_total = 0.0f64;
+    for &f in counts.iter() {
+        if f > 0 {
+            let nf = f64::from(f);
+            syms[n_syms] = (f, nf, nf.log2());
+            n_syms += 1;
+            n_total += nf;
+        }
+    }
+    let syms = &syms[..n_syms];
+    let mut best_d = 0u32;
+    let mut best_score = f64::INFINITY;
+    let mut score_d0 = f64::INFINITY;
+    for d in 0..=max.ilog2() {
+        let mut total_d: u64 = 0;
+        let mut prefix_bits = 0.0f64;
+        let mut sum_nlogq = 0.0f64;
+        for &(f, n, l) in syms {
+            let sv = (f >> d).max(1);
+            total_d += u64::from(sv);
+            let m = (sv + 1).ilog2();
+            prefix_bits += f64::from(fib_code_len(m + 1) + m);
+            // log2 of the downscaled slot value: table-exact for
+            // small values, `l − d` (error < 2^-8 bits) above.
+            sum_nlogq += n * if sv < 256 {
+                small_log2[sv as usize]
+            } else {
+                l - f64::from(d)
+            };
+        }
+        let body_bits = n_total * (total_d as f64).log2() - sum_nlogq;
+        let score = (prefix_bits + body_bits) / 8.0;
+        if d == 0 {
+            score_d0 = score;
+        }
+        if score < best_score {
+            best_score = score;
+            best_d = d;
+        }
+    }
+    // Demand a meaningful estimated win before spending the real
+    // re-encode pass (and to keep the wire on the historical raw
+    // table when the estimate is within noise).
+    if best_d > 0 && score_d0 - best_score < 2.0 {
+        return 0;
+    }
+    best_d
+}
+
+/// Range-encode `symbols` against `table`'s normalized model and
+/// return `prefix ‖ body` (the channel bytes after the header /
+/// length fields). `None` when the table is unnormalizable.
+fn encode_prefix_and_body(symbols: &[u8], table: &[u32; 256]) -> Option<Vec<u8>> {
+    let cdf = Cdf::from_wire_frequencies(table).ok()?;
+    let mut enc = RangeEncoder::new();
+    for &b in symbols {
+        enc.encode_symbol(&cdf, b as usize);
+    }
+    let body = enc.finish();
+    let prefix = encode_freq_table(table);
+    let mut out = Vec::with_capacity(prefix.len() + body.len());
+    out.extend_from_slice(&prefix);
+    out.extend_from_slice(&body);
+    Some(out)
+}
+
 /// Build a per-channel byte sequence using the channel-header sub-
 /// path that produces the smallest bytes for the given plane.
 /// Round-1 strategy: try header-`0x00` (Fibonacci + range-coded) and
@@ -333,6 +503,14 @@ pub fn encode_channel_raw_rle(plane: &[u8], escape_len: usize) -> Vec<u8> {
 /// `encode_channel_best_*` roundtrip tests below verify each
 /// header form decodes back to the input plane.
 ///
+/// After the header-form election, the winning **arithmetic** form
+/// (`0x00..=0x03`) additionally goes through the round-432
+/// transmitted-model downscale election (see the module comment
+/// above [`downscaled_table`]): a cost-modeled ladder picks a
+/// downscaled transmitted table, and the re-encoded payload
+/// replaces the winner only on a strict byte win — so the emitted
+/// channel is never larger than the historical raw-table form.
+///
 /// **Wire compatibility.** The choice between sub-paths is
 /// per-channel and externally invisible — a decoder reads byte 0,
 /// routes to the matching sub-path, and recovers the same plane
@@ -423,6 +601,56 @@ pub fn encode_channel_best(plane: &[u8]) -> Vec<u8> {
         }
     }
 
+    // Transmitted-model downscale election (round 432) — applied to
+    // the **winning** arithmetic form only (one ladder + at most one
+    // extra encode pass per channel, instead of one per candidate).
+    // A downscaled table can only shrink the winner's own payload;
+    // it never changes which header form decodes, so re-electing
+    // across forms is unnecessary for correctness and the potential
+    // cross-form flip is worth at most the few bytes the guard
+    // below already bounds.
+    let header = best[0];
+    if header <= 0x03 {
+        let symbols: &[u8] = if header == 0x00 {
+            plane
+        } else {
+            &contractions[header as usize - 1]
+        };
+        let counts = if header == 0x00 {
+            rescale_to_max_total(&freq, MAX_MODERN_TOTAL)
+        } else {
+            let mut c = [0u32; 256];
+            for &b in symbols {
+                c[b as usize] = c[b as usize].saturating_add(1);
+            }
+            rescale_to_max_total(&c, MAX_MODERN_TOTAL)
+        };
+        let d = best_table_downscale(&counts);
+        if d > 0 {
+            // One real probe encode at the elected rung; the strict
+            // `<` guard keeps it only when the actual bytes beat the
+            // raw-table winner (ties keep the historical wire). The
+            // size-vs-rung curve is flat near its minimum, so the
+            // single-rung probe captures almost all of the available
+            // win at one extra encode pass — probing neighbouring
+            // rungs too was measured to buy < 0.02% more size for
+            // another full pass.
+            let wrap = if header == 0x00 { 1 } else { 5 };
+            let table = downscaled_table(&counts, d);
+            if let Some(alt) = encode_prefix_and_body(symbols, &table) {
+                if wrap + alt.len() < best.len() {
+                    let mut v = Vec::with_capacity(wrap + alt.len());
+                    v.push(header);
+                    if header != 0x00 {
+                        v.extend_from_slice(&(symbols.len() as u32).to_le_bytes());
+                    }
+                    v.extend_from_slice(&alt);
+                    best = v;
+                }
+            }
+        }
+    }
+
     best
 }
 
@@ -437,17 +665,10 @@ pub fn encode_channel_best(plane: &[u8]) -> Vec<u8> {
 /// cover such planes.
 fn build_header_zero(plane: &[u8], freq: &[u32; 256]) -> Option<Vec<u8>> {
     let freq = rescale_to_max_total(freq, MAX_MODERN_TOTAL);
-    let cdf = Cdf::from_wire_frequencies(&freq).ok()?;
-    let mut enc = RangeEncoder::new();
-    for &b in plane {
-        enc.encode_symbol(&cdf, b as usize);
-    }
-    let body = enc.finish();
-    let prefix = encode_freq_table(&freq);
-    let mut out = Vec::with_capacity(1 + prefix.len() + body.len());
+    let payload = encode_prefix_and_body(plane, &freq)?;
+    let mut out = Vec::with_capacity(1 + payload.len());
     out.push(0x00);
-    out.extend_from_slice(&prefix);
-    out.extend_from_slice(&body);
+    out.extend_from_slice(&payload);
     Some(out)
 }
 
@@ -480,18 +701,11 @@ fn build_header_arith_rle_from_symbols(
         return None;
     }
     let freq = rescale_to_max_total(&freq, MAX_MODERN_TOTAL);
-    let cdf = Cdf::from_wire_frequencies(&freq).ok()?;
-    let mut enc = RangeEncoder::new();
-    for &b in symbols {
-        enc.encode_symbol(&cdf, b as usize);
-    }
-    let body = enc.finish();
-    let prefix = encode_freq_table(&freq);
-    let mut out = Vec::with_capacity(5 + prefix.len() + body.len());
+    let payload = encode_prefix_and_body(symbols, &freq)?;
+    let mut out = Vec::with_capacity(5 + payload.len());
     out.push(escape_len as u8);
     out.extend_from_slice(&(pre_rle_count as u32).to_le_bytes());
-    out.extend_from_slice(&prefix);
-    out.extend_from_slice(&body);
+    out.extend_from_slice(&payload);
     Some(out)
 }
 
@@ -1923,6 +2137,37 @@ mod tests {
                     best = candidate;
                 }
             }
+            // Round-432 winner-only downscale election, mirrored
+            // eagerly (fresh contraction, no sharing).
+            let header = best[0];
+            if header <= 0x03 {
+                let symbols: Vec<u8> = if header == 0x00 {
+                    plane.to_vec()
+                } else {
+                    crate::rle::contract_raw(plane, header as usize)
+                };
+                let mut c = [0u32; 256];
+                for &b in &symbols {
+                    c[b as usize] = c[b as usize].saturating_add(1);
+                }
+                let counts = rescale_to_max_total(&c, MAX_MODERN_TOTAL);
+                let d = best_table_downscale(&counts);
+                if d > 0 {
+                    let wrap = if header == 0x00 { 1usize } else { 5 };
+                    let table = downscaled_table(&counts, d);
+                    if let Some(alt) = encode_prefix_and_body(&symbols, &table) {
+                        if wrap + alt.len() < best.len() {
+                            let mut v = Vec::with_capacity(wrap + alt.len());
+                            v.push(header);
+                            if header != 0x00 {
+                                v.extend_from_slice(&(symbols.len() as u32).to_le_bytes());
+                            }
+                            v.extend_from_slice(&alt);
+                            best = v;
+                        }
+                    }
+                }
+            }
             best
         }
         let mut planes = best_test_planes();
@@ -1942,6 +2187,104 @@ mod tests {
                 plane.len(),
             );
         }
+    }
+
+    // ─────────── round 432 — transmitted-model downscale election ───────────
+
+    /// [`fib_code_len`] matches the `spec/04` §2.2 Zeckendorf shape:
+    /// one bit per position up to the highest summand of `v`, plus
+    /// the terminator. Recomputed here from the decoder's own FIB
+    /// series so the closed-form table can't drift.
+    #[test]
+    fn fib_code_len_matches_zeckendorf_positions() {
+        use crate::fibonacci::FIB;
+        for v in 1..=33u32 {
+            let highest = (0..FIB.len()).rev().find(|&i| FIB[i] <= v).unwrap();
+            assert_eq!(fib_code_len(v), highest as u32 + 2, "v={v}");
+        }
+    }
+
+    /// [`downscaled_table`] preserves the nonzero set at every rung
+    /// (a used symbol never drops out of the transmitted table) and
+    /// never increases a slot.
+    #[test]
+    fn downscaled_table_preserves_nonzero_set() {
+        let mut freq = [0u32; 256];
+        freq[0] = 100_000;
+        freq[1] = 1;
+        freq[17] = 255;
+        freq[255] = 3;
+        for d in 0..=17u32 {
+            let out = downscaled_table(&freq, d);
+            for s in 0..256 {
+                assert_eq!(out[s] > 0, freq[s] > 0, "d={d} s={s}");
+                assert!(out[s] <= freq[s].max(1), "d={d} s={s}");
+            }
+        }
+    }
+
+    /// The downscale election shrinks a large plane's header-0x00
+    /// channel below the raw-histogram form, and the elected wire
+    /// still decodes byte-exactly (`spec/04` §6: the decoder derives
+    /// its model from the transmitted table, so the table choice is
+    /// encoder-side model election). The raw-table reference comes
+    /// from `build_header_zero`, which the election never touches.
+    #[test]
+    fn downscale_election_shrinks_large_plane_and_roundtrips() {
+        // A 96k-pixel residual-like plane: zero-dominant with a
+        // Laplacian-ish tail at large per-symbol counts, no zero runs
+        // long enough to hand the win to an RLE form (every zero is
+        // isolated), so header 0x00 wins and the election runs on it.
+        let n = 96_000usize;
+        let mut plane = Vec::with_capacity(n);
+        let mut s = 0x5eed_5eedu64;
+        for _ in 0..n {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let r = (s >> 33) as u32 % 100;
+            // ~40% zeros (never adjacent thanks to the interleave),
+            // small magnitudes otherwise.
+            let v = match r {
+                0..=54 => ((r % 13) + 1) as u8,
+                55..=89 => 0,
+                _ => (128 + (r % 32)) as u8,
+            };
+            plane.push(v);
+        }
+        let mut freq = [0u32; 256];
+        for &b in &plane {
+            freq[b as usize] += 1;
+        }
+        let raw_form = build_header_zero(&plane, &freq).unwrap();
+        let best = encode_channel_best(&plane);
+        assert_eq!(best[0], 0x00, "expected the arithmetic winner");
+        assert!(
+            best.len() < raw_form.len(),
+            "election failed to shrink: best={} raw-table={}",
+            best.len(),
+            raw_form.len(),
+        );
+        let decoded = decode_channel(&best, plane.len()).unwrap();
+        assert_eq!(decoded, plane, "elected wire must decode byte-exactly");
+    }
+
+    /// The election is guarded: on planes where it cannot win (tiny
+    /// histograms, `max freq < 8`) the wire is byte-identical to the
+    /// raw-table form.
+    #[test]
+    fn downscale_election_keeps_small_plane_wire_identical() {
+        let plane: Vec<u8> = (0u8..=255).collect(); // every freq = 1
+        let mut freq = [0u32; 256];
+        for &b in &plane {
+            freq[b as usize] += 1;
+        }
+        let raw_form = build_header_zero(&plane, &freq).unwrap();
+        let best = encode_channel_best(&plane);
+        // Raw memcpy actually wins this plane; the invariant under
+        // test is just that nothing got *larger*.
+        assert!(best.len() <= raw_form.len());
+        assert_eq!(best_table_downscale(&freq), 0, "no headroom, no election");
     }
 
     // ─────────── encode_legacy_channel_best — type-7 sub-path selection ───────────

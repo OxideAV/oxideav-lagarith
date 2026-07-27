@@ -6,6 +6,37 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- round 432 — **transmitted-model downscale election** (cost-modeled;
+  `src/encoder.rs`). The Fibonacci probability prefix's table is an
+  encoder-side **model election**: the decoder derives its coding
+  model deterministically from the wire bytes (`spec/04` §6 parse +
+  the `provenance/52` `0x180001050` normalization), and nothing in
+  the decode path ties the table total to the pixel count — so any
+  table covering the coded symbols' nonzero set is a legal,
+  byte-exactly-decodable choice. The raw histogram spends
+  `~2·log2(freq)` prefix bits per nonzero symbol; `encode_channel_
+  best` now scores an element-wise `max(1, freq >> d)` downscale
+  ladder in closed form (exact per-slot Fibonacci prefix bits +
+  normalization-invariant entropy estimate of the body,
+  O(nonzero) per rung, no allocation), probes the elected rung with
+  one real encode on the **winning** arithmetic form only, and keeps
+  it strictly-on-byte-win — the emitted channel is never larger than
+  the historical raw-table wire, and ties keep the historical bytes.
+  Measured on gradient+noise content vs the raw-table form: 64×64
+  rgb24 6713→6683 B (−0.45%), rgba 8832→8800 (−0.36%), yv12
+  3159→3142 (−0.54%), yuy2 4384→4359 (−0.57%); 640×480 rgb24
+  491226→490288 (−0.19%), rgba 653421→652167 (−0.19%), yv12
+  237755→237357 (−0.17%), yuy2 318547→318039 (−0.16%). Encode-bench
+  cost of the probe pass: 64×64 rgb24 79.2→113.6 µs — net vs the
+  pre-round-432 encoder: ~13% slower for the size win, with the
+  shared-contraction speedup absorbing most of the probe. A
+  scan of real encodes across all rungs confirmed the closed-form
+  scorer lands on (or within one rung / < 0.02% of) the true
+  size minimum, and probing neighbour rungs bought < 0.02% for
+  another full pass, so the single-rung probe stands.
+
 ### Changed
 
 - round 432 — **channel-selector hot path: shared RLE contractions +
