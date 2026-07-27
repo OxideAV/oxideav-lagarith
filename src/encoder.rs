@@ -2453,6 +2453,34 @@ mod tests {
         }
     }
 
+    /// Frozen decisions of the round-432 downscale scorer on three
+    /// canonical histogram shapes — a drift alarm for the closed-form
+    /// cost model (`fib_code_len` table, entropy terms, gate margin):
+    /// an accidental change to any term shows up as a different
+    /// elected rung here before it shows up as silent wire churn.
+    #[test]
+    fn downscale_scorer_decision_pins() {
+        // (a) Zero-dominant with a wide rare tail at ~100k count —
+        // the residual profile the election targets.
+        let mut a = [0u32; 256];
+        a[0] = 100_000;
+        for s in 1..=120usize {
+            a[s] = 1 + (s as u32 % 7) * 40;
+        }
+        // (b) Two heavy symbols only — nothing but two large slots;
+        // downscale buys ~2 bits of prefix per rung at almost no
+        // body cost.
+        let mut b = [0u32; 256];
+        b[10] = 60_000;
+        b[200] = 40_000;
+        // (c) 256 unit frequencies — no headroom, must stay raw.
+        let c = [1u32; 256];
+        let da = best_table_downscale(&a);
+        let db = best_table_downscale(&b);
+        let dc = best_table_downscale(&c);
+        assert_eq!((da, db, dc), (3u32, 7u32, 0), "scorer decisions drifted");
+    }
+
     /// The round-432 estimate pruning of the arith+RLE candidate set
     /// picks the same escape length the exhaustive walk would: on
     /// every fixture plane, the pruned selector's channel is exactly

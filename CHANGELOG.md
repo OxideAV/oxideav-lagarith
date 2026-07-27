@@ -138,6 +138,19 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Tested
 
+- round 432 — **fuzz + pin coverage for the new encoder paths**
+  (`roundtrip_tests::encoder_fuzz_harness`, `encoder::tests`). A new
+  public-`encode_frame` fuzz loop drives large planes (10k–30k
+  pixels/plane, where the downscale election has headroom) × all
+  four host families × flat-with-impulses and gradient content —
+  residual zero runs span multiple full-capacity `spec/05` escapes
+  and the election / pruning / gate all engage — asserting byte-
+  exact self-roundtrip per iteration. Three canonical histogram
+  shapes freeze the scorer's elected rungs
+  (`downscale_scorer_decision_pins`) so a change to any cost-model
+  term surfaces as a deliberate pin update rather than silent wire
+  churn.
+
 - round 407 — normalizer unit suite (`model::tests`): pow2 identity
   fast path (incl. `total = 1` and the `2^31` ceiling),
   unit-frequency deficit distribution, `& 0x7f` cursor wrap, the

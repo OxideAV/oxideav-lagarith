@@ -6060,6 +6060,81 @@ mod encoder_fuzz_harness {
         }
     }
 
+    /// Piecewise-flat content with sparse impulses: long constant
+    /// stretches (→ residual zero runs far past one escape's
+    /// capacity, driving the round-432 full-capacity `spec/05` §5.4
+    /// chunking) with occasional level steps and isolated impulses
+    /// (→ non-degenerate histograms that keep the arithmetic forms
+    /// and the model election in play).
+    fn flat_impulse_bytes(state: &mut u64, n: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(n);
+        let mut level = (lcg_next(state) >> 32) as u8;
+        for i in 0..n {
+            if i % 331 == 0 {
+                // Occasional step.
+                level = level.wrapping_add(((lcg_next(state) >> 40) & 0x0f) as u8);
+            }
+            let b = if lcg_next(state) % 191 == 0 {
+                // Sparse impulse.
+                (lcg_next(state) >> 33) as u8
+            } else {
+                level
+            };
+            out.push(b);
+        }
+        out
+    }
+
+    /// Round-432 paths under fuzz, via the **public** `encode_frame`
+    /// dispatcher: large planes (10k–30k pixels per plane, where the
+    /// transmitted-model downscale election has headroom and fires)
+    /// × content whose residuals carry both multi-escape zero runs
+    /// (full-capacity `spec/05` chunks) and mixed-magnitude tails
+    /// (the cost-model gate and the arith+RLE pruning both engage).
+    /// Every iteration must round-trip byte-exactly through
+    /// `decode_frame`.
+    #[test]
+    fn fuzz_large_plane_election_and_long_runs_roundtrip() {
+        let kinds = [
+            PixelKind::Bgr24,
+            PixelKind::Bgra32,
+            PixelKind::Yv12,
+            PixelKind::Yuy2,
+        ];
+        let mut state = 0x432c_0de1_ec71_0432u64;
+        for iter in 0..10u32 {
+            // Even dims (YV12/YUY2-legal), spanning ~100x60 to ~180x120.
+            let w = 2 * (50 + (lcg_next(&mut state) % 41) as u32);
+            let h = 2 * (30 + (lcg_next(&mut state) % 31) as u32);
+            for &kind in &kinds {
+                let content_seed = state;
+                let n = kind.buffer_len(w, h);
+                // Alternate flat-impulse and gradient+noise content.
+                let pixels = if iter % 2 == 0 {
+                    flat_impulse_bytes(&mut state, n)
+                } else {
+                    let mut p = Vec::with_capacity(n);
+                    for i in 0..n {
+                        let grad = (i as u64 / 11) as u8;
+                        let noise = ((lcg_next(&mut state) >> 40) & 0x03) as u8;
+                        p.push(grad.wrapping_add(noise));
+                    }
+                    p
+                };
+                let frame = crate::encode_frame(&pixels, w, h, kind).unwrap_or_else(|e| {
+                    panic!("large-plane iter {iter} {kind:?} {w}x{h} seed={content_seed:#x}: {e:?}")
+                });
+                let dec = decode_frame(&frame, w, h, kind).unwrap_or_else(|e| {
+                    panic!("large-plane iter {iter} {kind:?} {w}x{h} seed={content_seed:#x}: {e:?}")
+                });
+                assert_eq!(
+                    dec.pixels, pixels,
+                    "large-plane iter {iter} {kind:?} {w}x{h} seed={content_seed:#x}: not byte-exact",
+                );
+            }
+        }
+    }
+
     /// Legacy RGB (type 7): the adaptive-CDF range coder.
     #[test]
     fn fuzz_legacy_rgb_roundtrip() {
