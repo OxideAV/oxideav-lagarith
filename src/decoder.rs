@@ -59,16 +59,23 @@ pub enum PixelKind {
 impl PixelKind {
     /// Byte length of the decoded buffer for this pixel format at
     /// the given dimensions.
+    ///
+    /// **Saturating**: dimension products a `usize` cannot represent
+    /// clamp to `usize::MAX` instead of overflowing (a debug-build
+    /// panic / release-build wraparound before round 432). No real
+    /// buffer can be that long, so both `encode_frame`'s length
+    /// check and `decode_frame`'s representability guard turn a
+    /// saturated result into a clean [`Error::BadDimensions`].
     pub fn buffer_len(self, width: u32, height: u32) -> usize {
-        let n = width as usize * height as usize;
+        let n = (width as usize).saturating_mul(height as usize);
         match self {
-            Self::Bgr24 => n * 3,
-            Self::Bgra32 => n * 4,
+            Self::Bgr24 => n.saturating_mul(3),
+            Self::Bgra32 => n.saturating_mul(4),
             // YV12: Y + V + U with chroma at quarter resolution.
             // Chroma is `floor((W * H) / 4)` per `spec/03` §6.1.1.
-            Self::Yv12 => n + 2 * (n / 4),
+            Self::Yv12 => n.saturating_add(2 * (n / 4)),
             // YUY2: packed `Y0 U Y1 V` — 2 bytes per pixel.
-            Self::Yuy2 => n * 2,
+            Self::Yuy2 => n.saturating_mul(2),
         }
     }
 
@@ -185,6 +192,16 @@ pub fn decode_frame(
         return Err(Error::NullFrame);
     }
     if width == 0 || height == 0 {
+        return Err(Error::BadDimensions { width, height });
+    }
+    // Representability guard (round 432): a decoded buffer longer
+    // than `isize::MAX` cannot exist as a Rust allocation, so
+    // dimensions requiring one are a caller error — surfaced here
+    // as a clean `BadDimensions` instead of a downstream capacity
+    // panic in whichever per-type path allocates first (the solid
+    // paths validate only their fixed 2–5-byte payload, so without
+    // this guard they would attempt the allocation).
+    if pixel_kind.buffer_len(width, height) > isize::MAX as usize {
         return Err(Error::BadDimensions { width, height });
     }
     let frame_type = FrameType::from_byte(payload[0])?;

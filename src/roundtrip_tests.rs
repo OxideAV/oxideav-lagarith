@@ -819,6 +819,46 @@ fn null_frame_dimension_mismatch_errors() {
 }
 
 #[test]
+fn absurd_dimensions_error_cleanly_on_both_directions() {
+    // Round-432 hardening: dimensions whose decoded buffer cannot
+    // exist as a Rust allocation must surface `BadDimensions` on
+    // both public entry points — previously `buffer_len` overflowed
+    // (debug panic / release wraparound), and the solid decode paths
+    // (which validate only their fixed 2–5-byte payload) would have
+    // reached the allocator with a saturated capacity.
+    let kinds = [
+        PixelKind::Bgr24,
+        PixelKind::Bgra32,
+        PixelKind::Yv12,
+        PixelKind::Yuy2,
+    ];
+    for &kind in &kinds {
+        // Encode side: no real buffer can match the required length.
+        let r = crate::encode_frame(&[0u8; 12], u32::MAX, u32::MAX, kind);
+        assert!(
+            matches!(r, Err(crate::Error::BadDimensions { .. })),
+            "encode {kind:?}: {r:?}"
+        );
+        // Decode side, solid-grey payload (the first-allocating path
+        // without the guard) and a raw-ish arithmetic payload.
+        for payload in [&[5u8, 0x40][..], &[4, 0, 0, 0, 0, 0, 0, 0, 0][..]] {
+            let r = decode_frame(payload, u32::MAX, u32::MAX, kind);
+            assert!(
+                matches!(r, Err(crate::Error::BadDimensions { .. })),
+                "decode {kind:?} {payload:?}: {r:?}"
+            );
+        }
+    }
+    // `buffer_len` saturates instead of wrapping: (2^32-1)^2 pixels
+    // fits a u64, but every per-format byte multiplier pushes past
+    // usize::MAX.
+    assert_eq!(PixelKind::Bgra32.buffer_len(u32::MAX, u32::MAX), usize::MAX);
+    assert_eq!(PixelKind::Bgr24.buffer_len(u32::MAX, u32::MAX), usize::MAX);
+    assert_eq!(PixelKind::Yuy2.buffer_len(u32::MAX, u32::MAX), usize::MAX);
+    assert_eq!(PixelKind::Yv12.buffer_len(u32::MAX, u32::MAX), usize::MAX);
+}
+
+#[test]
 fn yv12_unsupported_pixel_format_for_rgb_frame() {
     // Asking for Yv12 against an RGB frame is also a mismatch.
     let pixels = pattern_bgr24(4, 4);

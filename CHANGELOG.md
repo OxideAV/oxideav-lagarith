@@ -37,6 +37,23 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   size minimum, and probing neighbour rungs bought < 0.02% for
   another full pass, so the single-rung probe stands.
 
+### Fixed
+
+- round 432 — **absurd-dimension hardening on both public entry
+  points** (`src/decoder.rs`). `PixelKind::buffer_len` multiplied
+  `width × height × bytes-per-pixel` unchecked, so dimensions whose
+  buffer cannot exist as a Rust allocation panicked in debug builds
+  (and wrapped in release, where a crafted length could then slip
+  past `encode_frame`'s equality check); the solid decode paths —
+  which validate only their fixed 2–5-byte payload — would have
+  reached the allocator with the bogus capacity. `buffer_len` now
+  saturates at `usize::MAX`, and `decode_frame` rejects any
+  dimensions requiring a buffer beyond `isize::MAX` (the Rust
+  allocation ceiling) with a clean `Error::BadDimensions` before
+  dispatch. Covered on every pixel kind × both directions by
+  `absurd_dimensions_error_cleanly_on_both_directions`, which runs
+  in debug CI where the old code panicked.
+
 ### Changed
 
 - round 432 — **cost-model gate on the arithmetic encode passes**
