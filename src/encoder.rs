@@ -300,6 +300,19 @@ fn best_table_downscale(counts: &[u32; 256]) -> u32 {
     best_d
 }
 
+/// Slack, in bytes, the candidate gates grant the cost model before
+/// declaring an arithmetic form unable to win against a known-length
+/// (raw / raw+RLE) form and skipping its encode pass.
+///
+/// The estimator's body term is the entropy of the stream under its
+/// own histogram; an arithmetic coder's output cannot undercut that
+/// bound by more than a few bytes of framing slack (and the
+/// `0x180001050` normalization can only *raise* the cross-entropy),
+/// while the exact-prefix term never under-counts. So a form whose
+/// estimate exceeds a known length by this margin can never actually
+/// win or tie it, and skipping its encode pass is outcome-invisible.
+const EST_GATE_MARGIN: f64 = 16.0;
+
 /// Estimated arithmetic payload size in bytes — exact Fibonacci
 /// prefix (`encode_freq_table` on the transmitted table) plus the
 /// entropy of coding the same histogram against itself
@@ -578,12 +591,36 @@ pub fn encode_channel_best(plane: &[u8]) -> Vec<u8> {
         contract_raw(plane, 3),
     ];
 
+    // Shortest **known-length** form: raw memcpy (`1 + n`) or a
+    // raw+RLE transport (`1 +` contraction length). These need no
+    // entropy pass, so they gate the arithmetic candidates below.
+    let known_raw_min = contractions
+        .iter()
+        .map(|c| 1 + c.len())
+        .fold(1 + plane.len(), usize::min);
+
     // Candidate 0x00 — Fibonacci-prefix + arithmetic, no RLE. `None`
     // only for unnormalizable histograms (`provenance/52` §2 step 3),
     // which the always-legal raw candidate below covers; seeding with
     // raw there keeps the lower-header tie-break intact for every
     // plane that has a legal 0x00 form.
-    let mut best = build_header_zero(plane, &freq).unwrap_or_else(|| {
+    //
+    // Round-432 gate: when the cost model puts the arithmetic form
+    // more than [`EST_GATE_MARGIN`] beyond the best known-length raw
+    // form, its encode pass cannot win and is skipped outright —
+    // the arithmetic body's byte count is information-theoretically
+    // bounded below by the estimator's entropy term (minus a
+    // few-byte coder constant), so the gate can never suppress a
+    // form that would actually have won or tied. High-entropy planes
+    // (the frame-level type-1 fallback class) now skip the range
+    // coder entirely.
+    let est0 = 1.0 + estimate_arith_payload(&rescale_to_max_total(&freq, MAX_MODERN_TOTAL));
+    let mut best = if est0 <= known_raw_min as f64 + EST_GATE_MARGIN {
+        build_header_zero(plane, &freq)
+    } else {
+        None
+    }
+    .unwrap_or_else(|| {
         let mut v = Vec::with_capacity(1 + plane.len());
         v.push(0x04);
         v.extend_from_slice(plane);
@@ -622,13 +659,18 @@ pub fn encode_channel_best(plane: &[u8]) -> Vec<u8> {
             rle_pick = Some(escape_len);
         }
     }
+    // Same gate as the 0x00 form: encode the picked arith+RLE
+    // candidate only when the estimate says it can still beat the
+    // best actual-or-known length.
     if let Some(escape_len) = rle_pick {
-        let symbols = &contractions[escape_len - 1];
-        if let Some(candidate) =
-            build_header_arith_rle_from_symbols(plane.len(), symbols, escape_len)
-        {
-            if candidate.len() < best.len() {
-                best = candidate;
+        if rle_pick_est <= best.len().min(known_raw_min) as f64 + EST_GATE_MARGIN {
+            let symbols = &contractions[escape_len - 1];
+            if let Some(candidate) =
+                build_header_arith_rle_from_symbols(plane.len(), symbols, escape_len)
+            {
+                if candidate.len() < best.len() {
+                    best = candidate;
+                }
             }
         }
     }
@@ -2163,7 +2205,16 @@ mod tests {
             if freq.iter().filter(|&&f| f > 0).count() == 1 {
                 return vec![0xff, plane[0]];
             }
-            let mut best = build_header_zero(plane, &freq).unwrap_or_else(|| {
+            let known_raw_min = (1..=3usize)
+                .map(|e| 1 + crate::rle::contract_raw(plane, e).len())
+                .fold(1 + plane.len(), usize::min);
+            let est0 = 1.0 + estimate_arith_payload(&rescale_to_max_total(&freq, MAX_MODERN_TOTAL));
+            let mut best = if est0 <= known_raw_min as f64 + EST_GATE_MARGIN {
+                build_header_zero(plane, &freq)
+            } else {
+                None
+            }
+            .unwrap_or_else(|| {
                 let mut v = Vec::with_capacity(1 + plane.len());
                 v.push(0x04);
                 v.extend_from_slice(plane);
@@ -2193,12 +2244,14 @@ mod tests {
                 }
             }
             if let Some(escape_len) = rle_pick {
-                let symbols = crate::rle::contract_raw(plane, escape_len);
-                if let Some(candidate) =
-                    build_header_arith_rle_from_symbols(plane.len(), &symbols, escape_len)
-                {
-                    if candidate.len() < best.len() {
-                        best = candidate;
+                if rle_pick_est <= best.len().min(known_raw_min) as f64 + EST_GATE_MARGIN {
+                    let symbols = crate::rle::contract_raw(plane, escape_len);
+                    if let Some(candidate) =
+                        build_header_arith_rle_from_symbols(plane.len(), &symbols, escape_len)
+                    {
+                        if candidate.len() < best.len() {
+                            best = candidate;
+                        }
                     }
                 }
             }
@@ -2344,6 +2397,60 @@ mod tests {
         );
         let decoded = decode_channel(&best, plane.len()).unwrap();
         assert_eq!(decoded, plane, "elected wire must decode byte-exactly");
+    }
+
+    /// The round-432 cost-model gate never changes the selector's
+    /// outcome: across content classes from all-zero to full-entropy
+    /// random, the gated selector's channel is exactly as short as
+    /// the true minimum over ALL forms encoded eagerly (header 0x00,
+    /// every arith+RLE escape length, raw, every raw+RLE escape
+    /// length) — the gate only skips encode passes that cannot win.
+    #[test]
+    fn gate_never_changes_outcome_across_entropy_classes() {
+        let mut planes: Vec<Vec<u8>> = Vec::new();
+        let mut s = 0xfeed_beefu64;
+        for entropy_mask in [0x00u8, 0x03, 0x1f, 0xff] {
+            for len in [64usize, 500, 4096] {
+                let mut p = Vec::with_capacity(len);
+                for _ in 0..len {
+                    s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    p.push(((s >> 40) as u8) & entropy_mask);
+                }
+                planes.push(p);
+            }
+        }
+        for plane in &planes {
+            let best = encode_channel_best(plane);
+            // True minimum over every eagerly-encoded form.
+            let mut lens = vec![1 + plane.len()];
+            let mut freq = [0u32; 256];
+            for &b in plane {
+                freq[b as usize] = freq[b as usize].saturating_add(1);
+            }
+            if freq.iter().filter(|&&f| f > 0).count() < 2 {
+                continue; // solid short-circuit, not the gate's domain
+            }
+            if let Some(z) = build_header_zero(plane, &freq) {
+                lens.push(z.len());
+            }
+            for e in 1..=3usize {
+                let symbols = crate::rle::contract_raw(plane, e);
+                lens.push(1 + symbols.len());
+                if let Some(c) = build_header_arith_rle_from_symbols(plane.len(), &symbols, e) {
+                    lens.push(c.len());
+                }
+            }
+            let true_min = lens.into_iter().min().unwrap();
+            assert!(
+                best.len() <= true_min,
+                "gated selector ({}) beaten by an eager form ({true_min}) on \
+                 plane len {}",
+                best.len(),
+                plane.len(),
+            );
+            let decoded = decode_channel(&best, plane.len()).unwrap();
+            assert_eq!(&decoded, plane);
+        }
     }
 
     /// The round-432 estimate pruning of the arith+RLE candidate set

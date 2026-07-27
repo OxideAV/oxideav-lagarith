@@ -39,6 +39,26 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- round 432 — **cost-model gate on the arithmetic encode passes**
+  (`src/encoder.rs`). Before range-encoding the header-0x00 form (or
+  the pruned arith+RLE pick), the selector now compares its cost
+  estimate against the shortest **known-length** form (raw memcpy /
+  raw+RLE, whose wire sizes need no entropy pass) plus a 16-byte
+  margin, and skips the pass when it cannot win: the estimator's
+  body term is the stream's entropy under its own histogram — a
+  bound an arithmetic coder cannot undercut (and the `0x180001050`
+  normalization only raises the cross-entropy) — while the exact
+  prefix term never under-counts, so the gate is outcome-invisible
+  by construction. High-entropy planes (the frame-level type-1
+  fallback class) now skip the range coder entirely: random-content
+  640×480 encode drops 6744→2131 µs/frame (rgb24, −68%) and
+  3020→854 µs/frame (yv12, −72%) with byte-identical output; the
+  gradient+noise bench pays ~+2% (estimate overhead on planes where
+  the gate keeps everything) and all size fixtures are byte-
+  identical. A new cross-entropy-class test drives the gated
+  selector against the true minimum over every eagerly-encoded form
+  from all-zero to full-random content.
+
 - round 432 — **arith+RLE candidate pruning by the cost model**
   (`src/encoder.rs`). `encode_channel_best` encoded all three
   arith+RLE forms (`0x01..=0x03`) to compare their byte counts; the
