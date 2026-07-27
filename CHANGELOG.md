@@ -6,6 +6,25 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- round 432 — **residual-RLE contraction reaches the full escape
+  capacity** (`src/rle.rs`). `contract_raw` now derives the
+  supplement byte from the `spec/05` §3.2 / §5.3 algebraic inverse
+  of the forward permutation LUT, unlocking paddings 254 / 255 that
+  the staged INV_LUT's index arithmetic (`INV_LUT[chunk - e + 2]`,
+  capped at index 255 = padding 253) could not express. Long zero
+  runs now split per the §5.4 canonical greedy emit — one escape per
+  `min(R - e, 255)` supplement — so a 4096-zero stretch at
+  `escape_len = 1` contracts to 32 bytes (16 × `[0x00, 0x80]`)
+  instead of 34 (measured; 5.9% smaller on that wire form, ~0.8%
+  fewer escape pairs asymptotically on very long runs). The staged
+  `tables/02` INV_LUT extract stays bundled as the machine-checked
+  cross-check of the algebraic inverse (`rle::tests` pins agreement
+  on the overlapping padding domain 0..=253 and full-range
+  forward-LUT inversion; `tables::tests` keeps the
+  `LUT[INV_LUT[k]] = k - 2` invariant).
+
 ### Added
 
 - round 407 — **`0x180001050` model normalizer wired into the modern

@@ -90,6 +90,13 @@ pub fn rle_fwd_lut() -> &'static [u8; 256] {
 ///
 /// The encoder mirror of [`rle_fwd_lut`]: maps a desired run length
 /// back to the supplement byte the decoder expands to that run.
+///
+/// Since the encoder's `contract_raw` moved to the `spec/05` §5.3
+/// algebraic inverse (full `0..=255` padding domain; the INV_LUT
+/// index form stops at 253), this staged extract serves as the
+/// machine-checked cross-check of that inverse (`tables::tests`
+/// and `rle::tests`) rather than a production lookup.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn rle_inv_lut() -> &'static [u8; 256] {
     static CACHE: OnceLock<[u8; 256]> = OnceLock::new();
     CACHE.get_or_init(|| parse_u8_csv::<256>(RLE_INV_LUT_CSV))
