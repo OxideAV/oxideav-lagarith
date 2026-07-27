@@ -56,6 +56,40 @@ fn yuy2_input(seed: u64) -> Vec<u8> {
     gradient_noise(seed, PixelKind::Yuy2.buffer_len(W, H))
 }
 
+/// Piecewise-constant content with occasional level steps — residuals
+/// are zero-run-dominated, keeping the RLE candidate forms and the
+/// `spec/05` escape splitting on the encoder's hot path (round 432).
+fn flat_regions(seed: u64, len: usize) -> Vec<u8> {
+    let mut s = seed | 1;
+    let mut out = Vec::with_capacity(len);
+    let mut level = 0x40u8;
+    for i in 0..len {
+        if i % 97 == 0 {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            level = level.wrapping_add(((s >> 40) & 0x1f) as u8);
+        }
+        out.push(level);
+    }
+    out
+}
+
+/// Full-entropy random content — the frame-level type-1 fallback
+/// class, where the round-432 cost-model gate skips the range coder
+/// outright.
+fn random_bytes(seed: u64, len: usize) -> Vec<u8> {
+    let mut s = seed | 1;
+    (0..len)
+        .map(|_| {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (s >> 40) as u8
+        })
+        .collect()
+}
+
 fn bench_encode(c: &mut Criterion) {
     let mut group = c.benchmark_group("encode_64x64");
     // Throughput per source pixel so per-format numbers are comparable.
@@ -65,12 +99,24 @@ fn bench_encode(c: &mut Criterion) {
     let rgba = gradient_noise(2, PixelKind::Bgra32.buffer_len(W, H));
     let yv12 = gradient_noise(3, PixelKind::Yv12.buffer_len(W, H));
     let yuy2 = yuy2_input(4);
+    // Round-432 content-class cases: the gradient set above lands on
+    // the bare-arithmetic path; these two pin the RLE-heavy and the
+    // gate-skip (type-1 fallback) profiles so all three encoder
+    // regimes stay A/B-able.
+    let rgb24_flat = flat_regions(5, PixelKind::Bgr24.buffer_len(W, H));
+    let yv12_flat = flat_regions(6, PixelKind::Yv12.buffer_len(W, H));
+    let rgb24_random = random_bytes(7, PixelKind::Bgr24.buffer_len(W, H));
+    let yv12_random = random_bytes(8, PixelKind::Yv12.buffer_len(W, H));
 
     let cases: &[(&str, &[u8], PixelKind)] = &[
         ("rgb24", &rgb24, PixelKind::Bgr24),
         ("rgba", &rgba, PixelKind::Bgra32),
         ("yv12", &yv12, PixelKind::Yv12),
         ("yuy2", &yuy2, PixelKind::Yuy2),
+        ("rgb24_flat", &rgb24_flat, PixelKind::Bgr24),
+        ("yv12_flat", &yv12_flat, PixelKind::Yv12),
+        ("rgb24_random", &rgb24_random, PixelKind::Bgr24),
+        ("yv12_random", &yv12_random, PixelKind::Yv12),
     ];
 
     for (name, pixels, kind) in cases {

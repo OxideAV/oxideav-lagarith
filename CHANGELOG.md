@@ -155,6 +155,14 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Tested
 
+- round 432 — **encode bench gains content-class cases**
+  (`benches/encode.rs`): `rgb24_flat` / `yv12_flat`
+  (piecewise-constant, RLE-escape-dominated) and `rgb24_random` /
+  `yv12_random` (full-entropy, the cost-model-gate skip / type-1
+  fallback profile) alongside the existing gradient set, so all
+  three encoder regimes stay A/B-able from one `cargo bench` run.
+  64×64 anchors: rgb24_flat ≈ 97 µs, yv12_flat ≈ 52 µs.
+
 - round 432 — **fuzz + pin coverage for the new encoder paths**
   (`roundtrip_tests::encoder_fuzz_harness`, `encoder::tests`). A new
   public-`encode_frame` fuzz loop drives large planes (10k–30k
