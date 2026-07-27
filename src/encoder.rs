@@ -2464,8 +2464,8 @@ mod tests {
         // the residual profile the election targets.
         let mut a = [0u32; 256];
         a[0] = 100_000;
-        for s in 1..=120usize {
-            a[s] = 1 + (s as u32 % 7) * 40;
+        for (s, slot) in a.iter_mut().enumerate().take(121).skip(1) {
+            *slot = 1 + (s as u32 % 7) * 40;
         }
         // (b) Two heavy symbols only — nothing but two large slots;
         // downscale buys ~2 bits of prefix per rung at almost no
