@@ -8,6 +8,21 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- round 432 — **channel-selector hot path: shared RLE contractions +
+  lazy candidate materialisation** (`src/encoder.rs`).
+  `encode_channel_best` used to run `contract_raw` twice per escape
+  length (once for the arith+RLE candidate, once for raw+RLE) and
+  always materialised the raw-memcpy candidate buffer; it now
+  contracts each escape length **once** and builds the raw / raw+RLE
+  buffers only on a strict size win (their wire lengths are known
+  without materialising). Candidate order, strict-`<` comparison and
+  the "lower header wins ties" rule are unchanged — a
+  byte-equivalence test re-runs the eager ascending-header reference
+  walk and asserts identical wire on every fixture plane. Measured
+  on the 64×64 encode bench: rgb24 100.6→79.2 µs (−21.8%), rgba
+  136.0→105.7 µs (−21.8%), yv12 49.7→37.7 µs (−23.8%), yuy2
+  68.8→53.1 µs (−22.6%).
+
 - round 432 — **residual-RLE contraction reaches the full escape
   capacity** (`src/rle.rs`). `contract_raw` now derives the
   supplement byte from the `spec/05` §3.2 / §5.3 algebraic inverse

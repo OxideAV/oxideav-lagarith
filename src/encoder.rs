@@ -285,6 +285,11 @@ pub fn encode_channel_arith_rle(plane: &[u8], escape_len: usize) -> Vec<u8> {
 /// Fibonacci-prefix overhead dominates), yet still carry enough
 /// zero runs for the `spec/05` escape to shrink the byte count
 /// below the raw `0x04` baseline.
+///
+/// Since round 432 `encode_channel_best` materialises its raw+RLE
+/// candidates lazily from the shared contraction, so this eager
+/// builder survives as the direct primitive (test-exercised).
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn encode_channel_raw_rle(plane: &[u8], escape_len: usize) -> Vec<u8> {
     debug_assert!((1..=3).contains(&escape_len));
     let compressed = contract_raw(plane, escape_len);
@@ -358,6 +363,18 @@ pub fn encode_channel_best(plane: &[u8]) -> Vec<u8> {
         return vec![0xff, plane[0]];
     }
 
+    // The `spec/05` contraction of `plane` at each escape length is
+    // shared between the two candidate families that transport it —
+    // arith+RLE (`0x01..=0x03`) and raw+RLE (`0x05..=0x07`) — so each
+    // of the three contractions runs **once** per plane instead of
+    // twice (round 432 hot-path; the contraction is an O(n) pass and
+    // was the selector's largest duplicated cost).
+    let contractions: [Vec<u8>; 3] = [
+        contract_raw(plane, 1),
+        contract_raw(plane, 2),
+        contract_raw(plane, 3),
+    ];
+
     // Candidate 0x00 — Fibonacci-prefix + arithmetic, no RLE. `None`
     // only for unnormalizable histograms (`provenance/52` §2 step 3),
     // which the always-legal raw candidate below covers; seeding with
@@ -374,29 +391,35 @@ pub fn encode_channel_best(plane: &[u8]) -> Vec<u8> {
     // pre-RLE contraction. Skipped when the dispatcher fall-back
     // rule (`spec/06` §1.5) would trip.
     for escape_len in 1..=3usize {
-        if let Some(candidate) = build_header_arith_rle(plane, escape_len) {
+        let symbols = &contractions[escape_len - 1];
+        if let Some(candidate) =
+            build_header_arith_rle_from_symbols(plane.len(), symbols, escape_len)
+        {
             if candidate.len() < best.len() {
                 best = candidate;
             }
         }
     }
 
-    // Candidate 0x04 — raw memcpy.
-    let raw = {
+    // Candidate 0x04 — raw memcpy. Its wire length is known without
+    // materialising (`1 + n`); build the buffer only on a strict win
+    // (the seed above already covers the unnormalizable-0x00 case).
+    if 1 + plane.len() < best.len() {
         let mut v = Vec::with_capacity(1 + plane.len());
         v.push(0x04);
         v.extend_from_slice(plane);
-        v
-    };
-    if raw.len() < best.len() {
-        best = raw;
+        best = v;
     }
 
     // Candidates 0x05..=0x07 — raw bytes with RLE post-processing.
+    // Wire length is `1 + contraction length`; materialise lazily.
     for escape_len in 1..=3usize {
-        let candidate = encode_channel_raw_rle(plane, escape_len);
-        if candidate.len() < best.len() {
-            best = candidate;
+        let symbols = &contractions[escape_len - 1];
+        if 1 + symbols.len() < best.len() {
+            let mut v = Vec::with_capacity(1 + symbols.len());
+            v.push((escape_len as u8) + 4);
+            v.extend_from_slice(symbols);
+            best = v;
         }
     }
 
@@ -429,21 +452,27 @@ fn build_header_zero(plane: &[u8], freq: &[u32; 256]) -> Option<Vec<u8>> {
 }
 
 /// Build a header-`0x01..0x03` (Fibonacci + arithmetic with pre-RLE
-/// contraction) wire body. Returns `None` when the candidate is
-/// illegal under `spec/06` §1.5 (pre-RLE symbol count >= n_pixels
-/// would trip the dispatcher fall-back to header-0 semantics), when
-/// the contracted symbol stream collapsed to a single symbol
-/// (the arithmetic coder requires `nonzero >= 2`), or when the
-/// pre-RLE histogram is unnormalizable (`provenance/52` §2 step 3).
-fn build_header_arith_rle(plane: &[u8], escape_len: usize) -> Option<Vec<u8>> {
+/// contraction) wire body from an **already-contracted** symbol
+/// stream (`contract_raw(plane, escape_len)` — the caller shares one
+/// contraction between this candidate and the raw+RLE form). Returns
+/// `None` when the candidate is illegal under `spec/06` §1.5
+/// (pre-RLE symbol count >= n_pixels would trip the dispatcher
+/// fall-back to header-0 semantics), when the contracted symbol
+/// stream collapsed to a single symbol (the arithmetic coder
+/// requires `nonzero >= 2`), or when the pre-RLE histogram is
+/// unnormalizable (`provenance/52` §2 step 3).
+fn build_header_arith_rle_from_symbols(
+    n_pixels: usize,
+    symbols: &[u8],
+    escape_len: usize,
+) -> Option<Vec<u8>> {
     debug_assert!((1..=3).contains(&escape_len));
-    let symbols = contract_raw(plane, escape_len);
     let pre_rle_count = symbols.len();
-    if symbols.is_empty() || pre_rle_count >= plane.len() {
+    if symbols.is_empty() || pre_rle_count >= n_pixels {
         return None;
     }
     let mut freq = [0u32; 256];
-    for &b in &symbols {
+    for &b in symbols {
         freq[b as usize] = freq[b as usize].saturating_add(1);
     }
     let nonzero = freq.iter().filter(|&&f| f > 0).count();
@@ -453,7 +482,7 @@ fn build_header_arith_rle(plane: &[u8], escape_len: usize) -> Option<Vec<u8>> {
     let freq = rescale_to_max_total(&freq, MAX_MODERN_TOTAL);
     let cdf = Cdf::from_wire_frequencies(&freq).ok()?;
     let mut enc = RangeEncoder::new();
-    for &b in &symbols {
+    for &b in symbols {
         enc.encode_symbol(&cdf, b as usize);
     }
     let body = enc.finish();
@@ -1842,6 +1871,77 @@ mod tests {
             simple.len(),
             delta,
         );
+    }
+
+    /// The round-432 shared-contraction / lazy-materialisation
+    /// restructure of `encode_channel_best` is **byte-identical** to
+    /// the reference form that builds every candidate eagerly in
+    /// ascending-header order with a strict `<` comparison (the
+    /// documented "lower header wins ties" rule). Any drift in
+    /// candidate ordering or tie-breaking shows up here as a wire
+    /// diff.
+    #[test]
+    fn best_shared_contraction_byte_equiv_to_eager_reference() {
+        // Reference: the pre-432 candidate walk, materialising every
+        // candidate up front.
+        fn reference_best(plane: &[u8]) -> Vec<u8> {
+            if plane.is_empty() {
+                return vec![0xff, 0];
+            }
+            let mut freq = [0u32; 256];
+            for &b in plane {
+                freq[b as usize] = freq[b as usize].saturating_add(1);
+            }
+            if freq.iter().filter(|&&f| f > 0).count() == 1 {
+                return vec![0xff, plane[0]];
+            }
+            let mut best = build_header_zero(plane, &freq).unwrap_or_else(|| {
+                let mut v = Vec::with_capacity(1 + plane.len());
+                v.push(0x04);
+                v.extend_from_slice(plane);
+                v
+            });
+            for escape_len in 1..=3usize {
+                let symbols = crate::rle::contract_raw(plane, escape_len);
+                if let Some(candidate) =
+                    build_header_arith_rle_from_symbols(plane.len(), &symbols, escape_len)
+                {
+                    if candidate.len() < best.len() {
+                        best = candidate;
+                    }
+                }
+            }
+            let mut raw = Vec::with_capacity(1 + plane.len());
+            raw.push(0x04);
+            raw.extend_from_slice(plane);
+            if raw.len() < best.len() {
+                best = raw;
+            }
+            for escape_len in 1..=3usize {
+                let candidate = encode_channel_raw_rle(plane, escape_len);
+                if candidate.len() < best.len() {
+                    best = candidate;
+                }
+            }
+            best
+        }
+        let mut planes = best_test_planes();
+        // A plane where raw+RLE and arith+RLE lengths collide is the
+        // interesting tie surface; add a few structured extras.
+        planes.push({
+            let mut p = vec![0u8; 64];
+            p.extend((0u8..64).map(|i| i.wrapping_mul(37)));
+            p
+        });
+        planes.push(vec![0u8, 1, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 0, 4]);
+        for plane in planes {
+            assert_eq!(
+                encode_channel_best(&plane),
+                reference_best(&plane),
+                "selector restructure drifted on plane len {}",
+                plane.len(),
+            );
+        }
     }
 
     // ─────────── encode_legacy_channel_best — type-7 sub-path selection ───────────
