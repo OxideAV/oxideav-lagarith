@@ -300,6 +300,28 @@ fn best_table_downscale(counts: &[u32; 256]) -> u32 {
     best_d
 }
 
+/// Estimated arithmetic payload size in bytes — exact Fibonacci
+/// prefix (`encode_freq_table` on the transmitted table) plus the
+/// entropy of coding the same histogram against itself
+/// (`Σ n_s · (log2 T − log2 n_s)` bits; the `0x180001050`
+/// normalization factor cancels per symbol exactly as in
+/// [`best_table_downscale`]). Used to rank same-shaped candidates —
+/// the range coder tracks the entropy term to within a few bytes,
+/// and that residual is common-mode across candidates.
+fn estimate_arith_payload(counts: &[u32; 256]) -> f64 {
+    let total: u64 = counts.iter().map(|&f| u64::from(f)).sum();
+    debug_assert!(total > 0);
+    let log2_total = (total as f64).log2();
+    let mut bits = 0.0f64;
+    for &f in counts.iter() {
+        if f > 0 {
+            let nf = f64::from(f);
+            bits += nf * (log2_total - nf.log2());
+        }
+    }
+    encode_freq_table(counts).len() as f64 + bits / 8.0
+}
+
 /// Range-encode `symbols` against `table`'s normalized model and
 /// return `prefix ‖ body` (the channel bytes after the header /
 /// length fields). `None` when the table is unnormalizable.
@@ -479,8 +501,11 @@ pub fn encode_channel_raw_rle(plane: &[u8], escape_len: usize) -> Vec<u8> {
 /// which sub-path the encoder picked, only the resulting bytes
 /// matter). The cleanroom encoder cannot reproduce the proprietary
 /// heuristic byte-exactly without the disassembled selector, but it
-/// can produce a *legal* + *minimum-byte* choice by encoding all
-/// candidates and selecting whichever yields the shortest output.
+/// can produce a *legal* + *minimum-byte* choice by encoding the
+/// candidates and selecting whichever yields the shortest output
+/// (round 432: the three arith+RLE forms are ranked by the cost
+/// model first and only the best-estimated one is range-encoded —
+/// see the pruning comment in the body).
 ///
 /// Candidate set:
 /// * `0xff` — solid fill (2 bytes; valid only when the plane is
@@ -567,8 +592,37 @@ pub fn encode_channel_best(plane: &[u8]) -> Vec<u8> {
 
     // Candidates 0x01..=0x03 — Fibonacci-prefix + arithmetic with
     // pre-RLE contraction. Skipped when the dispatcher fall-back
-    // rule (`spec/06` §1.5) would trip.
+    // rule (`spec/06` §1.5) would trip. Round-432 pruning: the three
+    // forms are ranked by the cost model (exact prefix + entropy
+    // body over each stream's histogram — the same estimator that
+    // drives the downscale election) and only the best-estimated one
+    // is actually range-encoded; the streams' post-RLE lengths
+    // differ by construction, so the estimate separates them by far
+    // more than its few-byte noise floor. The header-0x00 candidate
+    // above is always fully encoded, preserving the never-larger-
+    // than-`encode_channel_simple` anchor.
+    let mut rle_pick: Option<usize> = None;
+    let mut rle_pick_est = f64::INFINITY;
     for escape_len in 1..=3usize {
+        let symbols = &contractions[escape_len - 1];
+        if symbols.is_empty() || symbols.len() >= plane.len() {
+            continue;
+        }
+        let mut c = [0u32; 256];
+        for &b in symbols {
+            c[b as usize] = c[b as usize].saturating_add(1);
+        }
+        if c.iter().filter(|&&f| f > 0).count() < 2 {
+            continue;
+        }
+        let counts = rescale_to_max_total(&c, MAX_MODERN_TOTAL);
+        let est = 5.0 + estimate_arith_payload(&counts);
+        if est < rle_pick_est {
+            rle_pick_est = est;
+            rle_pick = Some(escape_len);
+        }
+    }
+    if let Some(escape_len) = rle_pick {
         let symbols = &contractions[escape_len - 1];
         if let Some(candidate) =
             build_header_arith_rle_from_symbols(plane.len(), symbols, escape_len)
@@ -2115,7 +2169,30 @@ mod tests {
                 v.extend_from_slice(plane);
                 v
             });
+            // Estimate-pruned arith+RLE pick, mirrored eagerly with
+            // fresh contractions.
+            let mut rle_pick: Option<usize> = None;
+            let mut rle_pick_est = f64::INFINITY;
             for escape_len in 1..=3usize {
+                let symbols = crate::rle::contract_raw(plane, escape_len);
+                if symbols.is_empty() || symbols.len() >= plane.len() {
+                    continue;
+                }
+                let mut c = [0u32; 256];
+                for &b in &symbols {
+                    c[b as usize] = c[b as usize].saturating_add(1);
+                }
+                if c.iter().filter(|&&f| f > 0).count() < 2 {
+                    continue;
+                }
+                let counts = rescale_to_max_total(&c, MAX_MODERN_TOTAL);
+                let est = 5.0 + estimate_arith_payload(&counts);
+                if est < rle_pick_est {
+                    rle_pick_est = est;
+                    rle_pick = Some(escape_len);
+                }
+            }
+            if let Some(escape_len) = rle_pick {
                 let symbols = crate::rle::contract_raw(plane, escape_len);
                 if let Some(candidate) =
                     build_header_arith_rle_from_symbols(plane.len(), &symbols, escape_len)
@@ -2267,6 +2344,37 @@ mod tests {
         );
         let decoded = decode_channel(&best, plane.len()).unwrap();
         assert_eq!(decoded, plane, "elected wire must decode byte-exactly");
+    }
+
+    /// The round-432 estimate pruning of the arith+RLE candidate set
+    /// picks the same escape length the exhaustive walk would: on
+    /// every fixture plane, the pruned selector's channel is exactly
+    /// as short as the shortest of ALL three eagerly-encoded
+    /// arith+RLE candidates (or shorter, when another form wins).
+    #[test]
+    fn rle_pruning_matches_exhaustive_on_fixture_planes() {
+        for plane in best_test_planes() {
+            if plane.is_empty() {
+                continue;
+            }
+            let best = encode_channel_best(&plane);
+            let exhaustive_rle_min = (1..=3usize)
+                .filter_map(|e| {
+                    let symbols = crate::rle::contract_raw(&plane, e);
+                    build_header_arith_rle_from_symbols(plane.len(), &symbols, e)
+                })
+                .map(|c| c.len())
+                .min();
+            if let Some(min_len) = exhaustive_rle_min {
+                assert!(
+                    best.len() <= min_len,
+                    "pruned selector ({}) lost to an unencoded arith+RLE \
+                     candidate ({min_len}) on plane len {}",
+                    best.len(),
+                    plane.len(),
+                );
+            }
+        }
     }
 
     /// The election is guarded: on planes where it cannot win (tiny

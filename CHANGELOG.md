@@ -39,6 +39,24 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- round 432 — **arith+RLE candidate pruning by the cost model**
+  (`src/encoder.rs`). `encode_channel_best` encoded all three
+  arith+RLE forms (`0x01..=0x03`) to compare their byte counts; the
+  three are now ranked by the same estimator that drives the
+  downscale election (exact Fibonacci-prefix size + entropy body
+  over each pre-RLE stream's histogram) and only the best-estimated
+  form is range-encoded. The header-0x00 candidate is still always
+  fully encoded, preserving the never-larger-than-
+  `encode_channel_simple` anchor, and the post-RLE stream lengths
+  separate the three forms by far more than the estimator's few-byte
+  noise floor — measured output is byte-identical across the size
+  fixtures (64×64 / 256×256 / 640×480, four families), and a
+  regression test pins the pruned pick against all three eagerly
+  encoded candidates on the fixture planes. Measured on zero-heavy
+  content (piecewise-constant 640×480, where all three RLE forms
+  are legal): rgb24 6949→6188 µs/frame (−11.0%), yv12 2823→2558
+  (−9.4%), same bytes.
+
 - round 432 — **channel-selector hot path: shared RLE contractions +
   lazy candidate materialisation** (`src/encoder.rs`).
   `encode_channel_best` used to run `contract_raw` twice per escape
