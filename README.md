@@ -149,6 +149,32 @@ pixels. A bad buffer length or zero dimension surfaces a clean
 `Error::BadDimensions` rather than a panic. `encode_null()` produces
 the zero-byte NULL ("JUMP") payload (`spec/01` §1.1).
 
+Round 432 rebuilt the per-channel election around a **closed-form
+cost model** (exact Fibonacci-prefix bits + entropy body estimate,
+O(nonzero) per candidate):
+
+- **Transmitted-model downscale election** — the probability-prefix
+  table is an encoder-side model choice (the decoder rebuilds its
+  model deterministically from the wire bytes, `spec/04` §6 +
+  `provenance/52`), so the encoder scores an element-wise
+  `max(1, freq >> d)` ladder and probes the elected rung with one
+  real encode, keeping it only on a strict byte win. Measured on
+  gradient+noise content: −0.36…−0.57% at 64×64, −0.16…−0.19% at
+  640×480, never larger than the raw-histogram wire.
+- **Full-capacity RLE escapes** — `spec/05` §5.3's algebraic
+  inverse unlocks the 254/255 paddings the staged INV_LUT's index
+  form cannot express; long zero runs now split per the §5.4
+  canonical greedy emit (a 4096-zero stretch contracts 34 → 32
+  bytes at `escape_len = 1`).
+- **Candidate pruning + gating** — the three arith+RLE forms are
+  ranked by the cost model and only the best is range-encoded, and
+  any arithmetic pass whose estimate cannot beat the known-length
+  raw forms (entropy is a lower bound on arithmetic output) is
+  skipped outright. Byte-identical output on every size fixture;
+  zero-heavy 640×480 encodes ~11% faster and full-random content
+  ~68–72% faster (the type-1 fallback class skips the range coder
+  entirely).
+
 Through the framework, `CodecRegistry::first_encoder` yields a
 `LagarithEncoder` (`oxideav_core::Encoder`): `send_frame` reassembles
 the packed host buffer from a `VideoFrame`'s planes (stride padding
@@ -205,12 +231,17 @@ construction.
   YV12/YUY2 dispatchers across a mixed-parity shape set (down to the
   degenerate single-pixel `1×1` edge with empty chroma planes), so the
   same odd-dimension geometry is panic-free-checked under CI. The
-  encode-side counterpart (`encoder_fuzz_harness`, in-crate because the
-  encoder is test-only) runs a deterministic-LCG high-iteration loop
+  encode-side counterpart (`encoder_fuzz_harness`, in-crate so it runs
+  under CI) runs a deterministic-LCG high-iteration loop
   over the encoder's *input* space (random legal dimensions × a 4-level
   content-entropy knob): 1900 encode→decode roundtrips that must each
   neither panic nor diverge from byte-exact recovery, with failures
   reproducible from the printed `(family, w, h, content_seed)` tuple.
+  A round-432 extension drives the public `encode_frame` over large
+  planes (10k–30k pixels/plane) with flat-with-impulses and gradient
+  content, so the downscale election, the candidate gate, and
+  multi-escape full-capacity zero runs are all fuzz-covered, and
+  three frozen scorer-decision pins alarm on cost-model drift.
 - Criterion benchmarks in `benches/decode.rs` time the decode hot path,
   and a SIMD-vs-scalar predictor bench tracks the `spec/06` §3.2 path.
   `benches/encode.rs` is the encode-side counterpart: it times the

@@ -5912,11 +5912,11 @@ mod encoder_exhaustive_matrix {
 
 /// Round-341 milestone — **encoder fuzz harness (in-crate).**
 ///
-/// The crate's encoder is `#[cfg(test)]`-gated (it drives the
-/// self-roundtrip suite and makes no byte-equality claim against the
-/// proprietary), so it is not reachable from the separate `cargo-fuzz`
-/// binary in `fuzz/` (that binary fuzzes the public *decoder* against
-/// hostile wire bytes). This module is the encoder-side counterpart: a
+/// The separate `cargo-fuzz` binary in `fuzz/` fuzzes the public
+/// *decoder* against hostile wire bytes; the encoder's input space
+/// (well-formed pixel buffers) is a different shape, and its
+/// per-frame-type helpers are crate-internal. This module is the
+/// encoder-side counterpart, kept in-crate so it runs under CI: a
 /// high-iteration deterministic-random loop that fuzzes the encoder's
 /// **input** space — random dimensions across each family's legal
 /// constraints, crossed with random pixel content of varied byte
