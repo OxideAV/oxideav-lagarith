@@ -88,6 +88,21 @@ mod tables;
 mod roundtrip_tests;
 
 pub use crate::channel::{ChannelHeader, LegacyChannelHeader};
+
+/// Direct per-wire-form frame encoders, re-exported for the
+/// out-of-CI black-box capture driver (`examples/blackbox_capture.rs`)
+/// and for callers that need to force a specific frame type instead
+/// of [`encode_frame`]'s automatic smallest-form election. Hidden
+/// from the documented surface: the supported entry point remains
+/// [`encode_frame`], and these signatures may change without a
+/// semver signal.
+#[doc(hidden)]
+pub mod wire_forms {
+    pub use crate::encoder::{
+        encode_arith_reduced_res, encode_arith_rgb24, encode_arith_rgba, encode_arith_yuy2,
+        encode_arith_yv12, encode_legacy_rgb, encode_legacy_rgb_rle, encode_uncompressed,
+    };
+}
 pub use crate::decoder::{decode_frame, decode_frame_with_prev, DecodedFrame, Decoder, PixelKind};
 pub use crate::encoder::{encode_frame, encode_null};
 pub use crate::error::{Error, Result};
