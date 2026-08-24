@@ -51,13 +51,19 @@
 //! them against the `0x180001050`-normalized model while the crate's
 //! encoder (then) coded against the raw table. Random residuals never
 //! win the RLE contraction, stay on header `0x00` with a pow2 pixel-
-//! count total, and the two models coincide. Round 407's encoder
-//! codes against the normalized model, so the divergence class is
-//! expected closed; byte-exact re-confirmation against the black-box
-//! oracle (or a proprietary-encoded fixture — the public sample set
-//! still 404s) has not yet been re-captured and remains the open
-//! cross-encoder-parity item. The random-pattern pins below sample
-//! the identity-fast-path subset where pre- and post-407 agree.
+//! count total, and the two models coincide.
+//!
+//! **Round 451 closed the re-capture item.** The divergence class was
+//! NOT fully explained by the normalizer — the remaining piece was
+//! the range coder's top-symbol slack interval (`src/range_coder.rs`
+//! Step B), which random-table streams mask. With the absorbing
+//! interval landed, the oracle reconstructs every modern RGB(A) /
+//! YV12 / even-width-YUY2 stream byte-exactly, structured-pattern
+//! and non-pow2-total classes included — see
+//! `tests/blackbox_encode_pins.rs` for the frozen capture. The
+//! random-pattern pins below stay byte-valid (their decodes are
+//! unchanged by the round-451 semantics; the pinned frames were
+//! re-verified oracle-exact through the same AVI pipeline).
 
 use oxideav_lagarith::{decode_frame, PixelKind};
 
