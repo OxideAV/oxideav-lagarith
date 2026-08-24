@@ -327,22 +327,36 @@ impl<'a> RangeDecoder<'a> {
             return Ok(0);
         }
 
-        // Step B — symbol 0xff fast path per `spec/02` §5. The
-        // proprietary's reciprocal-multiply Step C path treats
-        // `low >= total * q` (i.e. the slack band above the
-        // highest CDF entry) as the 0xff sentinel and updates
-        // `low -= total*q; range -= total*q`. Note this differs
-        // from a naive "find symbol s with cum[s] <= target <
-        // cum[s+1]" search clamped to s = 255: the spec's update
-        // is unconditional even when `freq[255] == 0`. Stays
-        // bit-identical to the proprietary on real bitstreams;
-        // the self-roundtrip encoder never produces `low >=
-        // total*q` so this branch is exercised only by test
-        // fixtures crafted to hit it.
-        let total_scaled = total * q;
-        if self.low >= total_scaled {
-            self.low -= total_scaled;
-            self.range -= total_scaled;
+        // Step B — top-symbol (0xff) fast path. Round 451's
+        // black-box cross-validation against the independent
+        // third-party decoder establishes the fast-path boundary as
+        // `cum[255] * q` — the top symbol **absorbs the quotient
+        // slack** `range - total*q`: every value at or above
+        // `cum[255]*q` decodes 0xff with the interval update
+        // `low -= cum[255]*q; range -= cum[255]*q`. The `spec/02`
+        // §5 Step-B narrative reads the threshold as `total * q`,
+        // but under that reading the documented "0xff fast path" is
+        // unreachable for any stream an interval-consistent encoder
+        // can emit (no coding interval ever covers `[total*q,
+        // range)`), and the resulting `range = freq[255]*q` Step-C
+        // update measurably desyncs the oracle within a few symbols
+        // of any 0xff on real (concentrated-histogram) content
+        // while the absorbing form reproduces the oracle's output
+        // stream byte-exactly (see `tests/blackbox_encode_pins.rs`).
+        // Flagged as a spec/02 §5 erratum candidate; the encoder's
+        // Step-B arm mirrors this update so self-roundtrip and
+        // third-party decode agree on the identical wire bytes.
+        let top_scaled = cdf.cum_top * q;
+        if self.low >= top_scaled {
+            self.low -= top_scaled;
+            self.range -= top_scaled;
+            // `range - cum[255]*q` is positive for every stream the
+            // guard `q >= 1` admits unless the table's top slot is
+            // empty AND `range` has no slack — reachable only via a
+            // corrupt prefix; reject instead of hanging renormalise.
+            if self.range == 0 {
+                return Err(Error::ProbabilityTotalExceedsRange);
+            }
             self.renormalise()?;
             return Ok(0xff);
         }
@@ -535,13 +549,21 @@ impl RangeEncoder {
             return;
         }
 
-        // Step B — symbol 255 fast path (`spec/02` §5; symmetric to
-        // the decoder Step-B landed in round 8). cum[256] = total,
-        // so `range = (total - cum[255]) * q`; `low += cum[255] * q`.
+        // Step B — top-symbol (0xff) fast path, symmetric to the
+        // decoder's round-451 absorbing form: symbol 255's coding
+        // interval is `[cum[255]*q, range)` — it absorbs the
+        // quotient slack `range - total*q` — so the update is
+        // `low += cum[255]*q; range -= cum[255]*q`. Confirmed by
+        // black-box cross-validation: the independent third-party
+        // decoder reconstructs streams coded with this interval
+        // byte-exactly, while the previous `range = freq[255]*q`
+        // (slack-discarding) form desynced it within a few symbols
+        // of any 0xff on concentrated-histogram content
+        // (`tests/blackbox_encode_pins.rs`).
         if s == 255 {
             let lo_scaled = cdf.cum_top * q;
             self.low = self.low.wrapping_add(lo_scaled);
-            self.range = (total - cdf.cum_top) * q;
+            self.range -= lo_scaled;
             self.renormalise();
             return;
         }
@@ -1061,9 +1083,17 @@ mod tests {
             let total = cdf.total();
             let q = enc_generic.range / total;
             let lo = cdf.lo(s as usize);
-            let hi = cdf.lo(s as usize + 1);
             enc_generic.low = enc_generic.low.wrapping_add(lo * q);
-            enc_generic.range = (hi - lo) * q;
+            // Canonical per-symbol interval, round-451 semantics: the
+            // top symbol's interval absorbs the quotient slack
+            // (`range - cum[255]*q`); every other symbol's interval
+            // is the slack-free `(cum[s+1]-cum[s])*q` band.
+            if s == 0xff {
+                enc_generic.range -= lo * q;
+            } else {
+                let hi = cdf.lo(s as usize + 1);
+                enc_generic.range = (hi - lo) * q;
+            }
             enc_generic.renormalise();
         }
         let bytes_generic = enc_generic.finish();
@@ -1181,12 +1211,13 @@ mod tests {
 
     /// Round 10: encoder-side bit-equivalence guard for Step-B.
     /// Encode a 0xff-dominant stream through the Step-B fast path
-    /// AND through a generic Step-C-only encoder. The two outputs
-    /// MUST be byte-identical — Step-B is algebraically the same
-    /// `low += cum[255]*q; range = (cum[256]-cum[255])*q` update as
-    /// generic Step-C, just with `cum_top` cached on the Cdf struct
-    /// instead of read from `cum[]`. Any divergence here would mean
-    /// the optimisation altered the wire format.
+    /// AND through a generic per-symbol-interval encoder. The two
+    /// outputs MUST be byte-identical — Step-B is algebraically the
+    /// same `low += cum[255]*q; range -= cum[255]*q` (round-451
+    /// slack-absorbing top-symbol interval) update as the canonical
+    /// form, just with `cum_top` cached on the Cdf struct instead of
+    /// read from `cum[]`. Any divergence here would mean the
+    /// optimisation altered the wire format.
     #[test]
     fn rangecoder_step_b_encode_bit_equiv_to_generic() {
         let mut freq = [0u32; 256];
@@ -1220,9 +1251,17 @@ mod tests {
             let total = cdf.total();
             let q = enc_generic.range / total;
             let lo = cdf.lo(s as usize);
-            let hi = cdf.lo(s as usize + 1);
             enc_generic.low = enc_generic.low.wrapping_add(lo * q);
-            enc_generic.range = (hi - lo) * q;
+            // Canonical per-symbol interval, round-451 semantics: the
+            // top symbol's interval absorbs the quotient slack
+            // (`range - cum[255]*q`); every other symbol's interval
+            // is the slack-free `(cum[s+1]-cum[s])*q` band.
+            if s == 0xff {
+                enc_generic.range -= lo * q;
+            } else {
+                let hi = cdf.lo(s as usize + 1);
+                enc_generic.range = (hi - lo) * q;
+            }
             enc_generic.renormalise();
         }
         let bytes_generic = enc_generic.finish();

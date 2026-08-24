@@ -47,12 +47,38 @@ pub(crate) enum FirstColRule {
     /// chroma-subsampled plane widths are always 4-byte-aligned, so
     /// the `0x180009f30` predictor never takes a `width % 4` Rule-B
     /// branch. Also the `y == 1` fallback of Rule B (no `y - 2` row).
+    ///
+    /// Round 451: no shipping decode/encode path selects Rule A any
+    /// more — the YV12 / YUY2 / reduced-res families moved to the
+    /// oracle-recovered [`FirstColRule::Yuv`] (spec/06 §3.8 flagged
+    /// as an erratum candidate; §6.4 closed by black-box
+    /// cross-testing). The variant stays for the predictor unit
+    /// tests that pin the historical rule's algebra.
+    #[cfg_attr(not(test), allow(dead_code))]
     A,
     /// `TL = plane[y-2][W-1]` for `y >= 2` (Rule A for `y == 1`).
     /// The modern arithmetic RGB(A) path (types 2/4/8) and the
     /// legacy type-7 path both use this (`spec/06` §3.2 /
     /// `spec/07` §9.1 item 7b; oracle-confirmed for the modern path).
     B,
+    /// Round-451 oracle-recovered first-column rule for the
+    /// **YV12 / YUY2 / reduced-resolution** families (types 3 / 10 /
+    /// 11): `TL = plane[y-2][W-1]` for `y >= 2` exactly as Rule B,
+    /// but at `y == 1` the `0x180009f30` predictor's carry enters
+    /// the row holding `T` (`plane[0][0]`), not `L` — so the median
+    /// `MED(L, T, T)` collapses to `L = plane[0][W-1]` (Rule A / B
+    /// collapse to `T` there instead). This closes `spec/06` §6.4
+    /// (the non-RGB24 row-0 → row-1 carry initialisation, expressly
+    /// left open pending cross-testing): black-box cross-validation
+    /// discriminates the three candidates — under this rule the
+    /// independent third-party decoder reconstructs YV12 / YUY2
+    /// frames byte-exactly at every probed geometry and content
+    /// class, while both the §3.8 "Strategy A everywhere" reading
+    /// and a `TL = 0` carry mis-decode gradient content from
+    /// `(0, 1)` / `(0, 2)` onward (`tests/blackbox_encode_pins.rs`).
+    /// `spec/06` §3.8's "same `TL = L` (Strategy A)" sentence is
+    /// flagged as an erratum candidate.
+    Yuv,
 }
 
 /// Apply the in-place left-then-clamped-MED reconstruction to a
@@ -93,13 +119,17 @@ pub(crate) fn apply_plane_inverse_with_rule(
         // gradient = L_wrap + T - TL where L_wrap = plane[y-1][W-1].
         let pred_first = match rule {
             FirstColRule::A => plane[prev_off],
-            FirstColRule::B if y >= 2 => {
+            FirstColRule::B | FirstColRule::Yuv if y >= 2 => {
                 let l = plane[prev_off + width - 1]; // plane[y-1][W-1]
                 let t = plane[prev_off];
                 let tl = plane[(y - 2) * width + width - 1]; // plane[y-2][W-1]
                 clamped_med(l, t, tl)
             }
             FirstColRule::B => plane[prev_off],
+            // y == 1: the YUV predictor's carry holds T, so
+            // MED(L, T, T) = L (round-451 oracle recovery; the
+            // clamp is the identity on L).
+            FirstColRule::Yuv => plane[prev_off + width - 1],
         };
         plane[row_off] = plane[row_off].wrapping_add(pred_first);
         // Columns 1..W-1.
@@ -145,13 +175,15 @@ pub(crate) fn apply_plane_forward_with_rule(
         // First column.
         let pred_first = match rule {
             FirstColRule::A => plane[prev_off],
-            FirstColRule::B if y >= 2 => {
+            FirstColRule::B | FirstColRule::Yuv if y >= 2 => {
                 let l = plane[prev_off + width - 1];
                 let t = plane[prev_off];
                 let tl = plane[(y - 2) * width + width - 1];
                 clamped_med(l, t, tl)
             }
             FirstColRule::B => plane[prev_off],
+            // y == 1: MED(L, T, T) = L — see the inverse form.
+            FirstColRule::Yuv => plane[prev_off + width - 1],
         };
         out[row_off] = plane[row_off].wrapping_sub(pred_first);
         for x in 1..width {

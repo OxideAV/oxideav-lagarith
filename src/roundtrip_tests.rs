@@ -1295,15 +1295,19 @@ fn yuy2_odd_width_raw_channel_floor_layout_roundtrip() {
 
     // Hand-build per-plane RESIDUAL byte sequences by inverting the
     // forward predictor on a full plane of arbitrary values. Reuse
-    // `apply_plane_forward` from the predict module.
-    use crate::predict::apply_plane_forward;
+    // `apply_plane_forward_with_rule` from the predict module (the
+    // YUY2 wire uses the round-451 oracle-recovered Yuv first-column
+    // rule).
+    use crate::predict::{apply_plane_forward_with_rule, FirstColRule};
+    let fwd =
+        |p: &[u8], w: usize, h: usize| apply_plane_forward_with_rule(p, w, h, FirstColRule::Yuv);
     let plane_y_full: Vec<u8> = (0..n_y).map(|i| ((i * 7) ^ 0x55) as u8).collect();
     let plane_u_full: Vec<u8> = (0..n_c).map(|i| (0x40 + i as u8) ^ 0x10).collect();
     let plane_v_full: Vec<u8> = (0..n_c).map(|i| (0xa0 + i as u8) ^ 0x20).collect();
 
-    let res_y = apply_plane_forward(&plane_y_full, w as usize, h as usize);
-    let res_u = apply_plane_forward(&plane_u_full, cw, h as usize);
-    let res_v = apply_plane_forward(&plane_v_full, cw, h as usize);
+    let res_y = fwd(&plane_y_full, w as usize, h as usize);
+    let res_u = fwd(&plane_u_full, cw, h as usize);
+    let res_v = fwd(&plane_v_full, cw, h as usize);
 
     // Channel-header 0x04 raw-memcpy: byte 0 = 0x04, then the
     // residual stream verbatim.
@@ -1926,8 +1930,7 @@ mod best_pipeline_size_delta {
     use crate::encoder::{encode_channel_simple, encode_uncompressed};
     use crate::frame::pack_channels;
     use crate::predict::{
-        apply_plane_forward, apply_plane_forward_with_rule, cross_plane_decorrelate_rgb_forward,
-        FirstColRule,
+        apply_plane_forward_with_rule, cross_plane_decorrelate_rgb_forward, FirstColRule,
     };
 
     /// A zero-heavy byte profile that mimics a post-gradient
@@ -2047,11 +2050,11 @@ mod best_pipeline_size_delta {
         let plane_y = &pixels[..y_pixels];
         let plane_v = &pixels[y_pixels..y_pixels + c_pixels];
         let plane_u = &pixels[y_pixels + c_pixels..];
-        let res_y = apply_plane_forward(plane_y, w, h);
+        let res_y = apply_plane_forward_with_rule(plane_y, w, h, FirstColRule::Yuv);
         let cw = w / 2;
         let ch = h / 2;
-        let res_v = apply_plane_forward(plane_v, cw, ch);
-        let res_u = apply_plane_forward(plane_u, cw, ch);
+        let res_v = apply_plane_forward_with_rule(plane_v, cw, ch, FirstColRule::Yuv);
+        let res_u = apply_plane_forward_with_rule(plane_u, cw, ch, FirstColRule::Yuv);
         let ch_y = encode_channel_simple(&res_y);
         let ch_v = encode_channel_simple(&res_v);
         let ch_u = encode_channel_simple(&res_u);
@@ -2077,9 +2080,9 @@ mod best_pipeline_size_delta {
                 plane_v.push(pixels[in_row + 4 * k + 3]);
             }
         }
-        let res_y = apply_plane_forward(&plane_y, w, h);
-        let res_u = apply_plane_forward(&plane_u, cw, h);
-        let res_v = apply_plane_forward(&plane_v, cw, h);
+        let res_y = apply_plane_forward_with_rule(&plane_y, w, h, FirstColRule::Yuv);
+        let res_u = apply_plane_forward_with_rule(&plane_u, cw, h, FirstColRule::Yuv);
+        let res_v = apply_plane_forward_with_rule(&plane_v, cw, h, FirstColRule::Yuv);
         let ch_y = encode_channel_simple(&res_y);
         let ch_u = encode_channel_simple(&res_u);
         let ch_v = encode_channel_simple(&res_v);
@@ -5814,9 +5817,14 @@ mod encoder_exhaustive_matrix {
             (0x01..=0x03).any(|h| seen.contains(&h)),
             "selector never chose any arithmetic-RLE form 0x01..0x03; seen = {seen:02x?}",
         );
+        // Round 451: the raw+RLE forms 0x05..0x07 are deliberately
+        // NOT electable (cross-decoder interop; see
+        // `encode_channel_best`) — assert the selector stays within
+        // the cross-validated set.
         assert!(
-            (0x05..=0x07).any(|h| seen.contains(&h)),
-            "selector never chose any raw-RLE form 0x05..0x07; seen = {seen:02x?}",
+            !(0x05..=0x07).any(|h| seen.contains(&h)),
+            "selector elected a raw-RLE form 0x05..0x07, which round 451 \
+             removed from the election; seen = {seen:02x?}",
         );
         assert!(
             seen.contains(&0xff),
@@ -5920,14 +5928,29 @@ mod encoder_exhaustive_matrix {
             produced.insert(hdr);
         }
 
-        // 0xff — solid fill (a constant plane forces it).
+        // 0xff — solid fill. Round 451 restricts the election to the
+        // all-zero residual plane (the one fill value that decodes
+        // identically under both the predictor-integrating and the
+        // direct-fill readings of `spec/06` §5; see
+        // `encode_channel_best`) — a nonzero constant plane now takes
+        // an unambiguous form instead.
         {
+            let zeros = vec![0u8; n];
+            let ch = encode_channel_simple(&zeros);
+            assert_eq!(ch[0], 0xff, "all-zero plane must encode to 0xff solid fill");
+            assert_eq!(ch[1], 0, "fill byte must be zero");
+            let dec = decode_channel(&ch, n).expect("solid-fill channel decodes");
+            assert_eq!(dec, zeros, "solid fill 0xff roundtrip");
+            produced.insert(0xff);
+
             let solid = vec![0x42u8; n];
             let ch = encode_channel_simple(&solid);
-            assert_eq!(ch[0], 0xff, "constant plane must encode to 0xff solid fill");
-            let dec = decode_channel(&ch, n).expect("solid-fill channel decodes");
-            assert_eq!(dec, solid, "solid fill 0xff roundtrip");
-            produced.insert(0xff);
+            assert_ne!(
+                ch[0], 0xff,
+                "nonzero-constant plane must avoid the reading-ambiguous 0xff fill"
+            );
+            let dec = decode_channel(&ch, n).expect("nonzero-constant channel decodes");
+            assert_eq!(dec, solid, "nonzero-constant roundtrip");
         }
 
         // The explicit encoders cover every escape-bearing form plus

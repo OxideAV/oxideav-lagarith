@@ -231,6 +231,9 @@ fn fib_code_len(v: u32) -> u32 {
 /// winning rung against the actually-encoded raw-table wire — the
 /// estimate ranks candidates; the byte counts decide.
 fn best_table_downscale(counts: &[u32; 256]) -> u32 {
+    if std::env::var("LAG_NO_DOWNSCALE").is_ok() {
+        return 0;
+    }
     let max = counts.iter().copied().max().unwrap_or(0);
     if max < 8 {
         return 0;
@@ -368,12 +371,14 @@ pub fn encode_channel_simple(plane: &[u8]) -> Vec<u8> {
     if plane.is_empty() {
         return vec![0xff, 0];
     }
-    // If all symbols collapsed to one value, emit a solid fill —
-    // the range coder still works but takes more bytes.
+    // If the plane is all-zero, emit a solid fill — the one fill
+    // value whose decode is identical whether or not a decoder runs
+    // the predictor pass over the filled plane (round 451; see
+    // `encode_channel_best`). Nonzero-constant planes fall through
+    // to the arithmetic / raw forms, which are reading-unambiguous.
     let nonzero = freq.iter().filter(|&&f| f > 0).count();
-    if nonzero == 1 {
-        // header 0xff + the byte
-        return vec![0xff, plane[0]];
+    if nonzero == 1 && plane[0] == 0 {
+        return vec![0xff, 0];
     }
 
     // Rescale the histogram so the transmitted total stays inside the
@@ -575,8 +580,23 @@ pub fn encode_channel_best(plane: &[u8]) -> Vec<u8> {
         freq[b as usize] = freq[b as usize].saturating_add(1);
     }
     let nonzero = freq.iter().filter(|&&f| f > 0).count();
-    if nonzero == 1 {
-        return vec![0xff, plane[0]];
+    // Constant-fill (0xff) election is restricted to the all-zero
+    // residual plane (round 451). A zero fill is form-invariant:
+    // integrating a zero residual plane through the spatial
+    // predictor reproduces the same all-zero plane, so the wire
+    // decodes identically whether a decoder feeds the fill through
+    // the predictor pipeline (`spec/06` §5 step 8) or writes it
+    // straight to the plane. For a NONZERO fill the two readings
+    // diverge, and black-box cross-validation shows the independent
+    // third-party decoder takes the fill as the final
+    // (pre-decorrelation) plane value with no predictor pass —
+    // against `spec/06` §5's checklist ordering. Until a
+    // proprietary-encoded fixture arbitrates that conflict, the
+    // encoder emits nonzero-constant residual planes through the
+    // unambiguous forms below (both readings agree on every other
+    // header), keeping every elected wire third-party-decodable.
+    if nonzero == 1 && plane[0] == 0 {
+        return vec![0xff, 0];
     }
 
     // The `spec/05` contraction of `plane` at each escape length is
@@ -591,13 +611,12 @@ pub fn encode_channel_best(plane: &[u8]) -> Vec<u8> {
         contract_raw(plane, 3),
     ];
 
-    // Shortest **known-length** form: raw memcpy (`1 + n`) or a
-    // raw+RLE transport (`1 +` contraction length). These need no
-    // entropy pass, so they gate the arithmetic candidates below.
-    let known_raw_min = contractions
-        .iter()
-        .map(|c| 1 + c.len())
-        .fold(1 + plane.len(), usize::min);
+    // Shortest **known-length** electable form: the raw memcpy
+    // (`1 + n`). (Round 451: the raw+RLE transports no longer gate —
+    // they are not elected, so their contraction lengths must not
+    // suppress an arithmetic candidate that is now the only
+    // compressed form in the running.)
+    let known_raw_min = 1 + plane.len();
 
     // Candidate 0x00 — Fibonacci-prefix + arithmetic, no RLE. `None`
     // only for unnormalizable histograms (`provenance/52` §2 step 3),
@@ -685,17 +704,19 @@ pub fn encode_channel_best(plane: &[u8]) -> Vec<u8> {
         best = v;
     }
 
-    // Candidates 0x05..=0x07 — raw bytes with RLE post-processing.
-    // Wire length is `1 + contraction length`; materialise lazily.
-    for escape_len in 1..=3usize {
-        let symbols = &contractions[escape_len - 1];
-        if 1 + symbols.len() < best.len() {
-            let mut v = Vec::with_capacity(1 + symbols.len());
-            v.push((escape_len as u8) + 4);
-            v.extend_from_slice(symbols);
-            best = v;
-        }
-    }
+    // Candidates 0x05..=0x07 (raw + RLE post-processing) are NOT
+    // elected as of round 451, although [`encode_channel_raw_rle`]
+    // still produces them on request and the decoder accepts them
+    // (`spec/03` §2.1). Black-box cross-validation shows the
+    // independent third-party decoder mis-expands (or rejects
+    // outright) channels carrying these headers, while the docs'
+    // encoder-mirror sections (`spec/06` §1.7 / §2.7) document
+    // vendor emission only for `0x00..0x03` — so no real-world
+    // stream exercises third-party support for the raw+RLE forms.
+    // Election therefore stays within the cross-validated set
+    // {0x00, 0x01..0x03, 0x04, 0xff-zero}; the size cost is a few
+    // bytes on heavily-zero planes whose contraction undercuts the
+    // arith+RLE body.
 
     // Transmitted-model downscale election (round 432) — applied to
     // the **winning** arithmetic form only (one ladder + at most one
@@ -864,22 +885,24 @@ pub fn encode_arith_yv12(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
     let plane_v = &pixels[y_pixels..y_pixels + c_pixels];
     let plane_u = &pixels[y_pixels + c_pixels..];
 
-    // First-column-of-row rule is Rule A per spec/06 §3.8 (the YV12
-    // plane widths are always 4-byte-aligned at the natural chroma
-    // subsampling, so the predictor is unconditional). Matches the
-    // decoder's `FirstColRule::A` selection in `decode_arith_yv12`.
-    let res_y = apply_plane_forward_with_rule(plane_y, w, h, FirstColRule::A);
+    // First-column-of-row rule is the round-451 oracle-recovered
+    // Yuv rule (row 1: `pred = L`; rows ≥ 2: Rule-B median) — see
+    // `src/predict.rs`. Matches the decoder's `FirstColRule::Yuv`
+    // selection in `decode_arith_yv12`, so the two directions invert
+    // each other and third-party decoders reconstruct the planes
+    // byte-exactly.
+    let res_y = apply_plane_forward_with_rule(plane_y, w, h, FirstColRule::Yuv);
     let cw = w / 2;
     let ch = h / 2;
     let (res_v, res_u) = if cw * ch == c_pixels {
         (
-            apply_plane_forward_with_rule(plane_v, cw, ch, FirstColRule::A),
-            apply_plane_forward_with_rule(plane_u, cw, ch, FirstColRule::A),
+            apply_plane_forward_with_rule(plane_v, cw, ch, FirstColRule::Yuv),
+            apply_plane_forward_with_rule(plane_u, cw, ch, FirstColRule::Yuv),
         )
     } else {
         (
-            apply_plane_forward_with_rule(plane_v, c_pixels, 1, FirstColRule::A),
-            apply_plane_forward_with_rule(plane_u, c_pixels, 1, FirstColRule::A),
+            apply_plane_forward_with_rule(plane_v, c_pixels, 1, FirstColRule::Yuv),
+            apply_plane_forward_with_rule(plane_u, c_pixels, 1, FirstColRule::Yuv),
         )
     };
 
@@ -944,11 +967,11 @@ pub fn encode_arith_yuy2(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
     debug_assert_eq!(plane_u.len(), c_pixels);
     debug_assert_eq!(plane_v.len(), c_pixels);
 
-    // Rule A per spec/06 §3.8 — see `encode_arith_yv12`. The YUY2
-    // chroma plane width (W/2) is 4-byte-aligned at 4:2:2.
-    let res_y = apply_plane_forward_with_rule(&plane_y, w, h, FirstColRule::A);
-    let res_u = apply_plane_forward_with_rule(&plane_u, cw, h, FirstColRule::A);
-    let res_v = apply_plane_forward_with_rule(&plane_v, cw, h, FirstColRule::A);
+    // Round-451 Yuv first-column rule — see `encode_arith_yv12` and
+    // the YUY2 partial-recovery note in `decode_arith_yuy2`.
+    let res_y = apply_plane_forward_with_rule(&plane_y, w, h, FirstColRule::Yuv);
+    let res_u = apply_plane_forward_with_rule(&plane_u, cw, h, FirstColRule::Yuv);
+    let res_v = apply_plane_forward_with_rule(&plane_v, cw, h, FirstColRule::Yuv);
 
     // Per-channel header-form selector — see `encode_channel_best`.
     let ch_y = encode_channel_best(&res_y);
@@ -1968,6 +1991,11 @@ mod tests {
     /// Unlike `tests/reference_pins.rs` this pin is NOT oracle-
     /// captured — it freezes the crate's own (reference-derivation)
     /// output so conformance-relevant bytes cannot drift silently.
+    ///
+    /// Re-frozen in round 451: the plane contains a 0xff residual,
+    /// so the bytes changed when the coder adopted the
+    /// oracle-confirmed slack-absorbing top-symbol interval
+    /// (`range -= cum[255]*q`; see `src/range_coder.rs` Step B).
     #[test]
     fn modern_wire_non_pow2_total_channel_self_pin() {
         let plane: Vec<u8> = vec![
@@ -1977,10 +2005,7 @@ mod tests {
         let channel = encode_channel_simple(&plane);
         assert_eq!(
             channel,
-            [
-                0, 30, 155, 154, 254, 216, 125, 25, 128, 94, 147, 211, 200, 26, 250, 122, 230, 192,
-                0
-            ],
+            [0, 30, 155, 154, 254, 216, 125, 25, 128, 94, 147, 211, 200, 53, 2, 154, 59, 176, 0],
             "normalized-model header-0x00 wire drifted at a non-pow2 total"
         );
         let decoded = decode_channel(&channel, plane.len()).unwrap();
@@ -2202,12 +2227,10 @@ mod tests {
             for &b in plane {
                 freq[b as usize] = freq[b as usize].saturating_add(1);
             }
-            if freq.iter().filter(|&&f| f > 0).count() == 1 {
-                return vec![0xff, plane[0]];
+            if freq.iter().filter(|&&f| f > 0).count() == 1 && plane[0] == 0 {
+                return vec![0xff, 0];
             }
-            let known_raw_min = (1..=3usize)
-                .map(|e| 1 + crate::rle::contract_raw(plane, e).len())
-                .fold(1 + plane.len(), usize::min);
+            let known_raw_min = 1 + plane.len();
             let est0 = 1.0 + estimate_arith_payload(&rescale_to_max_total(&freq, MAX_MODERN_TOTAL));
             let mut best = if est0 <= known_raw_min as f64 + EST_GATE_MARGIN {
                 build_header_zero(plane, &freq)
@@ -2261,12 +2284,8 @@ mod tests {
             if raw.len() < best.len() {
                 best = raw;
             }
-            for escape_len in 1..=3usize {
-                let candidate = encode_channel_raw_rle(plane, escape_len);
-                if candidate.len() < best.len() {
-                    best = candidate;
-                }
-            }
+            // (Round 451: the raw+RLE forms are no longer part of
+            // the election — the reference mirrors that.)
             // Round-432 winner-only downscale election, mirrored
             // eagerly (fresh contraction, no sharing).
             let header = best[0];
