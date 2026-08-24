@@ -8,6 +8,82 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- round 451 — **black-box cross-validation harness + pins**
+  (`examples/blackbox_capture.rs`, `tests/blackbox_encode_pins.rs`).
+  An out-of-CI driver encodes a 27-case deterministic matrix covering
+  every emittable frame type, wraps each stream in a minimal `LAGS`
+  AVI, and compares an independent third-party decoder's output (used
+  purely as a black-box binary oracle) against the crate's own decode.
+  Result: **every RGB24 / RGB32 / RGBA / YV12 case — 17/17, spanning
+  the arithmetic types 2 / 4 / 8 / 10, the solid types 5 / 6 / 9,
+  downscale-elected tables, unaligned widths, non-power-of-two
+  totals, and the round-127 "structured pattern" class — is
+  reconstructed sample-exactly by the third-party decoder**, closing
+  the standing cross-encoder-parity re-capture item. Types 1 / 7 / 11 and the NULL payload are unsupported by that
+  oracle build (rejected before decode); YUY2 remains a documented
+  partial (below). CI pins the FNV-1a-64 of all 26 encoded streams so
+  the oracle-validated bytes cannot drift silently.
+- round 451 — **framework encoder NULL ("JUMP") emission + PTS
+  passthrough** (`src/registry.rs`). `LagarithEncoder::send_frame`
+  detects a frame byte-identical to its predecessor and emits the
+  zero-byte NULL payload (`spec/01` §1.1) as a **non-keyframe**
+  packet; distinct frames stay intra keyframes. Packets now carry the
+  source frame's PTS. Duplicate frames (static scenes) cost 0 payload
+  bytes; the framework decoder's stateful replay reconstructs them
+  losslessly (new `framework_encoder_emits_null_jump_on_repeat_frame`
+  pin).
+- `#[doc(hidden)] wire_forms` module: re-exports the direct
+  wire-form frame encoders (uncompressed / legacy / reduced-res /
+  per-family arithmetic) for the capture driver and callers that need
+  to force a specific frame type.
+
+### Fixed
+
+- round 451 — **modern range coder: the top-symbol (0xff) interval
+  absorbs the quotient slack** (`src/range_coder.rs`, both
+  directions): `low/range -= cum[255]·q` instead of the previous
+  slack-discarding `range = freq[255]·q` + separate `low >= total·q`
+  branch. Black-box cross-validation proved the old form desynced a
+  third-party decoder within a few symbols of any 0xff on
+  concentrated-histogram (i.e. real-content) channels — random-table
+  streams masked it, which is why the historical pins held — while
+  the absorbing interval reproduces that decoder's stream
+  byte-exactly on every probed class. `spec/02` §5's Step-B reading
+  (`total·q` threshold) is flagged as an erratum candidate: under it
+  the documented "0xff fast path" is unreachable for any
+  interval-consistent encoder. Wire-affecting: the non-pow2 self-pin
+  and the four modern-arithmetic bench fixtures were re-frozen.
+- round 451 — **YV12 / YUY2 / reduced-res first-column predictor rule**
+  (`src/predict.rs` `FirstColRule::Yuv`): row 1 predicts `L`
+  (`plane[0][W-1]`; the `0x180009f30` carry enters the row holding
+  `T`, so `MED(L, T, T) = L`), rows ≥ 2 take the Rule-B
+  `TL = plane[y-2][W-1]` median. Replaces the `spec/06` §3.8
+  "Strategy A everywhere" reading (erratum candidate) and closes the
+  §6.4 open item (non-RGB24 row-0 → row-1 carry initialisation) for
+  YV12: under this rule the third-party oracle reconstructs YV12
+  frames byte-exactly at every probed geometry and content class
+  (gradient / reverse-gradient / zero-heavy / full-random, 64×48 and
+  320×240), and under no other candidate. YUY2 adopts the same rule
+  but stays **partially recovered**: black-box probes show the luma
+  path additionally carries a raw second row-0 sample, an
+  8-bit-wrapping median gradient, and a zeroed-TL first-chunk region
+  on row 1 that this implementation does not model — third-party
+  byte-exactness for YUY2 awaits the `spec/06` §6.4 byte-walk of the
+  YUY2 coordinator (docs ask filed via the round report).
+- round 451 — **channel-header election restricted to the
+  cross-validated set** `{0x00, 0x01..0x03, 0x04, 0xff-zero-fill}`
+  (`src/encoder.rs`). The raw+RLE forms `0x05..0x07` are mis-expanded
+  or rejected by the third-party decoder and are documented as
+  vendor-emitted nowhere (`spec/06` §1.7 / §2.7 mirror only
+  `0x00..0x03`); the constant-fill `0xff` decodes differently under
+  the two readings of `spec/06` §5 step 8 (predictor-integrated vs
+  direct fill) for any nonzero fill, so it is now elected only for
+  the all-zero plane, where both readings coincide. Both forms remain
+  fully decodable and directly encodable; only the automatic election
+  avoids them.
+
+### Added
+
 - round 432 — **transmitted-model downscale election** (cost-modeled;
   `src/encoder.rs`). The Fibonacci probability prefix's table is an
   encoder-side **model election**: the decoder derives its coding

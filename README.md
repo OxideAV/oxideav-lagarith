@@ -31,10 +31,26 @@ chroma counterpart and dropping the decoder-synthesised `0x80`
 neutral tail slot — so odd widths (incl. the degenerate `W = 1` with
 empty chroma planes) now self-roundtrip byte-exactly. Decode is
 stateless per frame (with a stateful
-wrapper for NULL "JUMP" frames). The modern RGB(A) paths are
-byte-exact-validated against an independent third-party decoder used
-strictly as a black-box binary oracle in fixture generation (it never
-runs in CI; committed pins carry the captured results).
+wrapper for NULL "JUMP" frames).
+
+**Round 451 lands third-party decodability of our encoded streams.**
+A black-box capture harness (`examples/blackbox_capture.rs`) drives a
+27-case deterministic matrix — every emittable frame type × content
+class × dimension parity — through an independent third-party decoder
+used strictly as a black-box binary oracle (never in CI): **all
+17 RGB24 / RGB32 / RGBA / YV12 cases decode sample-exactly** in that
+oracle (arithmetic types 2 / 4 / 8 / 10, solids 5 / 6 / 9,
+downscale-elected tables, unaligned widths, non-power-of-two totals,
+and the round-127 "structured pattern" class whose re-capture had been
+the standing open item). Types 1 / 7 / 11 and the NULL payload are
+rejected by that oracle build before decode (unsupported there);
+YUY2 remains a documented partial (`spec/06` §6.4). CI freezes all 26
+captured streams by hash (`tests/blackbox_encode_pins.rs`). Getting
+here surfaced and fixed two wire-semantics divergences the
+self-roundtrip suites could never see — the range coder's top-symbol
+slack interval and the YUV-family first-column predictor rule (see
+below) — and restricted the per-channel election to the
+cross-validated header set.
 
 ### Frame-type coverage
 
@@ -69,9 +85,14 @@ runs in CI; committed pins carry the captured results).
    JPEG-LS clamped median on rows ≥ 1. The modern RGB(A) types (2 / 4 /
    8) and the legacy type-7 path use the **Rule B** first-column rule
    (`TL = plane[y-2][W-1]`), while the YV12 / YUY2 / reduced-resolution
-   families (3 / 10 / 11) use **Rule A** unconditionally (their
-   chroma-subsampled plane widths are always 4-byte-aligned, so the
-   predictor never takes the `width % 4` Rule-B branch — `spec/06` §3.8).
+   families (3 / 10 / 11) use the round-451 oracle-recovered **Yuv**
+   rule — row 1 predicts `L = plane[0][W-1]` (the `0x180009f30`
+   carry enters the row holding `T`, so `MED(L, T, T) = L`), rows
+   ≥ 2 take the Rule-B median. This replaces `spec/06` §3.8's
+   "Strategy A everywhere" reading (flagged as an erratum candidate)
+   and closes the §6.4 open item for YV12: the black-box oracle
+   reconstructs YV12 frames byte-exactly under this rule at every
+   probed geometry/content class, and under no other candidate.
 7. **Cross-plane decorrelation** (`spec/03` §4) — RGB families only:
    `R += G; B += G` post-prediction; alpha is stored raw.
 
@@ -179,10 +200,24 @@ Through the framework, `CodecRegistry::first_encoder` yields a
 `LagarithEncoder` (`oxideav_core::Encoder`): `send_frame` reassembles
 the packed host buffer from a `VideoFrame`'s planes (stride padding
 stripped; YV12's three `Y / V / U` planes concatenated), and
-`receive_packet` emits one keyframe packet per frame. The host pixel
-format is read from `CodecParameters::pixel_format` (`Bgr24`, `Bgra`,
-`Yuv420P`, `Yuyv422`); unsupported formats are rejected at encoder
-construction.
+`receive_packet` emits one packet per frame carrying the source
+frame's PTS. A frame byte-identical to its predecessor becomes the
+zero-byte NULL ("JUMP") payload (`spec/01` §1.1) as a non-keyframe
+packet — static scenes cost 0 payload bytes and the stateful decoder
+replays the predecessor losslessly; distinct frames stay intra
+keyframes. The host pixel format is read from
+`CodecParameters::pixel_format` (`Bgr24`, `Bgra`, `Yuv420P`,
+`Yuyv422`); unsupported formats are rejected at encoder construction.
+
+Since round 451 the per-channel header election stays within the
+**cross-validated form set** `{0x00, 0x01..0x03, 0x04,
+0xff-zero-fill}`: the raw+RLE forms (`0x05..0x07`) and the
+nonzero-constant fill decode divergently (or not at all) in the
+black-box oracle, and the docs' encoder-mirror sections document
+vendor emission only for `0x00..0x03` — every form remains decodable
+and directly encodable (`encode_channel_raw_rle`), the automatic
+election just never emits a wire whose third-party decode is
+unconfirmed.
 
 ## Tests, benchmarks, fuzzing
 
@@ -194,6 +229,14 @@ construction.
   takes call site A (pre-RLE length, prefix at byte 5); `>= n_pixels`
   diverts to the header-`0x00` Fibonacci fall-back; a `0` length field
   surfaces a clean `Error::Truncated`.
+- The **round-451 black-box capture matrix**
+  (`examples/blackbox_capture.rs`, out of CI) muxes every emittable
+  frame type into minimal `LAGS` AVIs and diffs the third-party
+  oracle's raw output against the crate's own decode, classifying
+  each case Exact / oracle-unsupported / documented-YUY2-gap;
+  `tests/blackbox_encode_pins.rs` re-derives the same 26 streams in
+  CI and pins their bytes by FNV-1a-64 hash plus self-roundtrip, so
+  the oracle-validated wire cannot drift between captures.
 - An **exhaustive encoder → decoder self-roundtrip matrix**
   (`encoder_exhaustive_matrix`) drives every encodable colour family
   through a full cross-product of *dimensions* (spanning the
@@ -300,18 +343,40 @@ the pre-RLE arithmetic headers whose totals are non-pow2 even at pow2
 pixel counts, which is where the oracle (normalizing) and the crate's
 old raw-total model diverged.
 
-What remains open is byte-exact **cross-parity re-confirmation**
-against a *proprietary-encoded* stream (and a re-capture of the
-round-127 structured-pattern class against the black-box oracle, now
-expected to pass). It awaits a fixture — the public sample set 404s
-(`provenance/52` §6). One recovered-trace caveat is also pinned there
-(§5): the i386 build's rescale converts with `fistp` (x87
-rounding-mode-dependent) where the x86-64 build truncates; this crate
-targets the x86-64 truncation semantics per the trace's
-recommendation, and only a real fixture can settle the i386 `cum[]`
-±1 question empirically. The crate's own encode→decode round-trips
-all such streams byte-exactly, and a wire-level self-pin freezes the
-normalized non-pow2 channel bytes against drift.
+**Round 451 closes the cross-decoder re-capture** the round-407
+normalizer had left open: the black-box oracle now reconstructs every
+modern RGB(A)/YV12 stream the encoder emits byte-exactly, including
+the structured-pattern and non-pow2-total classes (see Status). Two
+further wire-semantics recoveries made that possible, both flagged as
+spec erratum candidates in the round report: the modern range coder's
+**top-symbol (0xff) slack-absorbing interval** (`spec/02` §5 Step B's
+recovered `total·q` threshold leaves the documented "0xff fast path"
+unreachable; the boundary is `cum[255]·q`) and the **Yuv first-column
+predictor rule** for the 4:2:x families (`spec/06` §3.8 / §6.4).
+
+Still open:
+
+* **YUY2 luma-path carry semantics** (`spec/06` §6.4, now the last
+  predictor gap): black-box probes additionally show a raw second
+  row-0 luma sample, an 8-bit-wrapping median gradient, and a
+  zeroed-TL first-chunk region on row 1; a candidate model matching
+  gradient/zero-heavy content exactly still diverges on full-random
+  content, so the recovery is incomplete and the crate deliberately
+  ships only the YV12-confirmed rule. Needs the §6.4 byte-walk of the
+  YUY2 coordinator/predictor (`0x180004ec0` / `0x180009f30`).
+* **`spec/06` §5 header-`0xff` semantics**: the oracle fills the
+  plane with no predictor pass, the checklist's step 8 implies one;
+  the encoder sidesteps the conflict (zero fill only) until a
+  vendor-encoded fixture or a re-derivation arbitrates.
+* **Proprietary-encoded fixture** — still the one artefact that would
+  arbitrate every remaining conflict directly against the vendor
+  bitstream. Per the docs staging of 2026-08-10 this is resolved as
+  an **operator upload** to the project fixture host (no research
+  path remains). The i386 `fistp` rounding caveat that fixture was
+  once needed for is now settled statically (audit/15, 2026-07-31):
+  both official builds truncate, so the rescale + residue path is
+  architecture-independent and the crate's x86-64-truncation model
+  covers both.
 
 ## License
 
