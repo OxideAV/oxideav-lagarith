@@ -23,7 +23,8 @@ use crate::legacy_range_coder::{
     build_legacy_cdf, encode_legacy_freq_table, is_rare_symbol_cluster, LegacyRangeEncoder,
 };
 use crate::predict::{
-    apply_plane_forward_with_rule, cross_plane_decorrelate_rgb_forward, FirstColRule,
+    apply_plane_forward_with_rule, apply_plane_forward_yuy2, cross_plane_decorrelate_rgb_forward,
+    FirstColRule,
 };
 use crate::range_coder::{Cdf, RangeEncoder, TOP};
 use crate::rle::contract_raw;
@@ -967,11 +968,13 @@ pub fn encode_arith_yuy2(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
     debug_assert_eq!(plane_u.len(), c_pixels);
     debug_assert_eq!(plane_v.len(), c_pixels);
 
-    // Round-451 Yuv first-column rule — see `encode_arith_yv12` and
-    // the YUY2 partial-recovery note in `decode_arith_yuy2`.
-    let res_y = apply_plane_forward_with_rule(&plane_y, w, h, FirstColRule::Yuv);
-    let res_u = apply_plane_forward_with_rule(&plane_u, cw, h, FirstColRule::Yuv);
-    let res_v = apply_plane_forward_with_rule(&plane_v, cw, h, FirstColRule::Yuv);
+    // Round-451 oracle-recovered YUY2 predictor — see
+    // `decode_arith_yuy2` / `apply_plane_forward_yuy2` (raw second
+    // luma sample on row 0, plain-L first chunk of row 1, wrapping
+    // median elsewhere).
+    let res_y = apply_plane_forward_yuy2(&plane_y, w, h, true);
+    let res_u = apply_plane_forward_yuy2(&plane_u, cw, h, false);
+    let res_v = apply_plane_forward_yuy2(&plane_v, cw, h, false);
 
     // Per-channel header-form selector — see `encode_channel_best`.
     let ch_y = encode_channel_best(&res_y);

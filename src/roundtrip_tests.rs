@@ -1295,19 +1295,17 @@ fn yuy2_odd_width_raw_channel_floor_layout_roundtrip() {
 
     // Hand-build per-plane RESIDUAL byte sequences by inverting the
     // forward predictor on a full plane of arbitrary values. Reuse
-    // `apply_plane_forward_with_rule` from the predict module (the
-    // YUY2 wire uses the round-451 oracle-recovered Yuv first-column
-    // rule).
-    use crate::predict::{apply_plane_forward_with_rule, FirstColRule};
-    let fwd =
-        |p: &[u8], w: usize, h: usize| apply_plane_forward_with_rule(p, w, h, FirstColRule::Yuv);
+    // `apply_plane_forward_yuy2` from the predict module (the
+    // round-451 oracle-recovered YUY2 predictor; the luma plane
+    // carries the raw second row-0 sample).
+    use crate::predict::apply_plane_forward_yuy2;
     let plane_y_full: Vec<u8> = (0..n_y).map(|i| ((i * 7) ^ 0x55) as u8).collect();
     let plane_u_full: Vec<u8> = (0..n_c).map(|i| (0x40 + i as u8) ^ 0x10).collect();
     let plane_v_full: Vec<u8> = (0..n_c).map(|i| (0xa0 + i as u8) ^ 0x20).collect();
 
-    let res_y = fwd(&plane_y_full, w as usize, h as usize);
-    let res_u = fwd(&plane_u_full, cw, h as usize);
-    let res_v = fwd(&plane_v_full, cw, h as usize);
+    let res_y = apply_plane_forward_yuy2(&plane_y_full, w as usize, h as usize, true);
+    let res_u = apply_plane_forward_yuy2(&plane_u_full, cw, h as usize, false);
+    let res_v = apply_plane_forward_yuy2(&plane_v_full, cw, h as usize, false);
 
     // Channel-header 0x04 raw-memcpy: byte 0 = 0x04, then the
     // residual stream verbatim.
@@ -2080,9 +2078,9 @@ mod best_pipeline_size_delta {
                 plane_v.push(pixels[in_row + 4 * k + 3]);
             }
         }
-        let res_y = apply_plane_forward_with_rule(&plane_y, w, h, FirstColRule::Yuv);
-        let res_u = apply_plane_forward_with_rule(&plane_u, cw, h, FirstColRule::Yuv);
-        let res_v = apply_plane_forward_with_rule(&plane_v, cw, h, FirstColRule::Yuv);
+        let res_y = crate::predict::apply_plane_forward_yuy2(&plane_y, w, h, true);
+        let res_u = crate::predict::apply_plane_forward_yuy2(&plane_u, cw, h, false);
+        let res_v = crate::predict::apply_plane_forward_yuy2(&plane_v, cw, h, false);
         let ch_y = encode_channel_simple(&res_y);
         let ch_u = encode_channel_simple(&res_u);
         let ch_v = encode_channel_simple(&res_v);

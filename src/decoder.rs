@@ -37,7 +37,10 @@
 use crate::channel::{decode_channel, decode_legacy_channel};
 use crate::error::{Error, Result};
 use crate::frame::{split_channels, FrameType};
-use crate::predict::{apply_plane_inverse_with_rule, cross_plane_decorrelate_rgb, FirstColRule};
+use crate::predict::{
+    apply_plane_inverse_with_rule, apply_plane_inverse_yuy2, cross_plane_decorrelate_rgb,
+    FirstColRule,
+};
 
 /// What pixel format the caller wants the decoder to produce.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -753,18 +756,19 @@ fn decode_arith_yuy2(
     let mut plane_u = decode_channel(slices[1], c_pixels)?;
     let mut plane_v = decode_channel(slices[2], c_pixels)?;
 
-    // First-column-of-row rule is the round-451 oracle-recovered
-    // **Yuv** rule shared with YV12 (`src/predict.rs`), replacing the
-    // spec/06 §3.8 "Strategy A" reading. NOTE: the YUY2 luma path's
-    // full SIMD carry semantics remain only partially recovered —
-    // black-box probes additionally show a raw second luma sample on
-    // row 0, an 8-bit-wrapping median gradient, and a zeroed-TL
-    // first-chunk region on row 1 that this implementation does NOT
-    // model (self-roundtrip is unaffected; third-party byte-exactness
-    // for YUY2 awaits the spec/06 §6.4 byte-walk of `0x180009f30`).
-    apply_plane_inverse_with_rule(&mut plane_y, w, h, FirstColRule::Yuv);
-    apply_plane_inverse_with_rule(&mut plane_u, cw, h, FirstColRule::Yuv);
-    apply_plane_inverse_with_rule(&mut plane_v, cw, h, FirstColRule::Yuv);
+    // Round-451 oracle-recovered YUY2 predictor
+    // (`apply_plane_inverse_yuy2`): row-0 raw second luma sample,
+    // plain-L first chunk of row 1 (4 luma / 2 chroma lanes),
+    // 8-bit-wrapping clamped median elsewhere with the Rule-B first
+    // column for rows >= 2. Byte-exact against the black-box oracle
+    // on every probed geometry and content class (11/11 EXACT) —
+    // closes `spec/06` §6.4 for YUY2; §3.8's shared-with-YV12
+    // "Strategy A" description is an erratum candidate (YV12
+    // measurably uses the signed-gradient median + `Yuv` rule
+    // instead).
+    apply_plane_inverse_yuy2(&mut plane_y, w, h, true);
+    apply_plane_inverse_yuy2(&mut plane_u, cw, h, false);
+    apply_plane_inverse_yuy2(&mut plane_v, cw, h, false);
 
     // Pack Y/U/V into the YUY2 output. The output is a `W * H * 2`
     // byte buffer; we emit one full row at a time. Odd-width tail

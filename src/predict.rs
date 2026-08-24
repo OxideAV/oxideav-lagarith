@@ -6,37 +6,31 @@
 //! - **RGB-family frames** apply `R += G; B += G` on the final
 //!   pixel buffer; the alpha plane (RGBA) is unchanged.
 //!
-//! ## First-column-of-row rule
+//! ## Per-family predictor selection (round-451 state)
 //!
-//! The MED predictor needs `TL` for column 0 of row `y >= 1`, which
-//! has no immediate left neighbour. Two rules apply per `spec/06`
-//! §3.2 / `spec/07` §9.1 item 7b:
+//! Three first-column rules plus a dedicated YUY2 predictor, all
+//! discriminated by black-box cross-validation against the
+//! independent third-party decoder (`tests/blackbox_encode_pins.rs`):
 //!
-//! - **Rule A** (`TL = L = plane[y-1][W-1]`): the simple "wrap
-//!   around" rule; the gradient collapses to `T`. This is the rule
-//!   the **YV12 / YUY2 / reduced-resolution** families (types 3 / 10
-//!   / 11) use unconditionally per `spec/06` §3.8: those plane
-//!   widths are always 4-byte-aligned at the natural chroma
-//!   subsampling, so the predictor at `lagarith.dll!0x180009f30`
-//!   takes the SIMD `TL = L = plane[y-1][W-1]` carry on every row
-//!   with no `width % 4` branch (and no Rule-B linear-memory step).
-//!   Rule A is also the `y == 1` fallback of Rule B (no `y - 2`
-//!   row).
-//! - **Rule B** (`TL = plane[y-2][W-1]` for `y >= 2`): the
-//!   linear-memory rule the proprietary's SIMD predictor walks one
-//!   step further back. This is the rule the **modern arithmetic
-//!   RGB(A)** path (types 2 / 4 / 8) uses, as well as the legacy
-//!   type-7 RGB path (`spec/07` §9.1 item 7b). For `y == 1` Rule B
-//!   falls back to Rule A because there is no `y - 2` row.
-//!
-//! Rule B for the modern types was confirmed against an independent
-//! third-party Lagarith decoder (black-box binary oracle): `LAGS`-
-//! wrapped frames built under Rule B decode to the original pixels
-//! byte-exactly in that oracle, whereas Rule A mis-decodes them. This
-//! resolves the cleanroom's open audit/01 §9.1 dispatch question — a
-//! horizontal-ramp fixture makes the two rules degenerate (first
-//! column constant ⇒ `TL == T`), so the static analysis could not
-//! distinguish them. See `tests/reference_pins.rs`.
+//! - **Rule B** (`TL = plane[y-2][W-1]` for `y >= 2`, Rule A at
+//!   `y == 1`) — the modern arithmetic RGB(A) types (2 / 4 / 8) and
+//!   the legacy type-7 path, signed-gradient median
+//!   ([`clamped_med`]). Oracle-confirmed for the modern path (round
+//!   124, re-confirmed round 451 across every content class).
+//! - **[`FirstColRule::Yuv`]** (row 1 predicts `L`; Rule-B median
+//!   for rows ≥ 2, signed gradient) — the **YV12 /
+//!   reduced-resolution** families (types 10 / 11). Round-451
+//!   recovery; closes `spec/06` §6.4 for YV12.
+//! - **[`apply_plane_inverse_yuy2`]** — the **YUY2** family
+//!   (type 3): raw second row-0 luma sample, plain-`L` first chunk
+//!   of row 1 (4 luma / 2 chroma lanes), and the 8-bit-**wrapping**
+//!   median ([`clamped_med_wrap`]) elsewhere, Rule-B first column
+//!   for rows ≥ 2. Round-451 second-pass recovery; closes `spec/06`
+//!   §6.4 for YUY2.
+//! - **Rule A** (`TL = L` ⇒ predictor `T`) — the `spec/03` §3.3.3 /
+//!   `spec/06` §3.8 reading; no shipping path selects it any more
+//!   (`spec/06` §3.8 is flagged as an erratum candidate) but the
+//!   variant stays for unit tests pinning its algebra.
 
 /// Selects the first-column-of-row rule for the inverse predictor.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -211,6 +205,134 @@ fn clamped_med(l: u8, t: u8, tl: u8) -> u8 {
     pred as u8
 }
 
+/// The YUY2 predictor's clamped median: identical to [`clamped_med`]
+/// except the gradient `L + T - TL` is reduced **mod 256 before**
+/// clamping (round-451 black-box recovery — the `0x180009f30` YUY2
+/// path computes the gradient in a byte-sized lane, so an over- or
+/// underflowing gradient wraps and then clamps, where the RGB / YV12
+/// paths clamp the signed-widened gradient). Observable on any
+/// neighbourhood with `L + T - TL ∉ [0, 255]`.
+#[inline]
+fn clamped_med_wrap(l: u8, t: u8, tl: u8) -> u8 {
+    let g = l.wrapping_add(t).wrapping_sub(tl);
+    let min_lt = l.min(t);
+    let max_lt = l.max(t);
+    g.clamp(min_lt, max_lt)
+}
+
+/// Round-451 oracle-recovered **YUY2 plane predictor** (inverse
+/// direction), covering the type-3 family's luma and chroma planes.
+/// Byte-exactly reproduces the independent third-party decoder's
+/// reconstruction on every probed geometry (2×8 .. 128×96, odd
+/// chroma widths) and content class (gradient, zero-heavy, two
+/// independent full-random streams) — 11/11 EXACT in the round-451
+/// capture. The recovered structure:
+///
+/// * **Row 0** — cumulative left sum; the **luma** plane additionally
+///   stores its second sample raw (`plane[0][1] = residual`, the
+///   packed first macropixel seeds both `Y0` and `Y1`).
+/// * **Row 1, `x < 4` (luma) / `x < 2` (chroma)** — the predictor is
+///   plain `L` (the previous sample in linear memory; for `x = 0`
+///   that is `plane[0][W-1]`): the first SIMD chunk of the row
+///   enters with no usable `T`/`TL` lanes.
+/// * **Everywhere else** — the 8-bit-wrapping clamped median
+///   ([`clamped_med_wrap`]), with the first column of rows ≥ 2
+///   taking the Rule-B `TL = plane[y-2][W-1]`.
+///
+/// This supersedes `spec/06` §3.8's "same `TL = L` (Strategy A)"
+/// description of the `0x180009f30` predictor for the YUY2
+/// coordinator and closes the §6.4 open item for YUY2; the YV12
+/// coordinator measurably does NOT share it (its planes reconstruct
+/// under the signed-gradient median + [`FirstColRule::Yuv`] and
+/// diverge under this rule on random content), so the two families
+/// keep separate predictor paths.
+pub(crate) fn apply_plane_inverse_yuy2(plane: &mut [u8], width: usize, height: usize, luma: bool) {
+    debug_assert_eq!(plane.len(), width * height);
+    if width == 0 || height == 0 {
+        return;
+    }
+    let special = if luma { 4 } else { 2 };
+    // Row 0: cumulative sum; luma keeps plane[1] raw and continues
+    // the running sum from it.
+    let mut start = 1usize;
+    if luma && width >= 2 {
+        // plane[1] stays as-is (raw seed).
+        start = 2;
+    }
+    for x in start..width {
+        plane[x] = plane[x].wrapping_add(plane[x - 1]);
+    }
+    for y in 1..height {
+        let row_off = y * width;
+        let prev_off = row_off - width;
+        for x in 0..width {
+            let pred = if y == 1 && x < special {
+                // First chunk of row 1: plain L (linear memory —
+                // x = 0 reads the previous row's last sample).
+                plane[row_off + x - 1]
+            } else if x == 0 {
+                let l = plane[row_off - 1];
+                let t = plane[prev_off];
+                let tl = plane[(y - 2) * width + width - 1];
+                clamped_med_wrap(l, t, tl)
+            } else {
+                let l = plane[row_off + x - 1];
+                let t = plane[prev_off + x];
+                let tl = plane[prev_off + x - 1];
+                clamped_med_wrap(l, t, tl)
+            };
+            plane[row_off + x] = plane[row_off + x].wrapping_add(pred);
+        }
+    }
+}
+
+/// Forward (encoder-side) counterpart of
+/// [`apply_plane_inverse_yuy2`]; produces the residual stream the
+/// inverse integrates back to `plane`.
+pub(crate) fn apply_plane_forward_yuy2(
+    plane: &[u8],
+    width: usize,
+    height: usize,
+    luma: bool,
+) -> Vec<u8> {
+    debug_assert_eq!(plane.len(), width * height);
+    let mut out = vec![0u8; width * height];
+    if width == 0 || height == 0 {
+        return out;
+    }
+    let special = if luma { 4 } else { 2 };
+    out[0] = plane[0];
+    let mut start = 1usize;
+    if luma && width >= 2 {
+        out[1] = plane[1]; // raw seed
+        start = 2;
+    }
+    for x in start..width {
+        out[x] = plane[x].wrapping_sub(plane[x - 1]);
+    }
+    for y in 1..height {
+        let row_off = y * width;
+        let prev_off = row_off - width;
+        for x in 0..width {
+            let pred = if y == 1 && x < special {
+                plane[row_off + x - 1]
+            } else if x == 0 {
+                let l = plane[row_off - 1];
+                let t = plane[prev_off];
+                let tl = plane[(y - 2) * width + width - 1];
+                clamped_med_wrap(l, t, tl)
+            } else {
+                let l = plane[row_off + x - 1];
+                let t = plane[prev_off + x];
+                let tl = plane[prev_off + x - 1];
+                clamped_med_wrap(l, t, tl)
+            };
+            out[row_off + x] = plane[row_off + x].wrapping_sub(pred);
+        }
+    }
+    out
+}
+
 /// Reverse the cross-plane G-pivot decorrelation in place: R += G;
 /// B += G. Each slice has the same length (`spec/03` §4).
 pub fn cross_plane_decorrelate_rgb(r: &mut [u8], g: &[u8], b: &mut [u8]) {
@@ -325,10 +447,9 @@ mod tests {
         assert_eq!(res_a, res_b);
     }
 
-    /// `spec/06` §3.8: the YV12 / YUY2 / reduced-resolution families
-    /// decode their planes under Rule A unconditionally. This pins the
-    /// invariant that Rule-A reconstruction inverts Rule-A residuals
-    /// exactly (the decode path's selection), on a multi-row plane
+    /// Historical-rule algebra pin (Rule A is no longer selected by
+    /// any shipping path — see the module header): Rule-A
+    /// reconstruction inverts Rule-A residuals exactly, on a multi-row plane
     /// whose first columns straddle so Rule A and Rule B genuinely
     /// diverge — i.e. the choice is observable, not degenerate.
     #[test]
