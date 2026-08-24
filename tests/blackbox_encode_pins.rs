@@ -23,10 +23,11 @@
 //!   itself ("Unsupported Lagarith frame type"): types 1 / 7 / 11.
 //!   The NULL ("JUMP") payload is undecidable through it too (its
 //!   demuxer drops zero-byte packets). Pinned for stability only.
-//! * `KnownYuy2Gap` — YUY2 (type 3): the luma path's SIMD carry
-//!   semantics are only partially recovered (`spec/06` §6.4 stays
-//!   open); the oracle diverges on rich content. Pinned for
-//!   stability; not third-party-validated.
+//! * The even-width YUY2 cases joined the `Exact` class in the
+//!   round-451 second pass (complete recovery of the YUY2 predictor:
+//!   raw second row-0 luma sample, plain-L row-1 first chunk,
+//!   8-bit-wrapping median); the odd-width case stays stability-only
+//!   because the oracle rejects odd-width YUY2 frames outright.
 //!
 //! Two coder-semantics recoveries landed with this capture (both
 //! confirmed by the oracle reproducing our streams byte-exactly, and
@@ -457,7 +458,7 @@ fn pins() -> Vec<Pin> {
             false,
             false,
         ),
-        // ── stability-only pins (documented YUY2 gap, spec/06 §6.4) ──
+        // ── YUY2 (oracle-EXACT since the round-451 second pass) ──
         pin(
             "yuy2_64x48_gradient_t3",
             Yuy2,
@@ -466,8 +467,8 @@ fn pins() -> Vec<Pin> {
             GradientNoise,
             41,
             None,
-            0x7bf011e5e1340a5a,
-            false,
+            0xfeeec7e2f6e408b3,
+            true,
             true,
         ),
         pin(
@@ -478,8 +479,8 @@ fn pins() -> Vec<Pin> {
             ZeroHeavy,
             42,
             None,
-            0x29038812cc6515b4,
-            false,
+            0x2233a38373d4218d,
+            true,
             true,
         ),
         // Odd width: the tail chroma slot is decoder-synthesised
@@ -493,7 +494,7 @@ fn pins() -> Vec<Pin> {
             GradientNoise,
             43,
             None,
-            0x3d7b30d3dd2914c1,
+            0xfb60be7f07a66a76,
             false,
             false,
         ),
@@ -543,5 +544,5 @@ fn blackbox_capture_pins_hold() {
     // The capture matrix's third-party-validated surface: every RGB24
     // / RGBA / YV12 case. Guards against silently shrinking the
     // validated class when editing the table.
-    assert_eq!(oracle_exact, 17, "oracle-exact pin count changed");
+    assert_eq!(oracle_exact, 19, "oracle-exact pin count changed");
 }

@@ -39,10 +39,14 @@
 //!   The zero-byte NULL ("JUMP") payload is also here: the oracle's
 //!   demuxer drops empty packets before they reach its decoder under
 //!   every probed flag combination.
-//! * `KnownYuy2Gap` — YUY2 (type 3): the luma path's SIMD carry
-//!   semantics are only partially recovered (spec/06 §6.4); the
-//!   oracle diverges on rich content and rejects odd widths. Tracked
-//!   as a docs ask, reported but not counted as a failure.
+//! * `KnownYuy2Gap` — reserved for a YUY2 case awaiting recovery.
+//!   As of the round-451 second pass the even-width YUY2 predictor is
+//!   fully recovered (raw second row-0 luma sample, plain-L row-1
+//!   first chunk, 8-bit-wrapping median) and those cases moved to
+//!   `Exact`; only the odd-width case remains here — the oracle
+//!   rejects odd-width YUY2 frames outright regardless of content,
+//!   so the crate's spec/03 §6.2 floor-chroma odd-width form is
+//!   validated by self-roundtrip only.
 
 use oxideav_lagarith::{decode_frame, encode_frame, encode_null, wire_forms, PixelKind};
 use std::io::Write as _;
@@ -539,7 +543,7 @@ fn main() {
             Content::GradientNoise,
             41,
             None,
-            KnownYuy2Gap,
+            Exact,
         ),
         case(
             "yuy2_64x48_zeroheavy",
@@ -549,7 +553,7 @@ fn main() {
             Content::ZeroHeavy,
             42,
             None,
-            KnownYuy2Gap,
+            Exact,
         ),
         case(
             "yuy2_63x48_gradient_odd",

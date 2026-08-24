@@ -39,6 +39,22 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- round 451 (second pass) — **complete YUY2 predictor recovery**
+  (`src/predict.rs` `apply_plane_{forward,inverse}_yuy2`): the type-3
+  family's planes reconstruct with (1) a **raw second row-0 luma
+  sample** (the packed first macropixel seeds `Y0` and `Y1`), (2) a
+  plain-`L` predictor over the **first chunk of row 1** (4 luma / 2
+  chroma lanes — the row enters with no usable `T`/`TL` lanes), and
+  (3) the clamped median computed on the **mod-256-wrapped gradient**
+  everywhere else (RGB / YV12 clamp the signed gradient), with the
+  Rule-B first column for rows ≥ 2. Discriminated cell-by-cell from
+  oracle output on full-random content and verified frame-exact on
+  11/11 fixtures spanning 2×8 .. 128×96, odd chroma widths, and four
+  content classes — the even-width YUY2 cases move into the capture
+  matrix's oracle-EXACT class (now 19/26) and their pins are
+  re-frozen. Closes `spec/06` §6.4 for YUY2; the odd-width form stays
+  self-roundtrip-only (the oracle rejects odd-width YUY2 frames
+  outright). `FRAME_YUY2_64` re-captured.
 - round 451 — **modern range coder: the top-symbol (0xff) interval
   absorbs the quotient slack** (`src/range_coder.rs`, both
   directions): `low/range -= cum[255]·q` instead of the previous

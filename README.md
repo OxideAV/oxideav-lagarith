@@ -38,19 +38,20 @@ A black-box capture harness (`examples/blackbox_capture.rs`) drives a
 27-case deterministic matrix — every emittable frame type × content
 class × dimension parity — through an independent third-party decoder
 used strictly as a black-box binary oracle (never in CI): **all
-17 RGB24 / RGB32 / RGBA / YV12 cases decode sample-exactly** in that
-oracle (arithmetic types 2 / 4 / 8 / 10, solids 5 / 6 / 9,
-downscale-elected tables, unaligned widths, non-power-of-two totals,
-and the round-127 "structured pattern" class whose re-capture had been
-the standing open item). Types 1 / 7 / 11 and the NULL payload are
-rejected by that oracle build before decode (unsupported there);
-YUY2 remains a documented partial (`spec/06` §6.4). CI freezes all 26
-captured streams by hash (`tests/blackbox_encode_pins.rs`). Getting
-here surfaced and fixed two wire-semantics divergences the
+19 RGB24 / RGB32 / RGBA / YV12 / even-width-YUY2 cases decode
+sample-exactly** in that oracle (arithmetic types 2 / 3 / 4 / 8 / 10,
+solids 5 / 6 / 9, downscale-elected tables, unaligned widths,
+non-power-of-two totals, and the round-127 "structured pattern" class
+whose re-capture had been the standing open item). Types 1 / 7 / 11,
+the NULL payload, and odd-width YUY2 are rejected by that oracle
+build before decode (unsupported there). CI freezes all 26 captured
+streams by hash (`tests/blackbox_encode_pins.rs`). Getting here
+surfaced and fixed three wire-semantics divergences the
 self-roundtrip suites could never see — the range coder's top-symbol
-slack interval and the YUV-family first-column predictor rule (see
-below) — and restricted the per-channel election to the
-cross-validated header set.
+slack interval, the YV12-family first-column predictor rule, and the
+complete YUY2 predictor (raw second row-0 luma sample, plain-L row-1
+first chunk, 8-bit-wrapping median; see below) — and restricted the
+per-channel election to the cross-validated header set.
 
 ### Frame-type coverage
 
@@ -84,15 +85,23 @@ cross-validated header set.
 6. **Spatial predictor** (`spec/03` §3) — left predictor on row 0,
    JPEG-LS clamped median on rows ≥ 1. The modern RGB(A) types (2 / 4 /
    8) and the legacy type-7 path use the **Rule B** first-column rule
-   (`TL = plane[y-2][W-1]`), while the YV12 / YUY2 / reduced-resolution
-   families (3 / 10 / 11) use the round-451 oracle-recovered **Yuv**
+   (`TL = plane[y-2][W-1]`), while the YV12 / reduced-resolution
+   families (10 / 11) use the round-451 oracle-recovered **Yuv**
    rule — row 1 predicts `L = plane[0][W-1]` (the `0x180009f30`
    carry enters the row holding `T`, so `MED(L, T, T) = L`), rows
-   ≥ 2 take the Rule-B median. This replaces `spec/06` §3.8's
-   "Strategy A everywhere" reading (flagged as an erratum candidate)
-   and closes the §6.4 open item for YV12: the black-box oracle
-   reconstructs YV12 frames byte-exactly under this rule at every
-   probed geometry/content class, and under no other candidate.
+   ≥ 2 take the Rule-B median — and YUY2 (type 3) uses its own
+   recovered predictor: the luma plane stores its second row-0
+   sample raw (the packed first macropixel seeds `Y0` and `Y1`),
+   the first chunk of row 1 (4 luma / 2 chroma lanes) predicts
+   plain `L`, and everywhere else the clamped-median **gradient
+   wraps mod 256** before clamping (where RGB / YV12 clamp the
+   signed gradient), with the Rule-B first column for rows ≥ 2.
+   Both recoveries replace `spec/06` §3.8's "Strategy A everywhere"
+   reading (flagged as an erratum candidate) and close the §6.4
+   open item: the black-box oracle reconstructs YV12 **and**
+   even-width YUY2 frames byte-exactly under these rules at every
+   probed geometry/content class — and under no other candidate
+   (the two families measurably do NOT share one predictor).
 7. **Cross-plane decorrelation** (`spec/03` §4) — RGB families only:
    `R += G; B += G` post-prediction; alpha is stored raw.
 
@@ -356,14 +365,10 @@ predictor rule** for the 4:2:x families (`spec/06` §3.8 / §6.4).
 
 Still open:
 
-* **YUY2 luma-path carry semantics** (`spec/06` §6.4, now the last
-  predictor gap): black-box probes additionally show a raw second
-  row-0 luma sample, an 8-bit-wrapping median gradient, and a
-  zeroed-TL first-chunk region on row 1; a candidate model matching
-  gradient/zero-heavy content exactly still diverges on full-random
-  content, so the recovery is incomplete and the crate deliberately
-  ships only the YV12-confirmed rule. Needs the §6.4 byte-walk of the
-  YUY2 coordinator/predictor (`0x180004ec0` / `0x180009f30`).
+* **Odd-width YUY2 third-party validation**: the oracle rejects
+  odd-width YUY2 frames outright regardless of content, so the
+  crate's `spec/03` §6.2 floor-chroma odd-width form remains
+  validated by self-roundtrip only.
 * **`spec/06` §5 header-`0xff` semantics**: the oracle fills the
   plane with no predictor pass, the checklist's step 8 implies one;
   the encoder sidesteps the conflict (zero fill only) until a
