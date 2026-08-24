@@ -256,6 +256,8 @@ pub fn make_encoder(params: &CodecParameters) -> CoreResult<Box<dyn Encoder>> {
         pixel_kind,
         out_params,
         pending: None,
+        pending_pts: None,
+        prev_pixels: None,
         eof: false,
     }))
 }
@@ -267,6 +269,16 @@ struct LagarithEncoder {
     pixel_kind: PixelKind,
     out_params: CodecParameters,
     pending: Option<Vec<u8>>,
+    /// PTS of the frame the pending packet was encoded from.
+    pending_pts: Option<i64>,
+    /// Packed host buffer of the most recently encoded frame.
+    /// `send_frame` compares the incoming frame against it and emits
+    /// the zero-byte NULL ("JUMP") payload on an exact repeat
+    /// (`spec/01` §1.1) — the reference encoder's inter-frame rate
+    /// feature: a conformant stateful decoder replays the
+    /// predecessor, so duplicate frames (static scenes, capture
+    /// overruns) cost 0 payload bytes instead of a full intra frame.
+    prev_pixels: Option<Vec<u8>>,
     eof: bool,
 }
 
@@ -364,18 +376,36 @@ impl Encoder for LagarithEncoder {
             }
         };
         let pixels = self.pack_planes(vf)?;
-        let bytes = encode_frame(&pixels, self.width, self.height, self.pixel_kind)
-            .map_err(|e| CoreError::invalid(format!("oxideav-lagarith: {e}")))?;
+        // NULL ("JUMP") fast path: a frame byte-identical to the
+        // previous one is transmitted as the zero-byte payload
+        // (`spec/01` §1.1) and replayed by the decoder.
+        let bytes = if self.prev_pixels.as_deref() == Some(pixels.as_slice()) {
+            crate::encode_null()
+        } else {
+            let b = encode_frame(&pixels, self.width, self.height, self.pixel_kind)
+                .map_err(|e| CoreError::invalid(format!("oxideav-lagarith: {e}")))?;
+            self.prev_pixels = Some(pixels);
+            b
+        };
         self.pending = Some(bytes);
+        self.pending_pts = vf.pts;
         Ok(())
     }
 
     fn receive_packet(&mut self) -> CoreResult<Packet> {
         match self.pending.take() {
-            // Every Lagarith frame is intra-only (the codec is
-            // lossless and stateless across frames — `spec/00`), so
-            // each emitted packet is a keyframe.
-            Some(bytes) => Ok(Packet::new(0, TimeBase::new(1, 1), bytes).with_keyframe(true)),
+            // Every non-NULL Lagarith frame is intra-only (the codec
+            // is lossless and stateless across frames — `spec/00`),
+            // so each non-empty packet is a keyframe. A NULL ("JUMP")
+            // packet depends on its predecessor and is NOT a
+            // keyframe: a demuxer must not start decode or seek at
+            // it. The source frame's PTS is carried through.
+            Some(bytes) => {
+                let keyframe = !bytes.is_empty();
+                let mut pkt = Packet::new(0, TimeBase::new(1, 1), bytes).with_keyframe(keyframe);
+                pkt.pts = self.pending_pts.take();
+                Ok(pkt)
+            }
             None => {
                 if self.eof {
                     Err(CoreError::Eof)
@@ -498,6 +528,68 @@ mod tests {
             other => panic!("expected video, got {other:?}"),
         };
         assert_eq!(replayed, pixels, "NULL frame must replay the predecessor");
+    }
+
+    /// Round 451: the framework `Encoder` emits the zero-byte NULL
+    /// ("JUMP") payload for a frame byte-identical to its
+    /// predecessor (`spec/01` §1.1) — non-keyframe, PTS carried
+    /// through — and resumes full intra frames when content changes.
+    /// The packets decode back losslessly through the framework
+    /// `Decoder`'s stateful NULL replay.
+    #[test]
+    fn framework_encoder_emits_null_jump_on_repeat_frame() {
+        use oxideav_core::PixelFormat;
+        let (w, h) = (8u32, 6u32);
+        let pixels_a: Vec<u8> = (0..(w * h * 4)).map(|i| (i * 17 % 251) as u8).collect();
+        let pixels_b: Vec<u8> = pixels_a.iter().map(|&b| b.wrapping_add(3)).collect();
+
+        let mut params = CodecParameters::video(CodecId::new(CODEC_ID_STR));
+        params.media_type = MediaType::Video;
+        params.width = Some(w);
+        params.height = Some(h);
+        params.pixel_format = Some(PixelFormat::Bgra);
+
+        let frame = |pixels: &Vec<u8>, pts: i64| {
+            Frame::Video(VideoFrame {
+                pts: Some(pts),
+                planes: vec![VideoPlane {
+                    stride: (w * 4) as usize,
+                    data: pixels.clone(),
+                }],
+            })
+        };
+
+        let mut enc = make_encoder(&params).unwrap();
+        let mut dec = make_decoder(&params).unwrap();
+        let mut decoded = Vec::new();
+        for (i, src) in [&pixels_a, &pixels_a, &pixels_a, &pixels_b, &pixels_b]
+            .into_iter()
+            .enumerate()
+        {
+            enc.send_frame(&frame(src, i as i64)).unwrap();
+            let pkt = enc.receive_packet().unwrap();
+            assert_eq!(pkt.pts, Some(i as i64), "packet {i} carries the frame PTS");
+            let is_repeat = i == 1 || i == 2 || i == 4;
+            assert_eq!(
+                pkt.data.is_empty(),
+                is_repeat,
+                "packet {i}: repeat frames are zero-byte NULL payloads"
+            );
+            assert_eq!(
+                pkt.flags.keyframe, !is_repeat,
+                "packet {i}: NULL packets must not be keyframes"
+            );
+            dec.send_packet(&pkt).unwrap();
+            match dec.receive_frame().unwrap() {
+                Frame::Video(v) => decoded.push(v.planes[0].data.clone()),
+                other => panic!("expected video, got {other:?}"),
+            }
+        }
+        assert_eq!(decoded[0], pixels_a);
+        assert_eq!(decoded[1], pixels_a);
+        assert_eq!(decoded[2], pixels_a);
+        assert_eq!(decoded[3], pixels_b);
+        assert_eq!(decoded[4], pixels_b);
     }
 
     #[test]
