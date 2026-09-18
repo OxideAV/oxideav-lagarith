@@ -5891,14 +5891,16 @@ mod encoder_exhaustive_matrix {
             (0x01..=0x03).any(|h| seen.contains(&h)),
             "selector never chose any arithmetic-RLE form 0x01..0x03; seen = {seen:02x?}",
         );
-        // Round 451: the raw+RLE forms 0x05..0x07 are deliberately
-        // NOT electable (cross-decoder interop; see
+        // Rounds 451 / 459: the raw+RLE forms 0x05..0x07 are
+        // deliberately NOT electable — they are vendor wire (the
+        // corpus carries 55 such channels) but the mainstream
+        // third-party decoder rejects them (see
         // `encode_channel_best`) — assert the selector stays within
-        // the cross-validated set.
+        // the interoperable set.
         assert!(
             !(0x05..=0x07).any(|h| seen.contains(&h)),
-            "selector elected a raw-RLE form 0x05..0x07, which round 451 \
-             removed from the election; seen = {seen:02x?}",
+            "selector elected a raw-RLE form 0x05..0x07, which the \
+             election withholds for third-party interop; seen = {seen:02x?}",
         );
         assert!(
             seen.contains(&0xff),
@@ -7054,4 +7056,169 @@ fn yuv_seeded_predictor_with_plane0_seed_equals_the_yuv_rule() {
         apply_plane_inverse_yuv_seeded(&mut c, w, h, res[0].wrapping_add(0x80));
         assert_ne!(c, plane, "{w}x{h}: seed must be observable");
     }
+}
+
+// ───────── Round 459: encoder election against the vendor corpus ─────────
+
+/// A solid residual plane `{v, 0, 0, …}` — zero or not — is elected
+/// as the 2-byte header-`0xff` form (`spec/03` §2.1 corrected
+/// blockquote), and it decodes back to the same residual plane. The
+/// vendor emits exactly this for its solid `B'` / `R'` / chroma planes
+/// (`rgb24-4x4-nearflat` `07,ff,ff`, `yv12-*-flat` `ff,ff,ff`).
+#[test]
+fn encoder_elects_header_ff_for_any_solid_residual_plane() {
+    use crate::encoder::{encode_channel_best, encode_channel_simple};
+    for v in [0u8, 1, 0x5c, 0xff] {
+        let mut plane = vec![0u8; 64];
+        plane[0] = v;
+        assert_eq!(encode_channel_best(&plane), vec![0xff, v], "v={v}");
+        assert_eq!(encode_channel_simple(&plane), vec![0xff, v], "v={v}");
+        assert_eq!(decode_channel(&[0xff, v], 64).unwrap(), plane);
+    }
+    // A plane that is constant but NOT of the residual-solid shape
+    // (every residual equal and non-zero) is not the `0xff` form.
+    let plane = vec![7u8; 64];
+    assert_ne!(encode_channel_best(&plane)[0], 0xff);
+}
+
+/// Frame-level solid planes per family go out as `0xff` channels and
+/// round-trip: an RGB24 frame whose `B - G` and `R - G` planes are
+/// constant (vendor `ramp` / `nearflat` shape), a YV12 flat frame
+/// (`ff,ff,ff`), and a YUY2 flat frame whose luma solid shape is
+/// `{v, v, 0, …}` (raw second sample) — emitted as `ff v` and rebuilt
+/// through the coordinator's `Y[1] = Y[0]` patch.
+#[test]
+fn encoder_solid_planes_use_header_ff_per_family_and_roundtrip() {
+    use crate::frame::split_channels;
+    // RGB24 4x4: G is a gradient, B = G + 0x10, R = G + 0x20.
+    let (w, h) = (4u32, 4u32);
+    let mut px = Vec::new();
+    for i in 0..16u8 {
+        let g = i.wrapping_mul(9).wrapping_add(3);
+        px.extend_from_slice(&[g.wrapping_add(0x10), g, g.wrapping_add(0x20)]);
+    }
+    let frame = encode_arith_rgb24(&px, w, h);
+    let ch = split_channels(&frame, 3).unwrap();
+    assert_eq!(ch[0], &[0xff, 0x10]);
+    assert_eq!(ch[2], &[0xff, 0x20]);
+    assert_eq!(
+        decode_frame(&frame, w, h, PixelKind::Bgr24).unwrap().pixels,
+        px
+    );
+
+    // YV12 8x8 flat.
+    let (w, h) = (8u32, 8u32);
+    let mut yv = vec![0x5au8; 64];
+    yv.extend(std::iter::repeat_n(0x9du8, 16));
+    yv.extend(std::iter::repeat_n(0x6cu8, 16));
+    let frame = encode_arith_yv12(&yv, w, h);
+    let ch = split_channels(&frame, 3).unwrap();
+    assert_eq!(ch, [&[0xff, 0x5a][..], &[0xff, 0x9d], &[0xff, 0x6c]]);
+    assert_eq!(
+        decode_frame(&frame, w, h, PixelKind::Yv12).unwrap().pixels,
+        yv
+    );
+
+    // YUY2 8x8 flat (Y 5a, U 6c, V 9d).
+    let yuy2: Vec<u8> = [0x5au8, 0x6c, 0x5a, 0x9d].repeat(32);
+    let frame = encode_arith_yuy2(&yuy2, w, h);
+    let ch = split_channels(&frame, 3).unwrap();
+    assert_eq!(ch, [&[0xff, 0x5a][..], &[0xff, 0x6c], &[0xff, 0x9d]]);
+    assert_eq!(frame.len(), 15);
+    assert_eq!(
+        decode_frame(&frame, w, h, PixelKind::Yuy2).unwrap().pixels,
+        yuy2
+    );
+    // Width 1: no raw second luma sample, the generic shape applies
+    // (the vendor never produces this width; self-consistency only).
+    let yuy2_w1: Vec<u8> = (0..8).flat_map(|_| [0x5au8, 0x80]).collect();
+    let frame = encode_arith_yuy2(&yuy2_w1, 1, 8);
+    assert_eq!(
+        decode_frame(&frame, 1, 8, PixelKind::Yuy2).unwrap().pixels,
+        yuy2_w1
+    );
+}
+
+/// RGB32 (round 459): a 32-bpp host buffer with `0xff` alpha
+/// throughout encodes as the RGB24 family (types 5 / 6 / 4 / 2), like
+/// the vendor's `rgb32-*` streams, and still round-trips byte-exactly
+/// on the 32-bpp host (the decoder writes `0xff` alpha for non-RGBA
+/// frames); the same pixels also decode on a 24-bpp host. Any other
+/// alpha keeps the RGBA forms (types 9 / 8).
+#[test]
+fn encoder_treats_opaque_bgra32_as_rgb32() {
+    use crate::encoder::encode_frame;
+    let (w, h) = (16u32, 16u32);
+    let bgr = pattern_bgr24(w, h);
+    let opaque: Vec<u8> = bgr
+        .chunks_exact(3)
+        .flat_map(|p| [p[0], p[1], p[2], 0xff])
+        .collect();
+    let frame = encode_frame(&opaque, w, h, PixelKind::Bgra32).unwrap();
+    assert_eq!(frame[0], 4, "opaque 32-bpp input takes the RGB24 family");
+    assert_eq!(frame, encode_frame(&bgr, w, h, PixelKind::Bgr24).unwrap());
+    assert_eq!(
+        decode_frame(&frame, w, h, PixelKind::Bgra32)
+            .unwrap()
+            .pixels,
+        opaque
+    );
+    assert_eq!(
+        decode_frame(&frame, w, h, PixelKind::Bgr24).unwrap().pixels,
+        bgr
+    );
+    // Solids: grey / rgb.
+    let grey = [0x5cu8, 0x5c, 0x5c, 0xff].repeat(256);
+    assert_eq!(
+        encode_frame(&grey, w, h, PixelKind::Bgra32).unwrap(),
+        vec![5, 0x5c]
+    );
+    let flat = [0x37u8, 0x8a, 0xc4, 0xff].repeat(256);
+    assert_eq!(
+        encode_frame(&flat, w, h, PixelKind::Bgra32).unwrap(),
+        vec![6, 0x37, 0x8a, 0xc4]
+    );
+    // Unaligned width -> type 2.
+    let (w2, h2) = (5u32, 7u32);
+    let opaque2: Vec<u8> = pattern_bgr24(w2, h2)
+        .chunks_exact(3)
+        .flat_map(|p| [p[0], p[1], p[2], 0xff])
+        .collect();
+    let frame2 = encode_frame(&opaque2, w2, h2, PixelKind::Bgra32).unwrap();
+    assert_eq!(frame2[0], 2);
+    assert_eq!(
+        decode_frame(&frame2, w2, h2, PixelKind::Bgra32)
+            .unwrap()
+            .pixels,
+        opaque2
+    );
+    // A single non-0xff alpha byte keeps the RGBA path.
+    let mut with_alpha = opaque.clone();
+    with_alpha[3] = 0x80;
+    let frame3 = encode_frame(&with_alpha, w, h, PixelKind::Bgra32).unwrap();
+    assert_eq!(frame3[0], 8);
+    assert_eq!(
+        decode_frame(&frame3, w, h, PixelKind::Bgra32)
+            .unwrap()
+            .pixels,
+        with_alpha
+    );
+    // Uncompressed fallback keeps the 32-bpp host layout: random
+    // opaque content must still round-trip on the 32-bpp host.
+    let mut seed = 0x1234_5678u32;
+    let noisy: Vec<u8> = (0..256)
+        .flat_map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            [seed as u8, (seed >> 8) as u8, (seed >> 16) as u8, 0xff]
+        })
+        .collect();
+    let frame4 = encode_frame(&noisy, w, h, PixelKind::Bgra32).unwrap();
+    assert_eq!(
+        decode_frame(&frame4, w, h, PixelKind::Bgra32)
+            .unwrap()
+            .pixels,
+        noisy
+    );
 }

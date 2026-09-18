@@ -239,7 +239,7 @@ fn vendor_layout_reproduces_every_byte_exact_stream() {
 
 /// Floor on the number of vendored inputs whose `encode_frame` output
 /// is byte-identical to the vendor's own stream (encoder parity).
-const ENCODER_VENDOR_IDENTICAL_FLOOR: usize = 23;
+const ENCODER_VENDOR_IDENTICAL_FLOOR: usize = 45;
 
 #[test]
 fn vendor_corpus_inputs_roundtrip_through_encoder() {

@@ -356,6 +356,14 @@ fn encode_prefix_and_body(symbols: &[u8], table: &[u32; 256]) -> Option<Vec<u8>>
     Some(out)
 }
 
+/// `true` when `plane` is the residual of a solid plane under the
+/// RGB / YV12 predictors — `plane[0] = v` and every other residual
+/// zero — i.e. exactly what the header-`0xff` form decodes to
+/// (`spec/03` §2.1 corrected blockquote). Non-empty planes only.
+fn is_solid_residual_plane(plane: &[u8]) -> bool {
+    !plane.is_empty() && plane[1..].iter().all(|&b| b == 0)
+}
+
 /// Build a per-channel byte sequence using the channel-header sub-
 /// path that produces the smallest bytes for the given plane.
 /// Round-1 strategy: try header-`0x00` (Fibonacci + range-coded) and
@@ -372,14 +380,11 @@ pub fn encode_channel_simple(plane: &[u8]) -> Vec<u8> {
     if plane.is_empty() {
         return vec![0xff, 0];
     }
-    // If the plane is all-zero, emit a solid fill — the one fill
-    // value whose decode is identical whether or not a decoder runs
-    // the predictor pass over the filled plane (round 451; see
-    // `encode_channel_best`). Nonzero-constant planes fall through
-    // to the arithmetic / raw forms, which are reading-unambiguous.
-    let nonzero = freq.iter().filter(|&&f| f > 0).count();
-    if nonzero == 1 && plane[0] == 0 {
-        return vec![0xff, 0];
+    // A solid residual plane `{v, 0, 0, …}` is the header-`0xff`
+    // form (`spec/03` §2.1 corrected blockquote; see
+    // `encode_channel_best`).
+    if is_solid_residual_plane(plane) {
+        return vec![0xff, plane[0]];
     }
 
     // Rescale the histogram so the transmitted total stays inside the
@@ -580,24 +585,24 @@ pub fn encode_channel_best(plane: &[u8]) -> Vec<u8> {
     for &b in plane {
         freq[b as usize] = freq[b as usize].saturating_add(1);
     }
-    let nonzero = freq.iter().filter(|&&f| f > 0).count();
-    // Constant-fill (0xff) election is restricted to the all-zero
-    // residual plane (round 451). A zero fill is form-invariant:
-    // integrating a zero residual plane through the spatial
-    // predictor reproduces the same all-zero plane, so the wire
-    // decodes identically whether a decoder feeds the fill through
-    // the predictor pipeline (`spec/06` §5 step 8) or writes it
-    // straight to the plane. For a NONZERO fill the two readings
-    // diverge, and black-box cross-validation shows the independent
-    // third-party decoder takes the fill as the final
-    // (pre-decorrelation) plane value with no predictor pass —
-    // against `spec/06` §5's checklist ordering. Until a
-    // proprietary-encoded fixture arbitrates that conflict, the
-    // encoder emits nonzero-constant residual planes through the
-    // unambiguous forms below (both readings agree on every other
-    // header), keeping every elected wire third-party-decodable.
-    if nonzero == 1 && plane[0] == 0 {
-        return vec![0xff, 0];
+    // Header-`0xff` "solid plane" election (round 459). The form is a
+    // *residual* plane `{v, 0, 0, …}` (`spec/03` §2.1 corrected
+    // blockquote; `spec/06` §5 step 2): the decoder zeroes the plane,
+    // stores `v` at position 0 and runs the predictor, which every
+    // rule integrates into a solid plane of `v`. So any residual plane
+    // of that exact shape — the residual of a solid plane under the
+    // RGB / YV12 predictors, zero or not — is the 2-byte form the
+    // vendor encoder itself emits for such planes (`fixtures/rgb24-
+    // 4x4-nearflat` `07,ff,ff`, `rgb24-4x4-ramp` `ff,00,ff`,
+    // `yv12-*-flat` `ff,ff,ff`). Round 451 had restricted this to the
+    // all-zero plane while the fill-vs-residual reading was
+    // unarbitrated; the vendor corpus settled it (and the black-box
+    // third-party reading of "fill, no predictor pass" yields the
+    // same solid plane, so the form stays interoperable). The YUY2
+    // luma plane's own solid shape (`{v, v, 0, …}`, raw second
+    // sample) is recognised by `encode_arith_yuy2`.
+    if is_solid_residual_plane(plane) {
+        return vec![0xff, plane[0]];
     }
 
     // The `spec/05` contraction of `plane` at each escape length is
@@ -706,18 +711,19 @@ pub fn encode_channel_best(plane: &[u8]) -> Vec<u8> {
     }
 
     // Candidates 0x05..=0x07 (raw + RLE post-processing) are NOT
-    // elected as of round 451, although [`encode_channel_raw_rle`]
-    // still produces them on request and the decoder accepts them
-    // (`spec/03` §2.1). Black-box cross-validation shows the
-    // independent third-party decoder mis-expands (or rejects
-    // outright) channels carrying these headers, while the docs'
-    // encoder-mirror sections (`spec/06` §1.7 / §2.7) document
-    // vendor emission only for `0x00..0x03` — so no real-world
-    // stream exercises third-party support for the raw+RLE forms.
-    // Election therefore stays within the cross-validated set
-    // {0x00, 0x01..0x03, 0x04, 0xff-zero}; the size cost is a few
-    // bytes on heavily-zero planes whose contraction undercuts the
-    // arith+RLE body.
+    // elected (round 451, re-confirmed round 459), although
+    // [`encode_channel_raw_rle`] still produces them on request and
+    // the decoder accepts them (`spec/03` §2.1). They are genuine
+    // vendor wire — the vendor-encoded corpus carries header `0x05`
+    // on 16 and `0x07` on 39 of its 636 channels (`fixtures/README.md`
+    // §Coverage), so any decoder of real Lagarith streams must handle
+    // them — but the widely deployed independent third-party decoder
+    // used as the round-451 black-box oracle rejects frames carrying
+    // them outright ("invalid data"; re-measured in round 459 on the
+    // `*_16x16_structured` cases). Electing them would shave a few
+    // bytes on heavily-zero planes at the cost of those streams being
+    // undecodable there, so the election stays within the set every
+    // probed decoder handles: {0x00, 0x01..0x03, 0x04, 0xff}.
 
     // Transmitted-model downscale election (round 432) — applied to
     // the **winning** arithmetic form only (one ladder + at most one
@@ -977,7 +983,20 @@ pub fn encode_arith_yuy2(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
     let res_v = apply_plane_forward_yuy2(&plane_v, cw, h, false);
 
     // Per-channel header-form selector — see `encode_channel_best`.
-    let ch_y = encode_channel_best(&res_y);
+    // The luma plane's solid shape under this family's predictor is
+    // `{v, v, 0, …}` (the second row-0 sample is stored raw); the
+    // decoder's coordinator rebuilds it from the 2-byte header-`0xff`
+    // form by copying `Y[0]` into `Y[1]` (`spec/06` §3.8) — the vendor
+    // emits `05,ff,ff`-style frames for `yuy2-*-flat` and `ff` luma
+    // for `yuy2-*-black`. Widths below 2 have no raw second sample
+    // and take the generic solid shape.
+    let ch_y =
+        if w >= 2 && res_y.len() >= 2 && res_y[1] == res_y[0] && res_y[2..].iter().all(|&b| b == 0)
+        {
+            vec![0xff, res_y[0]]
+        } else {
+            encode_channel_best(&res_y)
+        };
     let ch_u = encode_channel_best(&res_u);
     let ch_v = encode_channel_best(&res_v);
 
@@ -1840,7 +1859,42 @@ pub fn encode_frame(pixels: &[u8], width: u32, height: u32, kind: PixelKind) -> 
             }
         }
         PixelKind::Bgra32 => {
-            if let Some((b, g, r, a)) = solid_colour_bgra(pixels) {
+            if pixels.chunks_exact(4).all(|px| px[3] == 0xff) {
+                // RGB32 (round 459): a 32-bpp host buffer whose alpha
+                // byte is `0xff` throughout carries no alpha
+                // information, and that is exactly what the RGB
+                // families (types 2 / 4 / 5 / 6) reconstruct into a
+                // 32-bpp host — the decoder writes `0xff` alpha for
+                // every non-RGBA frame (`spec/03` §5, "RGB32: B, G, R,
+                // 0xff"). Encoding such input as RGB24-family drops a
+                // whole alpha channel from the wire (the vendor treats
+                // 32-bpp input the same way unless its RGBA mode is
+                // switched on: `fixtures/rgb32-*` are types 2 / 4 / 5 /
+                // 6) and still round-trips byte-exactly through
+                // `decode_frame(.., Bgra32)`. The uncompressed fallback
+                // keeps the host's 32-bpp layout (type 1 is the host
+                // format verbatim), so it is sized against the
+                // 32-bpp buffer, not the 24-bpp intermediate.
+                let bgr: Vec<u8> = pixels
+                    .chunks_exact(4)
+                    .flat_map(|px| [px[0], px[1], px[2]])
+                    .collect();
+                if let Some((b, g, r)) = solid_colour_bgr(&bgr) {
+                    if b == g && g == r {
+                        encode_solid_grey(b)
+                    } else {
+                        encode_solid_rgb(b, g, r)
+                    }
+                } else {
+                    let arith = encode_arith_rgb24(&bgr, width, height);
+                    let raw = encode_uncompressed(pixels);
+                    if raw.len() < arith.len() {
+                        raw
+                    } else {
+                        arith
+                    }
+                }
+            } else if let Some((b, g, r, a)) = solid_colour_bgra(pixels) {
                 encode_solid_rgba(b, g, r, a)
             } else {
                 encode_arith_rgba_or_uncompressed(pixels, width, height)
@@ -2230,8 +2284,8 @@ mod tests {
             for &b in plane {
                 freq[b as usize] = freq[b as usize].saturating_add(1);
             }
-            if freq.iter().filter(|&&f| f > 0).count() == 1 && plane[0] == 0 {
-                return vec![0xff, 0];
+            if plane[1..].iter().all(|&b| b == 0) {
+                return vec![0xff, plane[0]];
             }
             let known_raw_min = 1 + plane.len();
             let est0 = 1.0 + estimate_arith_payload(&rescale_to_max_total(&freq, MAX_MODERN_TOTAL));
@@ -2287,7 +2341,7 @@ mod tests {
             if raw.len() < best.len() {
                 best = raw;
             }
-            // (Round 451: the raw+RLE forms are no longer part of
+            // (Rounds 451 / 459: the raw+RLE forms are not part of
             // the election — the reference mirrors that.)
             // Round-432 winner-only downscale election, mirrored
             // eagerly (fresh contraction, no sharing).

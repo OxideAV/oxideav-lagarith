@@ -18,7 +18,9 @@
 use std::fs;
 use std::path::Path;
 
-use oxideav_lagarith::{decode_frame, decode_frame_vendor_layout, Decoder, PixelKind};
+use oxideav_lagarith::{
+    decode_frame, decode_frame_vendor_layout, encode_frame, Decoder, FrameType, PixelKind,
+};
 
 #[path = "../tests/common/sha256.rs"]
 mod sha256;
@@ -199,10 +201,111 @@ fn main() {
             failures.push(name.clone());
         }
     }
+    if std::env::var("LAGS_ENCODE").is_ok() {
+        encoder_report(&dir, &names);
+    }
     println!();
     println!("vendor-byte-exact streams: {exact_ok}/{exact_total}");
     println!("vendor-lossy streams (vendor-decoder parity): {lossy_ok}/{lossy_total}");
     if !failures.is_empty() {
         println!("failures: {}", failures.join(" "));
     }
+}
+
+/// Split a modern arithmetic frame into (type, channel slices) using
+/// the public channel-offset layout (`spec/01` §2.3).
+fn channels(frame: &[u8]) -> Option<(u8, Vec<&[u8]>)> {
+    let ty = FrameType::from_byte(frame[0]).ok()?;
+    let n = ty.n_channels();
+    if n == 0 {
+        return None;
+    }
+    let prefix = 1 + 4 * (n - 1);
+    let mut offs = vec![prefix];
+    for i in 0..n - 1 {
+        let o = u32::from_le_bytes([
+            frame[1 + 4 * i],
+            frame[2 + 4 * i],
+            frame[3 + 4 * i],
+            frame[4 + 4 * i],
+        ]) as usize;
+        offs.push(o);
+    }
+    offs.push(frame.len());
+    let mut v = Vec::new();
+    for i in 0..n {
+        v.push(frame.get(offs[i]..offs[i + 1])?);
+    }
+    Some((frame[0], v))
+}
+
+/// Encoder-side comparison against the vendor bytes: per stream, is
+/// our `encode_frame` output byte-identical, and if not, does it
+/// pick the same frame type and per-channel headers, and which
+/// channels are byte-identical anyway.
+fn encoder_report(dir: &str, names: &[String]) {
+    let (mut identical, mut same_type, mut same_headers, mut total) = (0, 0, 0, 0);
+    let mut ch_same = 0;
+    let mut ch_total = 0;
+    println!();
+    for name in names {
+        let base = Path::new(dir).join(name);
+        let Some((kind, ext, w, h)) = geometry(name) else {
+            continue;
+        };
+        let (Ok(input), Ok(vendor)) = (
+            fs::read(base.join(format!("input.{ext}"))),
+            fs::read(base.join("frame.lags")),
+        ) else {
+            continue;
+        };
+        let notes = parse_notes(&fs::read_to_string(base.join("notes.md")).unwrap_or_default());
+        if !notes.roundtrip_exact {
+            continue;
+        }
+        total += 1;
+        let ours = encode_frame(&input, w, h, kind).expect("encode");
+        if ours == vendor {
+            identical += 1;
+            println!("IDENTICAL {name} ({} bytes)", ours.len());
+            continue;
+        }
+        let mut detail = format!("type {:#04x} vs vendor {:#04x}", ours[0], vendor[0]);
+        if ours[0] == vendor[0] {
+            same_type += 1;
+            if let (Some((_, a)), Some((_, b))) = (channels(&ours), channels(&vendor)) {
+                let ha: Vec<u8> = a.iter().map(|c| c[0]).collect();
+                let hb: Vec<u8> = b.iter().map(|c| c[0]).collect();
+                if ha == hb {
+                    same_headers += 1;
+                }
+                let mut per = Vec::new();
+                for (x, y) in a.iter().zip(&b) {
+                    ch_total += 1;
+                    if x == y {
+                        ch_same += 1;
+                        per.push(format!("{:02x}=", x[0]));
+                    } else {
+                        per.push(format!(
+                            "{:02x}/{:02x}({}/{})",
+                            x[0],
+                            y[0],
+                            x.len(),
+                            y.len()
+                        ));
+                    }
+                }
+                detail = format!("channels [{}]", per.join(" "));
+            }
+        }
+        println!(
+            "DIFF      {name}: ours {} B, vendor {} B — {detail}",
+            ours.len(),
+            vendor.len()
+        );
+    }
+    println!();
+    println!(
+        "encoder: identical {identical}/{total}; same frame type {same_type}; same headers {same_headers}; identical channels {ch_same}/{ch_total}"
+    );
 }

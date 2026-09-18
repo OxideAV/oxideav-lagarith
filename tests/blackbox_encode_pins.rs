@@ -301,6 +301,10 @@ fn pins() -> Vec<Pin> {
             true,
             true,
         ),
+        // Re-frozen in round 459: the constant alpha plane now takes
+        // the 2-byte header-`0xff` solid form (`spec/03` §2.1 corrected
+        // blockquote) instead of a coded channel; re-captured
+        // oracle-exact through the same AVI pipeline (188 bytes).
         pin(
             "rgba_16x16_structured",
             Bgra32,
@@ -309,7 +313,7 @@ fn pins() -> Vec<Pin> {
             Structured,
             0,
             None,
-            0xb30cbc76cac28e87,
+            0x5b26b8bbb7debfa4,
             true,
             true,
         ),

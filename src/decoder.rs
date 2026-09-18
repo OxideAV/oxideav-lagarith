@@ -873,7 +873,11 @@ fn decode_arith_yuy2(
     // raw (`apply_plane_inverse_yuy2`) and would otherwise leave it
     // at 0 instead of `v`. Vendor fixtures `yuy2-*-flat` (`05,ff,ff`)
     // and `yuy2-16x16-black` pin both sides of the patch.
-    if slices[0].first() == Some(&0xff) && plane_y.len() >= 2 {
+    // (Widths below 2 have no raw second sample — `apply_plane_
+    // inverse_yuy2` only seeds it for `W >= 2` — so the generic
+    // residual shape applies there; the vendor never produces such
+    // widths, see `fixtures/README.md` geometry rules.)
+    if slices[0].first() == Some(&0xff) && w >= 2 && plane_y.len() >= 2 {
         plane_y[1] = plane_y[0];
     }
 

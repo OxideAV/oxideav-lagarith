@@ -8,6 +8,31 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- round 459 — **encoder: vendor-shaped solid planes and RGB32 input**
+  (`src/encoder.rs`). (1) Any solid residual plane `{v, 0, 0, …}` —
+  not just the all-zero one — is elected as the 2-byte header-`0xff`
+  form now that the vendor corpus settled its residual reading, the
+  YUY2 luma's own solid shape `{v, v, 0, …}` included (the coordinator
+  rebuilds it from `ff v`); a YV12 / YUY2 flat frame is 15 bytes, the
+  vendor's `07,ff,ff` / `ff,00,ff` channel shapes are reproduced, and
+  the round-451 third-party oracle re-captured the changed
+  `rgba_16x16_structured` stream sample-exact (pin re-frozen). (2) A
+  32-bpp host buffer whose alpha is `0xff` throughout is encoded as
+  the RGB24 family (types 2 / 4 / 5 / 6 — exactly how the vendor
+  treats 32-bpp input outside its RGBA mode, `fixtures/rgb32-*`),
+  dropping a whole alpha channel from the wire while still
+  round-tripping byte-exactly on the 32-bpp host; the uncompressed
+  fallback keeps the 32-bpp layout. Encoder vendor-identical streams
+  **23/179 → 45/179** (byte-identical to the vendor's own bytes:
+  every solid frame, every RGB24 / RGB32 / RGBA / YV12 / YUY2 frame
+  whose channels the vendor codes bare-arithmetic, …), 80/195
+  same-header channels byte-identical — the remaining differences are
+  the vendor's RLE-header heuristic (out of scope per `spec/05` §9
+  item 2) and this crate's transmitted-table downscale election
+  (`spec/04` §6), never a larger frame than the vendor's. The raw+RLE
+  forms `0x05..0x07` stay withheld from the election: the corpus
+  proves them ordinary vendor wire (55 channels) but the mainstream
+  third-party decoder rejects frames carrying them (re-measured).
 - round 459 — **`decode_frame_vendor_layout`: the vendor decoder's
   host-buffer behaviour at degenerate geometries** (`src/decoder.rs`,
   `src/predict.rs` `apply_plane_inverse_yuv_seeded`). The 52
