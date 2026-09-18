@@ -6487,3 +6487,171 @@ mod decode_determinism_property {
         }
     }
 }
+
+// ───────── Round 459: vendor-corpus first-column rule pins ─────────
+
+/// Decode a modern RGB24 / RGB32 (types 2 / 4) or RGBA (type 8)
+/// vendor stream with an explicit first-column rule, bypassing the
+/// frame decoder's fixed choice, so the rule can be discriminated on
+/// the vendor's own bytes.
+fn decode_rgb_family_with_rule(
+    frame: &[u8],
+    width: u32,
+    height: u32,
+    rule: crate::predict::FirstColRule,
+    bpp: usize,
+) -> Vec<u8> {
+    use crate::frame::split_channels;
+    use crate::predict::{apply_plane_inverse_with_rule, cross_plane_decorrelate_rgb};
+    let n = width as usize * height as usize;
+    let n_ch = if frame[0] == 8 { 4 } else { 3 };
+    let slices = split_channels(frame, n_ch).unwrap();
+    let mut planes: Vec<Vec<u8>> = slices
+        .iter()
+        .map(|s| decode_channel(s, n).unwrap())
+        .collect();
+    for p in planes.iter_mut() {
+        apply_plane_inverse_with_rule(p, width as usize, height as usize, rule);
+    }
+    let (b, g, r) = {
+        let (b, rest) = planes.split_at_mut(1);
+        let (g, r) = rest.split_at_mut(1);
+        (&mut b[0], &g[0], &mut r[0])
+    };
+    cross_plane_decorrelate_rgb(b, g, r);
+    let mut out = Vec::with_capacity(n * bpp);
+    for (i, (&b, &g)) in planes[0].iter().zip(&planes[1]).enumerate() {
+        out.push(b);
+        out.push(g);
+        out.push(planes[2][i]);
+        if bpp == 4 {
+            out.push(if n_ch == 4 { planes[3][i] } else { 0xff });
+        }
+    }
+    out
+}
+
+/// `spec/03` §3.3.3 / `spec/06` §3.3–§3.6 (validation-corrected
+/// 2026-09-12): on **every** vendor-encoded RGB24 / RGB32 / RGBA
+/// arithmetic frame with `H >= 3` — the SIMD path (type 4, widths 4 /
+/// 16 / 64) and the RGBA vector predictor (type 8) alike — the first
+/// column of rows `y >= 2` decodes only under **Rule B**
+/// (`TL = plane[y-2][W-1]`), with row 1 predicting `T`. Rule A never
+/// matches a vendor stream with `H >= 3`. Pinned per stream on the
+/// vendor's own bytes: Rule B reproduces the vendor input, Rule A
+/// does not.
+#[test]
+fn vendor_rgb_family_streams_decode_only_under_rule_b() {
+    use crate::predict::FirstColRule;
+    macro_rules! case {
+        ($dir:literal, $ext:literal, $w:expr, $h:expr, $bpp:expr) => {
+            (
+                $dir,
+                include_bytes!(concat!("../tests/vendor_corpus/", $dir, "/frame.lags")) as &[u8],
+                include_bytes!(concat!("../tests/vendor_corpus/", $dir, "/input.", $ext))
+                    as &[u8],
+                $w,
+                $h,
+                $bpp,
+            )
+        };
+    }
+    let cases = [
+        // type 4, SIMD path (width % 4 == 0)
+        case!("rgb24-4x4-gradient", "bgr24", 4, 4, 3),
+        case!("rgb24-16x16-gradient", "bgr24", 16, 16, 3),
+        case!("rgb24-16x16-edges", "bgr24", 16, 16, 3),
+        case!("rgb24-16x16-noise", "bgr24", 16, 16, 3),
+        case!("rgb24-64x48-gradient", "bgr24", 64, 48, 3),
+        case!("rgb24-64x48-edges", "bgr24", 64, 48, 3),
+        case!("rgb32-16x16-gradient", "bgr32", 16, 16, 4),
+        case!("rgb32-64x48-noise", "bgr32", 64, 48, 4),
+        // type 8, RGB32 / RGBA vector predictor (spec/06 §3.7)
+        case!("rgba-4x4-gradient", "bgra", 4, 4, 4),
+        case!("rgba-16x16-gradient", "bgra", 16, 16, 4),
+        case!("rgba-16x16-edges", "bgra", 16, 16, 4),
+        case!("rgba-33x27-gradient", "bgra", 33, 27, 4),
+    ];
+    for (name, frame, input, w, h, bpp) in cases {
+        assert!(matches!(frame[0], 4 | 8), "{name}: expected type 4 / 8");
+        let rule_b = decode_rgb_family_with_rule(frame, w, h, FirstColRule::B, bpp);
+        assert_eq!(
+            rule_b, input,
+            "{name}: Rule B must reproduce the vendor input"
+        );
+        let rule_a = decode_rgb_family_with_rule(frame, w, h, FirstColRule::A, bpp);
+        assert_ne!(
+            rule_a, input,
+            "{name}: Rule A must NOT reproduce the vendor input (the rules are distinguishable here)"
+        );
+        // And the public entry point agrees with Rule B.
+        let kind = if bpp == 3 {
+            PixelKind::Bgr24
+        } else {
+            PixelKind::Bgra32
+        };
+        assert_eq!(
+            decode_frame(frame, w, h, kind).unwrap().pixels,
+            input,
+            "{name}"
+        );
+    }
+}
+
+/// The YV12 rule differs from the RGB families in row 1 only
+/// (`spec/06` §3.8: column 0 predicts `L`, rows `>= 2` Rule B): the
+/// vendor's YV12 streams decode under `FirstColRule::Yuv` and under
+/// neither pure RGB rule.
+#[test]
+fn vendor_yv12_streams_decode_only_under_the_yuv_rule() {
+    use crate::frame::split_channels;
+    use crate::predict::{apply_plane_inverse_with_rule, FirstColRule};
+    type Case = (&'static str, &'static [u8], &'static [u8], u32, u32);
+    let cases: [Case; 3] = [
+        (
+            "yv12-16x16-gradient",
+            include_bytes!("../tests/vendor_corpus/yv12-16x16-gradient/frame.lags"),
+            include_bytes!("../tests/vendor_corpus/yv12-16x16-gradient/input.yv12"),
+            16,
+            16,
+        ),
+        (
+            "yv12-32x24-edges",
+            include_bytes!("../tests/vendor_corpus/yv12-32x24-edges/frame.lags"),
+            include_bytes!("../tests/vendor_corpus/yv12-32x24-edges/input.yv12"),
+            32,
+            24,
+        ),
+        (
+            "yv12-64x48-noise",
+            include_bytes!("../tests/vendor_corpus/yv12-64x48-noise/frame.lags"),
+            include_bytes!("../tests/vendor_corpus/yv12-64x48-noise/input.yv12"),
+            64,
+            48,
+        ),
+    ];
+    for (name, frame, input, w, h) in cases {
+        let (w, h) = (w as usize, h as usize);
+        let slices = split_channels(frame, 3).unwrap();
+        let decode_with = |rule| {
+            let mut y = decode_channel(slices[0], w * h).unwrap();
+            let mut v = decode_channel(slices[1], w * h / 4).unwrap();
+            let mut u = decode_channel(slices[2], w * h / 4).unwrap();
+            apply_plane_inverse_with_rule(&mut y, w, h, rule);
+            apply_plane_inverse_with_rule(&mut v, w / 2, h / 2, rule);
+            apply_plane_inverse_with_rule(&mut u, w / 2, h / 2, rule);
+            [y, v, u].concat()
+        };
+        assert_eq!(decode_with(FirstColRule::Yuv), input, "{name}: Yuv rule");
+        assert_ne!(
+            decode_with(FirstColRule::B),
+            input,
+            "{name}: Rule B must differ"
+        );
+        assert_ne!(
+            decode_with(FirstColRule::A),
+            input,
+            "{name}: Rule A must differ"
+        );
+    }
+}

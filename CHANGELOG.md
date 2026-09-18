@@ -8,6 +8,21 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- round 459 — **SIMD first-column Rule B pinned on the vendor corpus**
+  (`src/roundtrip_tests.rs`
+  `vendor_rgb_family_streams_decode_only_under_rule_b`,
+  `vendor_yv12_streams_decode_only_under_the_yuv_rule`). The docs'
+  round-8 errata (`spec/03` §3.3.3 / `spec/06` §3.6, 2026-09-12)
+  retire the "Strategy A on the SIMD path" reading: on every
+  vendor-encoded RGB24 / RGB32 / RGBA arithmetic frame with `H >= 3`
+  the first column decodes only under Rule B (row 1 `TL = L`, rows
+  `>= 2` `TL = plane[y-2][W-1]`) — the rule this crate has shipped for
+  types 2 / 4 / 8 since round 124 (oracle-confirmed then, vendor-
+  confirmed now: 0 corpus regressions, 187/188 → 187/188). Twelve
+  vendor streams across the SIMD type-4 widths 4 / 16 / 64, RGB32 and
+  the type-8 vector predictor are pinned Rule-B-exact **and**
+  Rule-A-inexact on the vendor's bytes; three YV12 streams pin the
+  `FirstColRule::Yuv` row-1 difference against both RGB rules.
 - round 459 — **vendor-corpus conformance harness** (`tests/vendor_corpus.rs`,
   `tests/vendor_corpus/`, `examples/vendor_corpus.rs`). The 240-stream
   corpus produced by the vendor's own encoder (docs staging of

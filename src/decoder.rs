@@ -452,7 +452,13 @@ fn decode_arith_rgb(
     // the oracle reproduces the original pixels byte-exactly only for
     // **Rule B** encodes (every power-of-two pixel-count RGB24 /
     // RGB32 / RGBA frame tested). Rule A mis-decodes the same
-    // streams. See `tests/reference_pins.rs`.
+    // streams. See `tests/reference_pins.rs`. The docs' round-8
+    // validation against the vendor-encoded corpus settled it the
+    // same way for *every* RGB24 / RGB32 / RGBA arithmetic frame with
+    // `H >= 3` — SIMD (type 4) and type-2 paths alike (`spec/03`
+    // §3.3.3 / `spec/06` §3.6 validation-corrected blockquotes);
+    // `roundtrip_tests::vendor_rgb_family_streams_decode_only_under_rule_b`
+    // pins it on the vendor's own bytes.
     apply_plane_inverse_with_rule(
         &mut plane_b,
         width as usize,

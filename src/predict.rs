@@ -27,10 +27,19 @@
 //!   median ([`clamped_med_wrap`]) elsewhere, Rule-B first column
 //!   for rows ≥ 2. Round-451 second-pass recovery; closes `spec/06`
 //!   §6.4 for YUY2.
-//! - **Rule A** (`TL = L` ⇒ predictor `T`) — the `spec/03` §3.3.3 /
-//!   `spec/06` §3.8 reading; no shipping path selects it any more
-//!   (`spec/06` §3.8 is flagged as an erratum candidate) but the
-//!   variant stays for unit tests pinning its algebra.
+//! - **Rule A** (`TL = L` ⇒ predictor `T`) — the original
+//!   `spec/03` §3.3.3 / `spec/06` §3.3–§3.6 "Strategy A" reading. The
+//!   docs' round-8 validation against the vendor-encoded corpus
+//!   (`spec/03` §3.3.3 / `spec/06` §3.6 validation-corrected
+//!   blockquotes, 2026-09-12) recorded it as an **erratum**: Rule A
+//!   never matches a vendor RGB24 / RGB32 / RGBA arithmetic stream
+//!   with `H >= 3`, on the SIMD path (type 4) and the type-2 / type-8
+//!   paths alike — Rule B (row 1 `TL = L`, rows `>= 2`
+//!   `TL = plane[y-2][W-1]`) is the single rule for every RGB-family
+//!   plane, which is what this crate has shipped since round 124.
+//!   `roundtrip_tests::vendor_rgb_family_streams_decode_only_under_rule_b`
+//!   pins it per vendor stream. No shipping path selects Rule A; the
+//!   variant stays for the tests that discriminate it.
 
 /// Selects the first-column-of-row rule for the inverse predictor.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -53,7 +62,11 @@ pub(crate) enum FirstColRule {
     /// `TL = plane[y-2][W-1]` for `y >= 2` (Rule A for `y == 1`).
     /// The modern arithmetic RGB(A) path (types 2/4/8) and the
     /// legacy type-7 path both use this (`spec/06` §3.2 /
-    /// `spec/07` §9.1 item 7b; oracle-confirmed for the modern path).
+    /// `spec/07` §9.1 item 7b; oracle-confirmed for the modern path
+    /// in round 124 and vendor-corpus-confirmed on every RGB24 /
+    /// RGB32 / RGBA arithmetic stream with `H >= 3` — `spec/03`
+    /// §3.3.3 / `spec/06` §3.6 validation-corrected blockquotes,
+    /// 2026-09-12).
     B,
     /// Round-451 oracle-recovered first-column rule for the
     /// **YV12 / YUY2 / reduced-resolution** families (types 3 / 10 /
