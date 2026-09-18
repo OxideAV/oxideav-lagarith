@@ -33,6 +33,28 @@ empty chroma planes) now self-roundtrip byte-exactly. Decode is
 stateless per frame (with a stateful
 wrapper for NULL "JUMP" frames).
 
+**Round 459 lands vendor-corpus exactness.** The docs workspace staged
+a 240-stream corpus produced by the **vendor's own encoder**
+(`docs/video/lagarith/fixtures/`, 2026-09-12: 187 byte-exact
+round-trip streams + a 3-frame NULL sequence + 52 degenerate
+geometries at which the vendor codec is itself lossy), and the crate
+now decodes **187/188** of the byte-exact class byte-exactly through
+`decode_frame` (the one miss is a stream the vendor round-trips only
+through its 24-bpp DIB-stride host layout) and reproduces the vendor
+*decoder's* own output on **42/52** of the lossy class through
+`decode_frame_vendor_layout` — which also reproduces all 188/188 of
+the byte-exact class. The corpus is vendored with its digests and
+pinned in CI (`tests/vendor_corpus.rs`); the round-8 spec errata it
+came with (SIMD first-column Rule B, the RLE zero-count rule, the
+pow2 model normaliser) are each pinned per stream on the vendor's own
+bytes, and the one crate-side defect it exposed — the header-`0xff`
+"solid plane" is a residual plane `{v, 0, 0, …}`, not a fill — is
+fixed. On the encoder side **45/179** vendor inputs now encode to
+bytes identical to the vendor's (every solid frame and every frame
+whose channels the vendor codes bare-arithmetic; 80/195 same-header
+channels are byte-identical) and no frame is larger than the
+vendor's.
+
 **Round 451 lands third-party decodability of our encoded streams.**
 A black-box capture harness (`examples/blackbox_capture.rs`) drives a
 27-case deterministic matrix — every emittable frame type × content
@@ -75,17 +97,29 @@ per-channel election to the cross-validated header set.
 1. **Frame layout** (`spec/01`) — byte 0 is the frame-type selector;
    non-NULL frames carry an `(n_channels - 1) * 4` byte channel-offset
    table.
-2. **Per-channel header dispatcher** (`spec/03` §2.1 + `spec/06` §1).
+2. **Per-channel header dispatcher** (`spec/03` §2.1 + `spec/06` §1) —
+   the header-`0xff` "solid plane" form is a *residual* plane
+   `{v, 0, 0, …}` (zeroed plane, byte 1 stored at position 0) that
+   runs through the predictor like any other channel (`spec/03` §2.1
+   corrected blockquote; the YUY2 coordinator copies `Y[0]` into
+   `Y[1]` first).
 3. **Fibonacci probability prefix** (`spec/04`) — MSB-first Zeckendorf
    decode of the 256-entry frequency table with the zero-run subcode.
 4. **Modern range coder** (`spec/02`) — TOP = 2^23, init range = 2^31,
    four-byte priming + flush, byte refill with cross-byte LSB rotation.
 5. **Residual zero-run RLE escape** (`spec/05`) — `escape_len +
-   LUT[supplement_byte]` zero runs.
+   LUT[supplement_byte]` zero runs, decoded lazily from the range
+   coder until the plane is full: the escape fires on the
+   `escape_len`-th consecutive zero and the very next symbol is the
+   supplement (`spec/06` §2.3 / §2.6); the channel's u32 pre-RLE
+   count is a dispatch hint, not the symbol budget.
 6. **Spatial predictor** (`spec/03` §3) — left predictor on row 0,
    JPEG-LS clamped median on rows ≥ 1. The modern RGB(A) types (2 / 4 /
    8) and the legacy type-7 path use the **Rule B** first-column rule
-   (`TL = plane[y-2][W-1]`), while the YV12 / reduced-resolution
+   (`TL = plane[y-2][W-1]`; the docs' round-8 validation records the
+   older "Strategy A on the SIMD path" reading as an erratum — every
+   vendor RGB-family stream with `H >= 3` decodes only under Rule B,
+   pinned per stream), while the YV12 / reduced-resolution
    families (10 / 11) use the round-451 oracle-recovered **Yuv**
    rule — row 1 predicts `L = plane[0][W-1]` (the `0x180009f30`
    carry enters the row holding `T`, so `MED(L, T, T) = L`), rows
@@ -126,6 +160,18 @@ let yv12 = decode_frame(&payload, width, height, PixelKind::Yv12)?;
 assert_eq!(yv12.pixels.len(), PixelKind::Yv12.buffer_len(width, height));
 # Ok::<(), oxideav_lagarith::Error>(())
 ```
+
+`decode_frame_vendor_layout` decodes the same wire **as the vendor
+decoder lays it into a host buffer**, reproducing three
+host-integration behaviours of the vendor build at degenerate
+geometries that the wire format does not define (`spec/06` §3.2 step
+1 / §3.7 / §3.8 validated notes): 24-bpp rows on the Windows DIB
+stride `(3W + 3) & !3` (zero pads, output cut to `3·W·H`), no `+= G`
+recorrelation on single-row RGB32 output, and — below the YV12 vector
+loop's size — a row-1 / column-0 `TL` seed read from the byte
+preceding each plane. It is bit-identical to `decode_frame`
+everywhere else; use it to compare against vendor-captured output at
+such sizes, and `decode_frame` for everything a host actually wants.
 
 Stateful decode that handles NULL ("JUMP") frames by replaying the
 predecessor (`spec/01` §1.1):
@@ -218,18 +264,40 @@ keyframes. The host pixel format is read from
 `CodecParameters::pixel_format` (`Bgr24`, `Bgra`, `Yuv420P`,
 `Yuyv422`); unsupported formats are rejected at encoder construction.
 
-Since round 451 the per-channel header election stays within the
-**cross-validated form set** `{0x00, 0x01..0x03, 0x04,
-0xff-zero-fill}`: the raw+RLE forms (`0x05..0x07`) and the
-nonzero-constant fill decode divergently (or not at all) in the
-black-box oracle, and the docs' encoder-mirror sections document
-vendor emission only for `0x00..0x03` — every form remains decodable
-and directly encodable (`encode_channel_raw_rle`), the automatic
-election just never emits a wire whose third-party decode is
-unconfirmed.
+The per-channel header election stays within the **interoperable
+form set** `{0x00, 0x01..0x03, 0x04, 0xff}`. Since round 459 the
+`0xff` "solid plane" form is elected for *any* solid residual plane
+(`{v, 0, 0, …}`, and the YUY2 luma's `{v, v, 0, …}`), exactly as the
+vendor encoder does (`07,ff,ff` / `ff,00,ff` / `ff,ff,ff` channel
+shapes), and a 32-bpp host buffer whose alpha is `0xff` throughout is
+encoded as the RGB24 family (types 2 / 4 / 5 / 6 — the vendor's own
+treatment of 32-bpp input outside its RGBA mode), dropping the alpha
+channel from the wire. The raw+RLE forms (`0x05..0x07`) remain
+decodable and directly encodable (`encode_channel_raw_rle`) but are
+withheld from the automatic election: the vendor corpus proves them
+ordinary vendor wire (55 channels), yet the mainstream third-party
+decoder rejects frames carrying them outright.
 
 ## Tests, benchmarks, fuzzing
 
+- The **vendor corpus** (`tests/vendor_corpus/`, 240 streams produced
+  by the vendor's own encoder from deterministic inputs, each with the
+  SHA-256 the vendor decoder's output must hash to) is decoded in CI
+  through the public entry points: streams outside a `KNOWN_GAPS`
+  table must match, streams inside it must still miss (the table only
+  shrinks by fixing the decoder), the scorecard is pinned (187/188
+  byte-exact via `decode_frame`, 42/52 vendor-lossy via
+  `decode_frame_vendor_layout`, 188/188 byte-exact via the latter),
+  and every vendored input encodes through `encode_frame`,
+  self-roundtrips, and is counted against the vendor's bytes
+  (floor 45/179 identical). Per-stream pins on the vendor's bytes
+  also discriminate the round-8 errata: Rule B vs Rule A on 12
+  RGB-family + 3 YV12 streams, the lazy RLE decode consuming exactly
+  the u32 on all 52 arith+RLE channels, and the pow2 normaliser vs a
+  raw-total model on all 189 non-power-of-two channels.
+  `examples/vendor_corpus.rs` runs the same comparison against the
+  docs staging with per-byte diffs and an encoder-side per-channel
+  report.
 - Unit + roundtrip tests cover every frame type and the predictor
   rules; cross-decoder pins (captured from a black-box binary oracle)
   exercise the modern RGB(A) paths byte-exactly without that oracle in
@@ -270,7 +338,11 @@ unconfirmed.
   accumulated drift (`spec/01` §1.1).
 - Two `libFuzzer`-style harnesses guard robustness from both ends. The
   decode-side harness in `fuzz/` (`cargo-fuzz`) asserts panic-freedom
-  on attacker-supplied payloads — the modern range coder rejects a
+  on attacker-supplied payloads through both `decode_frame` and
+  `decode_frame_vendor_layout` (which must agree on `Ok`/`Err`, on
+  output length, and byte-for-byte off the quirk geometries) plus the
+  stateful NULL replay, seeded with 220 vendor-encoded streams — the
+  modern range coder rejects a
   malformed probability total exceeding the working `range`
   (per-symbol quotient → 0) as `Error::ProbabilityTotalExceedsRange`
   rather than dividing by zero (`spec/02` §5 / `spec/04` §5). Its
@@ -365,23 +437,24 @@ predictor rule** for the 4:2:x families (`spec/06` §3.8 / §6.4).
 
 Still open:
 
-* **Odd-width YUY2 third-party validation**: the oracle rejects
-  odd-width YUY2 frames outright regardless of content, so the
-  crate's `spec/03` §6.2 floor-chroma odd-width form remains
-  validated by self-roundtrip only.
-* **`spec/06` §5 header-`0xff` semantics**: the oracle fills the
-  plane with no predictor pass, the checklist's step 8 implies one;
-  the encoder sidesteps the conflict (zero fill only) until a
-  vendor-encoded fixture or a re-derivation arbitrates.
-* **Proprietary-encoded fixture** — still the one artefact that would
-  arbitrate every remaining conflict directly against the vendor
-  bitstream. Per the docs staging of 2026-08-10 this is resolved as
-  an **operator upload** to the project fixture host (no research
-  path remains). The i386 `fistp` rounding caveat that fixture was
-  once needed for is now settled statically (audit/15, 2026-07-31):
-  both official builds truncate, so the rescale + residue path is
-  architecture-independent and the crate's x86-64-truncation model
-  covers both.
+* **Odd-width YUY2 third-party validation**: the vendor encoder
+  rejects `W % 4 != 0` YUY2 input and the third-party oracle rejects
+  odd-width YUY2 frames outright, so the crate's `spec/03` §6.2
+  floor-chroma odd-width form remains validated by self-roundtrip
+  only.
+* **24-bpp DIB pad bytes at `W >= 4`**: the vendor decoder's row-end
+  vector store leaves values in the pad bytes of `W % 4 != 0`, `W >= 4`
+  RGB24 rows that the docs did not capture; the 10 remaining
+  vendor-lossy misses (`rgb24-5x7-*`, `rgb24-33x27-*`) differ only
+  there (`spec/06` §3.2 step 1 validated note).
+* **Vendor header heuristic**: the vendor's RLE-header choice
+  (`spec/05` §9 item 2, out of the spec's scope) and this crate's
+  transmitted-table downscale election account for every remaining
+  encoder-side byte difference; no frame is larger than the vendor's.
+
+Closed in round 459: the `spec/06` §5 header-`0xff` semantics (residual
+plane, normative) and the standing proprietary-encoded-fixture item
+(the vendor corpus is staged and pinned).
 
 ## License
 

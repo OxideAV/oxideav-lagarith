@@ -42,7 +42,14 @@
 //!
 //! ## Public API
 //!
-//! - [`decode_frame`] — decode one Lagarith-encoded frame's bytes.
+//! - [`decode_frame`] — decode one Lagarith-encoded frame's bytes
+//!   (the wire-format decode; byte-exact on 187/188 of the
+//!   vendor-encoded corpus, see `tests/vendor_corpus.rs`).
+//! - [`decode_frame_vendor_layout`] — the same decode laid out as the
+//!   vendor decoder writes a host buffer at degenerate geometries
+//!   (DIB-stride 24-bpp rows, single-row RGB32 without recorrelation,
+//!   tiny-YV12 seeded first column); bit-identical to [`decode_frame`]
+//!   everywhere else.
 //! - [`encode_frame`] — encode one raw frame into Lagarith bytes; the
 //!   symmetric counterpart of [`decode_frame`], with automatic
 //!   smallest-wire-form (solid / arithmetic / uncompressed)
