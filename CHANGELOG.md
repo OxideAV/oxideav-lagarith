@@ -8,6 +8,16 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- round 459 — **fuzz: vendor-layout + stateful paths, vendor seeds**
+  (`fuzz/fuzz_targets/decode_lagarith.rs`, `fuzz/corpus/`). The decode
+  target now drives `decode_frame_vendor_layout` next to `decode_frame`
+  on every host format — asserting both agree on `Ok`/`Err`, on the
+  output length, and byte-for-byte off the three quirk geometries —
+  and replays every successful decode through the stateful `Decoder`'s
+  NULL ("JUMP") path. 220 vendor-encoded streams (every `.lags` ≤ 2 KiB
+  at ≤ 64x64, dimension-prefixed) seed the corpus. Foreground run at
+  round close: 9.2 M executions / 541 s, coverage 1360 edges, no
+  findings.
 - round 459 — **encoder: vendor-shaped solid planes and RGB32 input**
   (`src/encoder.rs`). (1) Any solid residual plane `{v, 0, 0, …}` —
   not just the all-zero one — is elected as the 2-byte header-`0xff`

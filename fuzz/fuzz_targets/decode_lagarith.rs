@@ -69,7 +69,9 @@
 //! the corpus.
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_lagarith::{decode_frame, DecodedFrame, PixelKind};
+use oxideav_lagarith::{
+    decode_frame, decode_frame_vendor_layout, DecodedFrame, Decoder, PixelKind,
+};
 
 /// Map a fuzz selector byte onto a small dimension in `1..=64`,
 /// **including odd values**. Odd widths and heights reach the decoder's
@@ -89,8 +91,41 @@ fn drive(payload: &[u8], width: u32, height: u32) {
     // formats. Return values intentionally discarded — a debug-build
     // round-trip oracle would need a trusted encoder of the *same*
     // arbitrary stream, which doesn't exist for a clean-room codec.
+    //
+    // Round 459: the vendor-layout entry point runs the same decode
+    // with three extra host-buffer transforms (24-bpp DIB-stride
+    // re-layout, single-row RGB32 recorrelation skip, tiny-YV12 seeded
+    // first column) and must be equally panic-free; where none of the
+    // quirks applies it must agree with the wire-format decode
+    // byte-for-byte. The stateful `Decoder` additionally replays the
+    // frame through the NULL ("JUMP") path.
     for kind in PixelKind::all() {
-        let _: Result<DecodedFrame, _> = decode_frame(payload, width, height, kind);
+        let wire: Result<DecodedFrame, _> = decode_frame(payload, width, height, kind);
+        let vendor = decode_frame_vendor_layout(payload, width, height, kind);
+        let quirk_geometry = (kind == PixelKind::Bgr24 && width % 4 != 0)
+            || (kind == PixelKind::Bgra32 && height == 1)
+            || (kind == PixelKind::Yv12 && width + 4 > ((width * height / 4 + width / 2) & !3));
+        match (&wire, &vendor) {
+            (Ok(a), Ok(b)) => {
+                assert_eq!(a.pixels.len(), b.pixels.len());
+                if !quirk_geometry {
+                    assert_eq!(
+                        a.pixels, b.pixels,
+                        "vendor layout must equal the wire decode off the quirk geometries"
+                    );
+                }
+            }
+            (Err(_), Err(_)) => {}
+            _ => panic!("wire and vendor-layout decodes disagree on Ok/Err"),
+        }
+        let mut dec = Decoder::new();
+        if dec.decode(payload, width, height, kind).is_ok() {
+            let replay = dec.decode(&[], width, height, kind);
+            assert!(
+                replay.is_ok(),
+                "NULL replay after a successful decode must succeed"
+            );
+        }
     }
 }
 
