@@ -103,7 +103,10 @@ pub mod wire_forms {
         encode_arith_yv12, encode_legacy_rgb, encode_legacy_rgb_rle, encode_uncompressed,
     };
 }
-pub use crate::decoder::{decode_frame, decode_frame_with_prev, DecodedFrame, Decoder, PixelKind};
+pub use crate::decoder::{
+    decode_frame, decode_frame_vendor_layout, decode_frame_with_prev, DecodedFrame, Decoder,
+    PixelKind,
+};
 pub use crate::encoder::{encode_frame, encode_null};
 pub use crate::error::{Error, Result};
 pub use crate::frame::{FrameType, WirePlaneRole};

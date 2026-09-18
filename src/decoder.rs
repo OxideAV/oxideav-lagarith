@@ -38,8 +38,8 @@ use crate::channel::{decode_channel, decode_legacy_channel};
 use crate::error::{Error, Result};
 use crate::frame::{split_channels, FrameType};
 use crate::predict::{
-    apply_plane_inverse_with_rule, apply_plane_inverse_yuy2, cross_plane_decorrelate_rgb,
-    FirstColRule,
+    apply_plane_inverse_with_rule, apply_plane_inverse_yuv_seeded, apply_plane_inverse_yuy2,
+    cross_plane_decorrelate_rgb, FirstColRule,
 };
 
 /// What pixel format the caller wants the decoder to produce.
@@ -191,6 +191,54 @@ pub fn decode_frame(
     height: u32,
     pixel_kind: PixelKind,
 ) -> Result<DecodedFrame> {
+    decode_frame_inner(payload, width, height, pixel_kind, false)
+}
+
+/// Decode one frame **as the vendor decoder lays it into a host
+/// buffer**, reproducing three host-integration behaviours of the
+/// vendor build at degenerate geometries that the wire format itself
+/// does not define (docs round-8 validation, 2026-09-12):
+///
+/// * **24-bpp DIB row stride** (`spec/06` §3.2 step 1, validated
+///   note): the vendor addresses the 24-bpp host buffer on the
+///   Windows DIB stride `(3·W + 3) & !3`, so for `W % 4 != 0` each
+///   row lands at that stride and the output is truncated to the
+///   caller's `3·W·H` bytes. Pad bytes are zero — exact for `W < 4`;
+///   for `W >= 4` the vendor's row-end vector store leaves values in
+///   the pad bytes that the docs did not capture (the in-row pixels
+///   match; only those pads differ — `rgb24-5x7-*` / `rgb24-33x27-*`
+///   stay listed in the corpus test's known gaps).
+/// * **RGB32 single-row frames** (`spec/06` §3.7 observed note): for
+///   `Bgra32` output of an RGB24 / RGB32-coded frame (types 2 / 4)
+///   with `H == 1` the vendor emits the *decorrelated* planes — no
+///   `+= G` recorrelation.
+/// * **YV12 below the vector loop's size** (`spec/06` §3.8 validated
+///   note): when `W + 4 > ((W·H/4 + W/2) & !3)` (e.g. 4x2) the
+///   row-1 / column-0 `TL` seed is the byte preceding each plane in
+///   the output buffer — `0` for Y, the last Y sample for V, the
+///   last V sample for U — instead of `plane[0]`.
+///
+/// Everywhere else this is bit-identical to [`decode_frame`] (which
+/// is the wire-format decode: tight rows, recorrelated RGB, the
+/// seeded YV12 rule). Use this entry point to compare against output
+/// captured from the vendor codec at such sizes; use [`decode_frame`]
+/// for everything a host actually wants.
+pub fn decode_frame_vendor_layout(
+    payload: &[u8],
+    width: u32,
+    height: u32,
+    pixel_kind: PixelKind,
+) -> Result<DecodedFrame> {
+    decode_frame_inner(payload, width, height, pixel_kind, true)
+}
+
+fn decode_frame_inner(
+    payload: &[u8],
+    width: u32,
+    height: u32,
+    pixel_kind: PixelKind,
+    vendor: bool,
+) -> Result<DecodedFrame> {
     if payload.is_empty() {
         return Err(Error::NullFrame);
     }
@@ -209,13 +257,13 @@ pub fn decode_frame(
     }
     let frame_type = FrameType::from_byte(payload[0])?;
 
-    match frame_type {
+    let mut frame = match frame_type {
         FrameType::Uncompressed => decode_uncompressed(payload, width, height, pixel_kind),
         FrameType::SolidGrey => decode_solid(payload, width, height, pixel_kind, SolidShape::Grey),
         FrameType::SolidRgb => decode_solid(payload, width, height, pixel_kind, SolidShape::Rgb),
         FrameType::SolidRgba => decode_solid(payload, width, height, pixel_kind, SolidShape::Rgba),
         FrameType::ArithmeticRgb24 | FrameType::UnalignedRgb24 => {
-            decode_arith_rgb(payload, width, height, pixel_kind)
+            decode_arith_rgb(payload, width, height, pixel_kind, vendor)
         }
         FrameType::LegacyRgb => decode_legacy_rgb(payload, width, height, pixel_kind),
         FrameType::ArithmeticRgba => {
@@ -223,10 +271,36 @@ pub fn decode_frame(
             // BGR24 we drop alpha after the decode.
             decode_arith_rgba(payload, width, height, pixel_kind)
         }
-        FrameType::ArithmeticYv12 => decode_arith_yv12(payload, width, height, pixel_kind),
+        FrameType::ArithmeticYv12 => decode_arith_yv12(payload, width, height, pixel_kind, vendor),
         FrameType::ArithmeticYuy2 => decode_arith_yuy2(payload, width, height, pixel_kind),
         FrameType::ReducedResYv12 => decode_reduced_res(payload, width, height, pixel_kind),
+    }?;
+    if vendor && pixel_kind == PixelKind::Bgr24 && width % 4 != 0 {
+        relayout_rows_on_dib_stride(&mut frame.pixels, width as usize, height as usize);
     }
+    Ok(frame)
+}
+
+/// Vendor host-buffer quirk (`spec/06` §3.2 step 1, validated note):
+/// re-lay tight `3·W` rows on the Windows 24-bpp DIB stride
+/// `(3·W + 3) & !3` and truncate to the tight `3·W·H` length. Pad
+/// bytes are left zero (exact for `W < 4`, where the whole row is a
+/// single vector store; the `W >= 4` pad values are not captured by
+/// the docs). The trailing rows that fall past `3·W·H` are cut, as
+/// the vendor's caller only ever reads that many bytes.
+fn relayout_rows_on_dib_stride(pixels: &mut Vec<u8>, width: usize, height: usize) {
+    let tight = 3 * width;
+    let stride = (tight + 3) & !3;
+    if stride == tight || height == 0 {
+        return;
+    }
+    let src = std::mem::take(pixels);
+    let mut out = vec![0u8; stride * height];
+    for (y, row) in src.chunks_exact(tight).enumerate() {
+        out[y * stride..y * stride + tight].copy_from_slice(row);
+    }
+    out.truncate(tight * height);
+    *pixels = out;
 }
 
 /// Decode one frame with optional predecessor-frame state for
@@ -420,6 +494,7 @@ fn decode_arith_rgb(
     width: u32,
     height: u32,
     pixel_kind: PixelKind,
+    vendor: bool,
 ) -> Result<DecodedFrame> {
     // Early pixel-kind validation — fail before decoding any channel
     // bytes when the host asks for a planar buffer for a packed
@@ -480,8 +555,14 @@ fn decode_arith_rgb(
 
     // `spec/03` §4: wire stores R-G and B-G. Output positions +0 and
     // +2 had G subtracted; restore via += G. Output position +1 (G)
-    // is unchanged.
-    cross_plane_decorrelate_rgb(&mut plane_b, &plane_g, &mut plane_r);
+    // is unchanged. Vendor host-buffer quirk (`spec/06` §3.7 observed
+    // note): the vendor's RGB32 output path skips this for
+    // single-row frames — reproduced only on the vendor-layout entry
+    // point.
+    let skip_recorrelation = vendor && pixel_kind == PixelKind::Bgra32 && height == 1;
+    if !skip_recorrelation {
+        cross_plane_decorrelate_rgb(&mut plane_b, &plane_g, &mut plane_r);
+    }
 
     // Pack into output (round 216 — single hoisted-branch pack loop).
     // `pixel_kind` is loop-invariant after the early `packed_bpp()`
@@ -645,6 +726,7 @@ fn decode_arith_yv12(
     width: u32,
     height: u32,
     pixel_kind: PixelKind,
+    vendor: bool,
 ) -> Result<DecodedFrame> {
     if pixel_kind != PixelKind::Yv12 {
         return Err(Error::PixelFormatMismatch {
@@ -685,9 +767,32 @@ fn decode_arith_yv12(
     // black-box oracle reconstructs YV12 frames byte-exactly under
     // this rule at every probed geometry/content class and under no
     // other candidate (see `src/predict.rs`).
-    apply_plane_inverse_with_rule(&mut plane_y, w, h, FirstColRule::Yuv);
     let cw = w / 2;
     let ch = h / 2;
+    // Vendor host-buffer quirk (`spec/06` §3.8 validated note): below
+    // the three-plane vector loop's size the row-1 `TL` seed is never
+    // written and the predictor reads the byte preceding each plane
+    // in the output buffer (0 / last Y / last V). Only on the
+    // vendor-layout entry point; the wire-format rule seeds `plane[0]`.
+    let below_vector_loop = vendor && w + 4 > ((y_pixels / 4 + w / 2) & !3);
+    if below_vector_loop && cw * ch == c_pixels {
+        apply_plane_inverse_yuv_seeded(&mut plane_y, w, h, 0);
+        let last_y = plane_y[y_pixels - 1];
+        apply_plane_inverse_yuv_seeded(&mut plane_v, cw, ch, last_y);
+        let last_v = plane_v.last().copied().unwrap_or(0);
+        apply_plane_inverse_yuv_seeded(&mut plane_u, cw, ch, last_v);
+        let mut pixels = Vec::with_capacity(y_pixels + 2 * c_pixels);
+        pixels.extend_from_slice(&plane_y);
+        pixels.extend_from_slice(&plane_v);
+        pixels.extend_from_slice(&plane_u);
+        return Ok(DecodedFrame {
+            width,
+            height,
+            pixel_kind,
+            pixels,
+        });
+    }
+    apply_plane_inverse_with_rule(&mut plane_y, w, h, FirstColRule::Yuv);
     if cw * ch == c_pixels {
         apply_plane_inverse_with_rule(&mut plane_v, cw, ch, FirstColRule::Yuv);
         apply_plane_inverse_with_rule(&mut plane_u, cw, ch, FirstColRule::Yuv);
@@ -873,7 +978,7 @@ fn decode_reduced_res(
     let mut sub = Vec::with_capacity(payload.len());
     sub.push(10);
     sub.extend_from_slice(&payload[1..]);
-    let half = decode_arith_yv12(&sub, half_w, half_h, PixelKind::Yv12)?;
+    let half = decode_arith_yv12(&sub, half_w, half_h, PixelKind::Yv12, false)?;
 
     // 2× upscale each plane (Y, V, U) by nearest-neighbour
     // duplication into a 2W × 2H output. (audit-resolved at

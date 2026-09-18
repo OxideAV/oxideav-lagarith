@@ -18,7 +18,7 @@
 use std::fs;
 use std::path::Path;
 
-use oxideav_lagarith::{decode_frame, Decoder, PixelKind};
+use oxideav_lagarith::{decode_frame, decode_frame_vendor_layout, Decoder, PixelKind};
 
 #[path = "../tests/common/sha256.rs"]
 mod sha256;
@@ -143,7 +143,14 @@ fn main() {
         let mut verdict = String::new();
         let mut ok = true;
         for (i, f) in frames.iter().enumerate() {
-            let res = if frames.len() == 1 {
+            // Vendor-lossy streams are compared against the vendor
+            // decoder's own host-buffer output, so they go through the
+            // vendor-layout entry point; byte-exact streams through
+            // the wire-format decode.
+            let plain = std::env::var("LAGS_PLAIN").is_ok();
+            let res = if frames.len() == 1 && !roundtrip_exact && !plain {
+                decode_frame_vendor_layout(f, w, h, kind)
+            } else if frames.len() == 1 {
                 decode_frame(f, w, h, kind)
             } else {
                 dec.decode(f, w, h, kind)

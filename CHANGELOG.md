@@ -8,6 +8,25 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- round 459 — **`decode_frame_vendor_layout`: the vendor decoder's
+  host-buffer behaviour at degenerate geometries** (`src/decoder.rs`,
+  `src/predict.rs` `apply_plane_inverse_yuv_seeded`). The 52
+  vendor-lossy corpus streams are lossy because of three
+  host-integration behaviours of the vendor build, not wire facts
+  (`spec/06` §3.2 step 1 / §3.7 / §3.8 validated notes): 24-bpp rows
+  addressed on the Windows DIB stride `(3W + 3) & !3` (zero pads,
+  output cut to `3·W·H`), no `+= G` recorrelation on single-row RGB32
+  output, and — below the YV12 vector loop's size, `W + 4 >
+  ((W·H/4 + W/2) & !3)` — a row-1 / column-0 `TL` seed read from the
+  byte preceding each plane (0 / last Y / last V) instead of
+  `plane[0]`. The new entry point reproduces them and is bit-identical
+  to `decode_frame` everywhere else (`decode_frame` stays the
+  wire-format decode hosts want). Vendor-lossy parity **9/52 → 42/52**
+  — all 21 `rgb24-{1x2,2x2,3x3}` streams, all 12 `rgb32-{1x1,2x1}`
+  streams and `yv12-4x2-noise` — plus `rgb24-1x2-edges`, so the
+  vendor-layout path reproduces **188/188** of the byte-exact class.
+  The 10 remaining (`rgb24-5x7-*`, `rgb24-33x27-*`, `W >= 4`) differ
+  only in DIB pad bytes the docs did not capture.
 - round 459 — **pow2 model normaliser re-derived from the corrected
   chapters and pinned on the vendor corpus** (`src/model.rs`,
   `src/roundtrip_tests.rs`

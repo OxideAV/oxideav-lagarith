@@ -150,6 +150,49 @@ pub(crate) fn apply_plane_inverse_with_rule(
     }
 }
 
+/// YV12-family inverse predictor with an explicit `TL` seed for the
+/// row-0 → row-1 transition (`spec/06` §3.8, validated 2026-09-12).
+/// The `0x180009f30` predictor's three-plane vector loop seeds `TL`
+/// at (row 1, col 0) with `plane[0]` — which collapses the median to
+/// `L` and is what [`FirstColRule::Yuv`] hard-codes — but for frames
+/// below that loop's size (`W + 4 > ((W*H/4 + W/2) & !3)`, e.g. 4x2)
+/// the seed is never written and `TL` is whatever byte precedes the
+/// plane in the output buffer. This variant takes that byte as
+/// `tl_seed`; with `tl_seed == plane[0]` it is bit-identical to the
+/// `Yuv` rule. Vendor-quirk path only (`decode_frame_vendor_layout`).
+pub(crate) fn apply_plane_inverse_yuv_seeded(
+    plane: &mut [u8],
+    width: usize,
+    height: usize,
+    tl_seed: u8,
+) {
+    debug_assert_eq!(plane.len(), width * height);
+    if width == 0 || height == 0 {
+        return;
+    }
+    for x in 1..width {
+        plane[x] = plane[x].wrapping_add(plane[x - 1]);
+    }
+    for y in 1..height {
+        let row_off = y * width;
+        let prev_off = (y - 1) * width;
+        let l = plane[prev_off + width - 1];
+        let t = plane[prev_off];
+        let tl = if y == 1 {
+            tl_seed
+        } else {
+            plane[(y - 2) * width + width - 1]
+        };
+        plane[row_off] = plane[row_off].wrapping_add(clamped_med(l, t, tl));
+        for x in 1..width {
+            let l = plane[row_off + x - 1];
+            let t = plane[prev_off + x];
+            let tl = plane[prev_off + x - 1];
+            plane[row_off + x] = plane[row_off + x].wrapping_add(clamped_med(l, t, tl));
+        }
+    }
+}
+
 /// Forward (encoder-side) form: produce residuals from a fully-
 /// reconstructed plane using **Rule A**. Test-only.
 #[cfg(test)]

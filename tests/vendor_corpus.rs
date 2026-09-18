@@ -30,7 +30,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use oxideav_lagarith::{decode_frame, encode_frame, Decoder, PixelKind};
+use oxideav_lagarith::{
+    decode_frame, decode_frame_vendor_layout, encode_frame, Decoder, PixelKind,
+};
 
 #[path = "common/sha256.rs"]
 mod sha256;
@@ -109,15 +111,20 @@ fn input_of(s: &Stream) -> Option<Vec<u8>> {
 }
 
 /// Decode every frame of the stream and report whether *all* of them
-/// hash to the expected digest.
-fn decodes_to_expected(s: &Stream) -> Result<bool, String> {
+/// hash to the expected digest. `vendor_layout` selects
+/// `decode_frame_vendor_layout` (the vendor decoder's host-buffer
+/// behaviour at degenerate geometries) over the wire-format
+/// `decode_frame`.
+fn decodes_to_expected(s: &Stream, vendor_layout: bool) -> Result<bool, String> {
     let frames = frames_of(s);
     let mut dec = Decoder::new();
     for (i, f) in frames.iter().enumerate() {
-        let out = if frames.len() == 1 {
-            decode_frame(f, s.width, s.height, s.kind)
-        } else {
+        let out = if frames.len() > 1 {
             dec.decode(f, s.width, s.height, s.kind)
+        } else if vendor_layout {
+            decode_frame_vendor_layout(f, s.width, s.height, s.kind)
+        } else {
+            decode_frame(f, s.width, s.height, s.kind)
         }
         .map_err(|e| format!("{}: frame{i}: {e}", s.name))?;
         if sha256_hex(&out.pixels) != s.expected_sha256 {
@@ -131,56 +138,34 @@ fn decodes_to_expected(s: &Stream) -> Result<bool, String> {
 /// The conformance test asserts these still miss, so a fix must remove
 /// its rows here in the same commit.
 const KNOWN_GAPS: &[(&str, &str)] = &[
-    ("rgb24-1x2-edges", "host DIB-stride re-layout of 24-bpp rows (spec/06 §3.2 step 1 validated note); the vendor round trip passes only because the pad byte equals the input"),
-    ("rgb24-1x2-flat", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("rgb24-1x2-grey", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("rgb24-1x2-nearflat", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("rgb24-1x2-noise", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("rgb24-1x2-ramp", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("rgb24-2x2-edges", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("rgb24-2x2-flat", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("rgb24-2x2-gradient", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("rgb24-2x2-grey", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("rgb24-2x2-nearflat", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("rgb24-2x2-noise", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("rgb24-2x2-ramp", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("rgb24-33x27-edges", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("rgb24-33x27-flat", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("rgb24-33x27-gradient", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("rgb24-33x27-noise", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("rgb24-3x3-edges", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("rgb24-3x3-flat", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("rgb24-3x3-gradient", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("rgb24-3x3-grey", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("rgb24-3x3-nearflat", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("rgb24-3x3-noise", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("rgb24-3x3-ramp", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("rgb24-5x7-edges", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("rgb24-5x7-flat", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("rgb24-5x7-grey", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("rgb24-5x7-gradient", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("rgb24-5x7-nearflat", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("rgb24-5x7-noise", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("rgb24-5x7-ramp", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("rgb32-1x1-edges", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("rgb32-1x1-flat", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("rgb32-1x1-grey", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("rgb32-1x1-nearflat", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("rgb32-1x1-noise", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("rgb32-1x1-ramp", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("rgb32-2x1-edges", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("rgb32-2x1-flat", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("rgb32-2x1-grey", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("rgb32-2x1-nearflat", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("rgb32-2x1-noise", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("rgb32-2x1-ramp", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("yv12-4x2-noise", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
+    (
+        "rgb24-1x2-edges",
+        "wire-format decode of a stream the vendor round-trips only through its 24-bpp DIB-stride host layout (the pad byte happens to equal the input); `decode_frame_vendor_layout` reproduces it",
+    ),
+    ("rgb24-33x27-edges", W4_PAD),
+    ("rgb24-33x27-flat", W4_PAD),
+    ("rgb24-33x27-gradient", W4_PAD),
+    ("rgb24-33x27-noise", W4_PAD),
+    ("rgb24-5x7-edges", W4_PAD),
+    ("rgb24-5x7-flat", W4_PAD),
+    ("rgb24-5x7-gradient", W4_PAD),
+    ("rgb24-5x7-nearflat", W4_PAD),
+    ("rgb24-5x7-noise", W4_PAD),
+    ("rgb24-5x7-ramp", W4_PAD),
 ];
 
-/// Scorecard floors: (vendor-byte-exact streams incl. the null
-/// sequence, vendor-lossy streams reproducing the vendor decoder).
+/// RGB24 with `W % 4 != 0` and `W >= 4`: the vendor decoder's row-end
+/// vector store leaves values in the DIB pad bytes that the docs did
+/// not capture (`spec/06` §3.2 step 1 validated note); the in-row
+/// pixels match. Zero pads reproduce `rgb24-5x7-grey` only.
+const W4_PAD: &str =
+    "24-bpp DIB pad bytes at W >= 4 not captured by the docs (spec/06 §3.2 step 1 validated note)";
+
+/// Scorecard: (vendor-byte-exact streams incl. the null sequence
+/// through the wire-format `decode_frame`, vendor-lossy streams
+/// reproducing the vendor decoder through `decode_frame_vendor_layout`).
 /// Raised in the same commit as each decoder fix.
-const EXPECTED_SCORECARD: (usize, usize) = (187, 9);
+const EXPECTED_SCORECARD: (usize, usize) = (187, 42);
 
 #[test]
 fn vendor_corpus_decodes_byte_exactly() {
@@ -197,8 +182,11 @@ fn vendor_corpus_decodes_byte_exactly() {
     let mut unexpected = Vec::new();
     let mut stale_gaps = Vec::new();
     for s in &streams {
-        let ok = decodes_to_expected(s).unwrap_or_else(|e| panic!("{e}"));
         let is_lossy = s.class == "lossy";
+        // Byte-exact streams are the wire-format contract and go
+        // through `decode_frame`; vendor-lossy streams are compared
+        // against the vendor decoder's own host-buffer output.
+        let ok = decodes_to_expected(s, is_lossy).unwrap_or_else(|e| panic!("{e}"));
         if is_lossy {
             lossy_total += 1;
             lossy_ok += usize::from(ok);
@@ -230,6 +218,23 @@ fn vendor_corpus_decodes_byte_exactly() {
         EXPECTED_SCORECARD,
         "scorecard drifted: byte-exact {exact_ok}/{exact_total}, vendor-lossy parity {lossy_ok}/{lossy_total}"
     );
+}
+
+/// The vendor-layout entry point is bit-identical to the wire-format
+/// decode wherever the host-buffer quirks do not apply, and it also
+/// reproduces the byte-exact class in full — including the one
+/// stream (`rgb24-1x2-edges`) the vendor round-trips only through
+/// its DIB-stride layout.
+#[test]
+fn vendor_layout_reproduces_every_byte_exact_stream() {
+    let streams = load_manifest();
+    let mut misses = Vec::new();
+    for s in streams.iter().filter(|s| s.class != "lossy") {
+        if !decodes_to_expected(s, true).unwrap_or_else(|e| panic!("{e}")) {
+            misses.push(s.name.clone());
+        }
+    }
+    assert!(misses.is_empty(), "vendor-layout misses: {misses:#?}");
 }
 
 /// Floor on the number of vendored inputs whose `encode_frame` output

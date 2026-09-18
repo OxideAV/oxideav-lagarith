@@ -6847,3 +6847,211 @@ fn vendor_non_pow2_channels_require_the_pow2_normaliser() {
         "the cumulative-sum correction walk must be exercised on most non-pow2 channels ({with_deficit}/{non_pow2})"
     );
 }
+
+// ───────── Round 459: vendor host-buffer layout entry point ─────────
+
+/// `decode_frame_vendor_layout` is bit-identical to `decode_frame`
+/// wherever none of the three vendor quirks applies: aligned RGB24,
+/// any RGBA / Bgr24 host, multi-row RGB32, YUY2, and YV12 at or above
+/// the vector loop's size.
+#[test]
+fn vendor_layout_matches_wire_decode_off_the_quirk_geometries() {
+    use crate::decoder::decode_frame_vendor_layout;
+    let cases: Vec<(Vec<u8>, u32, u32, PixelKind)> = vec![
+        (
+            encode_arith_rgb24(&pattern_bgr24(8, 6), 8, 6),
+            8,
+            6,
+            PixelKind::Bgr24,
+        ),
+        (
+            encode_arith_rgb24(&pattern_bgr24(16, 4), 16, 4),
+            16,
+            4,
+            PixelKind::Bgra32,
+        ),
+        (
+            encode_arith_rgb24(&pattern_bgr24(4, 1), 4, 1),
+            4,
+            1,
+            PixelKind::Bgr24,
+        ),
+        (
+            encode_arith_rgba(&pattern_bgra32(5, 3), 5, 3),
+            5,
+            3,
+            PixelKind::Bgra32,
+        ),
+        (
+            encode_arith_yv12(&pattern_yv12(8, 8), 8, 8),
+            8,
+            8,
+            PixelKind::Yv12,
+        ),
+        (
+            encode_arith_yv12(&pattern_yv12(16, 4), 16, 4),
+            16,
+            4,
+            PixelKind::Yv12,
+        ),
+        (
+            encode_arith_yuy2(&pattern_yuy2(6, 4), 6, 4),
+            6,
+            4,
+            PixelKind::Yuy2,
+        ),
+        (encode_solid_rgb(1, 2, 3), 8, 2, PixelKind::Bgr24),
+    ];
+    for (frame, w, h, kind) in cases {
+        let a = decode_frame(&frame, w, h, kind).unwrap();
+        let b = decode_frame_vendor_layout(&frame, w, h, kind).unwrap();
+        assert_eq!(a.pixels, b.pixels, "{w}x{h} {kind:?} type {}", frame[0]);
+    }
+}
+
+/// `spec/06` §3.2 step 1 (validated note): on the vendor-layout path
+/// a 24-bpp frame with `W % 4 != 0` is laid out on the DIB stride
+/// `(3W + 3) & !3` with zero pads and cut to `3·W·H` bytes. Checked
+/// on the structure directly (W = 3: rows at stride 12).
+#[test]
+fn vendor_layout_relays_unaligned_rgb24_rows_on_the_dib_stride() {
+    use crate::decoder::decode_frame_vendor_layout;
+    let (w, h) = (3u32, 3u32);
+    let pixels = pattern_bgr24(w, h);
+    let frame = encode_arith_rgb24(&pixels, w, h);
+    let wire = decode_frame(&frame, w, h, PixelKind::Bgr24).unwrap().pixels;
+    assert_eq!(wire, pixels);
+    let vendor = decode_frame_vendor_layout(&frame, w, h, PixelKind::Bgr24)
+        .unwrap()
+        .pixels;
+    assert_eq!(vendor.len(), 27);
+    // Row 0 at 0..9, pad 9..12, row 1 at 12..21, pad 21..24, row 2 (first
+    // three bytes) at 24..27.
+    assert_eq!(&vendor[0..9], &pixels[0..9]);
+    assert_eq!(&vendor[9..12], &[0, 0, 0]);
+    assert_eq!(&vendor[12..21], &pixels[9..18]);
+    assert_eq!(&vendor[21..24], &[0, 0, 0]);
+    assert_eq!(&vendor[24..27], &pixels[18..21]);
+    // Same frame through a 32-bpp host: no 24-bpp stride, untouched.
+    let bgra = decode_frame_vendor_layout(&frame, w, h, PixelKind::Bgra32)
+        .unwrap()
+        .pixels;
+    assert_eq!(
+        bgra,
+        decode_frame(&frame, w, h, PixelKind::Bgra32)
+            .unwrap()
+            .pixels
+    );
+}
+
+/// `spec/06` §3.7 (observed note): for an RGB24 / RGB32-coded frame
+/// with `H == 1` decoded to a 32-bpp host the vendor emits the
+/// decorrelated planes (`B - G`, `G`, `R - G`); the 24-bpp host and
+/// every `H >= 2` frame are recorrelated normally.
+#[test]
+fn vendor_layout_skips_recorrelation_on_single_row_rgb32() {
+    use crate::decoder::decode_frame_vendor_layout;
+    let (w, h) = (2u32, 1u32);
+    let pixels = pattern_bgr24(w, h);
+    let frame = encode_arith_rgb24(&pixels, w, h);
+    assert_eq!(frame[0], 2);
+    let vendor = decode_frame_vendor_layout(&frame, w, h, PixelKind::Bgra32)
+        .unwrap()
+        .pixels;
+    for (i, px) in vendor.chunks_exact(4).enumerate() {
+        let (b, g, r) = (pixels[3 * i], pixels[3 * i + 1], pixels[3 * i + 2]);
+        assert_eq!(
+            px,
+            [b.wrapping_sub(g), g, r.wrapping_sub(g), 0xff],
+            "pixel {i}"
+        );
+    }
+    // 24-bpp host of the same frame: recorrelated (and a 2x1 row needs
+    // no stride re-layout: 3*2 = 6 -> stride 8, the cut keeps 6 bytes).
+    let bgr = decode_frame_vendor_layout(&frame, w, h, PixelKind::Bgr24)
+        .unwrap()
+        .pixels;
+    assert_eq!(bgr, pixels);
+    // Two rows: recorrelated on the 32-bpp host too.
+    let (w, h) = (2u32, 2u32);
+    let pixels = pattern_bgr24(w, h);
+    let frame = encode_arith_rgb24(&pixels, w, h);
+    let vendor = decode_frame_vendor_layout(&frame, w, h, PixelKind::Bgra32)
+        .unwrap()
+        .pixels;
+    assert_eq!(
+        vendor,
+        decode_frame(&frame, w, h, PixelKind::Bgra32)
+            .unwrap()
+            .pixels
+    );
+}
+
+/// `spec/06` §3.8 (validated note): below the YV12 vector loop's size
+/// (`W + 4 > ((W·H/4 + W/2) & !3)`) the vendor's row-1 / column-0
+/// `TL` seed is the byte preceding each plane — 0 for Y, the last Y
+/// for V, the last V for U — instead of `plane[0]`. On a 4x4 frame
+/// the Y plane's (1, 0) prediction becomes `MED(L, T, 0)` rather
+/// than `L`; the two entry points diverge exactly there and nowhere
+/// on the 8x8 frame above the threshold.
+#[test]
+fn vendor_layout_seeds_tiny_yv12_first_column_from_the_preceding_byte() {
+    use crate::decoder::decode_frame_vendor_layout;
+    use crate::predict::apply_plane_inverse_yuv_seeded;
+    // 4x4: threshold 8 > ((4 + 2) & !3) = 4 -> quirk applies.
+    let (w, h) = (4u32, 4u32);
+    let pixels = pattern_yv12(w, h);
+    let frame = encode_arith_yv12(&pixels, w, h);
+    let wire = decode_frame(&frame, w, h, PixelKind::Yv12).unwrap().pixels;
+    assert_eq!(wire, pixels);
+    let vendor = decode_frame_vendor_layout(&frame, w, h, PixelKind::Yv12)
+        .unwrap()
+        .pixels;
+    // Reproduce the vendor reading by hand from the wire residuals:
+    // Y seeded with 0, V with the last Y, U with the last V.
+    let slices = crate::frame::split_channels(&frame, 3).unwrap();
+    let mut y = decode_channel(slices[0], 16).unwrap();
+    let mut v = decode_channel(slices[1], 4).unwrap();
+    let mut u = decode_channel(slices[2], 4).unwrap();
+    apply_plane_inverse_yuv_seeded(&mut y, 4, 4, 0);
+    apply_plane_inverse_yuv_seeded(&mut v, 2, 2, y[15]);
+    apply_plane_inverse_yuv_seeded(&mut u, 2, 2, v[3]);
+    assert_eq!(vendor, [y, v, u].concat());
+    // 8x8: 12 > ((16 + 4) & !3) = 20 is false -> identical to the wire decode.
+    let (w, h) = (8u32, 8u32);
+    let pixels = pattern_yv12(w, h);
+    let frame = encode_arith_yv12(&pixels, w, h);
+    assert_eq!(
+        decode_frame_vendor_layout(&frame, w, h, PixelKind::Yv12)
+            .unwrap()
+            .pixels,
+        pixels
+    );
+}
+
+/// With `tl_seed == plane[0]` the seeded YV12 predictor is
+/// bit-identical to `FirstColRule::Yuv` (the seed collapses the
+/// median to `L`), so the wire-format rule is the seeded form's
+/// special case.
+#[test]
+fn yuv_seeded_predictor_with_plane0_seed_equals_the_yuv_rule() {
+    use crate::predict::{
+        apply_plane_forward_with_rule, apply_plane_inverse_with_rule,
+        apply_plane_inverse_yuv_seeded, FirstColRule,
+    };
+    for (w, h) in [(4usize, 4usize), (6, 5), (16, 3)] {
+        let plane: Vec<u8> = (0..w * h).map(|i| ((i * 37) ^ (i >> 2)) as u8).collect();
+        let res = apply_plane_forward_with_rule(&plane, w, h, FirstColRule::Yuv);
+        let mut a = res.clone();
+        apply_plane_inverse_with_rule(&mut a, w, h, FirstColRule::Yuv);
+        let mut b = res.clone();
+        apply_plane_inverse_yuv_seeded(&mut b, w, h, res[0]);
+        assert_eq!(a, plane);
+        assert_eq!(b, plane, "{w}x{h}");
+        // And a different seed changes (1, 0) unless the median clamp
+        // happens to absorb it — never on this pattern.
+        let mut c = res.clone();
+        apply_plane_inverse_yuv_seeded(&mut c, w, h, res[0].wrapping_add(0x80));
+        assert_ne!(c, plane, "{w}x{h}: seed must be observable");
+    }
+}
