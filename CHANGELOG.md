@@ -70,6 +70,21 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- round 459 — **inline RLE decodes lazily to the plane end; the u32
+  field is a dispatch hint** (`src/rle.rs` `expand_from`,
+  `src/channel.rs`). Per `spec/06` §2.3 / §2.6 and the
+  validation-corrected §5 step 6 (2026-09-12) the escape fires on the
+  `escape_len`-th consecutive zero and the *very next* symbol is the
+  run-length supplement — no `(escape_len + 1)`-th zero — and the
+  loop terminates when the output cursor reaches the plane pixel
+  count, not after the u32 pre-RLE symbol count. The crate now pulls
+  symbols from the range coder on demand through one shared
+  `spec/05` §4.1 state machine (the raw `0x05..0x07` transport uses
+  the same expander over a byte iterator), so a spliced `0` / `1` /
+  `n - 1` length field no longer changes the decode (it used to
+  surface `Truncated`). Vendor corpus: **187/188 unchanged**, and all
+  52 header-`0x01` / `0x03` vendor channels are pinned to consume
+  exactly the u32 the vendor encoder wrote when decoded lazily.
 - round 459 — **header-`0xff` "solid plane" is a residual plane, not a
   fill** (`src/channel.rs`, `src/decoder.rs`). Per `spec/03` §2.1's
   validation-corrected blockquote (normative) and `spec/06` §5 step 2

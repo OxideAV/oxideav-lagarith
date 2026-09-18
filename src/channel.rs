@@ -7,7 +7,7 @@
 //! | Header | Wire form |
 //! | ------ | --------- |
 //! | `0x00` | Fibonacci prefix at offset 1 + arithmetic body. No RLE. Range coder produces `n_pixels` symbols. |
-//! | `0x01..=0x03` | u32 length at offsets 1..4 (only when `< n_pixels`); Fibonacci prefix at offset 5; arithmetic body produces `u32` pre-RLE symbols. Post-process RLE-expand with `escape_len = header` to fill `n_pixels`. The "u32 ≥ n_pixels" fall-back diverts to header-`0x00` style. |
+//! | `0x01..=0x03` | u32 length at offsets 1..4 (only when `< n_pixels`); Fibonacci prefix at offset 5; arithmetic body decoded lazily through the inline zero-run RLE state machine (`escape_len = header`) until `n_pixels` residuals are filled — the u32 is a dispatch hint, not the symbol budget (`spec/06` §2.6). The "u32 ≥ n_pixels" fall-back diverts to header-`0x00` style. |
 //! | `0x04` | `n_pixels` raw bytes at offset 1. No entropy. |
 //! | `0x05..=0x07` | Raw bytes at offset 1, post-processed with RLE escape `escape_len = header - 4`. |
 //! | `0xff` | "Solid plane": zeroed plane with the byte at offset 1 stored at position 0 — a residual plane `{v, 0, 0, …}` the predictor turns into a solid `v` (`spec/03` §2.1 corrected blockquote). |
@@ -691,14 +691,18 @@ fn decode_arith_rle(
     }
     let body = &channel[body_offset..];
     let mut dec = RangeDecoder::new(body)?;
-    let mut symbols = Vec::with_capacity(pre_rle_symbol_count);
-    for _ in 0..pre_rle_symbol_count {
-        symbols.push(dec.decode_symbol(&cdf)?);
-    }
-
-    // Post-process: the symbol sequence is the same form `expand_raw`
-    // consumes (escape_len consecutive zeros + supplement byte, etc.).
-    let (plane, _) = rle::expand_raw(&symbols, escape_len, n_pixels)?;
+    // Inline RLE-with-entropy (`spec/06` §2.3 / §2.6, §5 step 6
+    // validation-corrected): symbols are pulled from the range coder
+    // lazily and the loop terminates when the plane is full — the u32
+    // pre-RLE length field is a dispatch hint (§1.4), not the
+    // termination criterion. The escape fires on the `escape_len`-th
+    // consecutive zero and the very next symbol is the run-length
+    // supplement. On every vendor-encoded `0x01` / `0x03` channel the
+    // symbol count consumed this way equals the u32 field exactly
+    // (`roundtrip_tests::vendor_arith_rle_channels_consume_exactly_the_u32_symbol_count`).
+    let _ = pre_rle_symbol_count;
+    let (plane, _consumed) =
+        rle::expand_from(|| dec.decode_symbol(&cdf).map(Some), escape_len, n_pixels)?;
     Ok(plane)
 }
 

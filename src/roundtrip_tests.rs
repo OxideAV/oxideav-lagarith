@@ -468,31 +468,37 @@ fn arith_rle_length_field_dispatch_boundary() {
     }
 }
 
-/// `spec/06` §1.4 step 4 / §6.2: a length field of exactly `0`
-/// (`< n_pixels` for any non-empty plane) selects call site A with
-/// a **zero**-symbol pre-RLE stream. The range coder emits no
-/// symbols, so the RLE expander is handed an empty input but is
-/// still asked to fill `n_pixels` outputs — which `spec/05` §4.2's
-/// output-driven expander cannot do, yielding a clean `Truncated`
-/// error rather than a panic or an out-of-bounds read.
+/// `spec/06` §2.6 (termination clause) + §5 step 6
+/// (validation-corrected): for headers `0x01..0x03` the u32 length
+/// field is a **dispatch hint** (`spec/06` §1.4 — `< n_pixels` selects
+/// call site A), not the termination criterion. The inline RLE loop
+/// runs until the output cursor reaches the plane pixel count,
+/// pulling symbols from the range coder lazily, so a spliced length
+/// field of `0`, `1` or `n_pixels - 1` still decodes the very same
+/// plane — the prefix and body it points at are untouched. (Before
+/// round 459 the crate decoded exactly `u32` symbols and then
+/// expanded them, turning a `0` field into a `Truncated` error.)
 #[test]
-fn arith_rle_zero_length_field_is_clean_error() {
+fn arith_rle_length_field_is_not_the_termination_criterion() {
     let plane = vec![5u8, 0, 0, 0, 13, 0, 0, 17];
     let n_pixels = plane.len();
     for escape_len in 1u8..=3 {
-        let mut channel = encode_channel_arith_rle(&plane, escape_len as usize);
+        let channel = encode_channel_arith_rle(&plane, escape_len as usize);
         // Only meaningful when the encoder actually chose the arith+RLE
         // wire form (header byte in 0x01..=0x03 carries the u32 field).
         if !(0x01..=0x03).contains(&channel[0]) {
             continue;
         }
-        splice_u32_length_field(&mut channel, 0);
-        let r = decode_channel(&channel, n_pixels);
-        assert!(
-            matches!(r, Err(crate::Error::Truncated { .. })),
-            "zero-length call-site-A stream must surface Truncated, got {r:?} \
-             (escape_len={escape_len})"
-        );
+        for field in [0u32, 1, n_pixels as u32 - 1] {
+            let mut spliced = channel.clone();
+            splice_u32_length_field(&mut spliced, field);
+            let r = decode_channel(&spliced, n_pixels);
+            assert_eq!(
+                r.as_deref(),
+                Ok(plane.as_slice()),
+                "u32 = {field} must not change the decode (escape_len={escape_len})"
+            );
+        }
     }
 }
 
@@ -6654,4 +6660,82 @@ fn vendor_yv12_streams_decode_only_under_the_yuv_rule() {
             "{name}: Rule A must differ"
         );
     }
+}
+
+/// `spec/06` §5 step 6 (validation-corrected 2026-09-12) + §2.6: the
+/// escape fires when the `escape_len`-th consecutive zero has been
+/// written and the very next symbol is the run-length supplement —
+/// there is no `(escape_len + 1)`-th zero — and the loop terminates
+/// on the output cursor, not the u32 field. Consequence pinned on the
+/// vendor corpus: decoding every header-`0x01` / `0x03` vendor channel
+/// lazily until its plane is full consumes **exactly** the u32 pre-RLE
+/// symbol count the vendor encoder wrote (all 52 such channels in the
+/// corpus; a `(e + 1)`-zero rule would consume a different count and
+/// mis-place every run).
+#[test]
+fn vendor_arith_rle_channels_consume_exactly_the_u32_symbol_count() {
+    use crate::frame::{split_channels, FrameType};
+    use crate::range_coder::{Cdf, RangeDecoder};
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/vendor_corpus");
+    let manifest = std::fs::read_to_string(root.join("manifest.tsv")).unwrap();
+    let mut checked = 0usize;
+    let mut escape_lens_seen = [false; 4];
+    for line in manifest.lines().filter(|l| !l.starts_with('#')) {
+        let f: Vec<&str> = line.split('\t').collect();
+        let (name, w, h) = (
+            f[0],
+            f[2].parse::<u32>().unwrap(),
+            f[3].parse::<u32>().unwrap(),
+        );
+        let Ok(frame) = std::fs::read(root.join(name).join("frame.lags")) else {
+            continue;
+        };
+        let Ok(ty) = FrameType::from_byte(frame[0]) else {
+            continue;
+        };
+        let n_ch = ty.n_channels();
+        if n_ch == 0 {
+            continue;
+        }
+        let n = (w * h) as usize;
+        let counts = ty
+            .wire_plane_pixel_counts(w, h)
+            .unwrap_or_else(|| vec![n; n_ch]);
+        let slices = split_channels(&frame, n_ch).unwrap();
+        for (ci, ch) in slices.iter().enumerate() {
+            let header = ch[0];
+            if !(0x01..=0x03).contains(&header) {
+                continue;
+            }
+            let n_pixels = counts[ci];
+            let field = u32::from_le_bytes([ch[1], ch[2], ch[3], ch[4]]) as usize;
+            assert!(
+                field < n_pixels,
+                "{name} ch{ci}: field {field} >= {n_pixels}"
+            );
+            let (freq, prefix_bytes) = crate::fibonacci::decode_freq_table(&ch[5..]).unwrap();
+            let cdf = Cdf::from_wire_frequencies(&freq).unwrap();
+            let mut dec = RangeDecoder::new(&ch[5 + prefix_bytes..]).unwrap();
+            let (_plane, consumed) = crate::rle::expand_from(
+                || dec.decode_symbol(&cdf).map(Some),
+                header as usize,
+                n_pixels,
+            )
+            .unwrap();
+            assert_eq!(
+                consumed, field,
+                "{name} ch{ci} (escape_len {header}): lazily consumed {consumed} symbols, u32 says {field}"
+            );
+            escape_lens_seen[header as usize] = true;
+            checked += 1;
+        }
+    }
+    assert_eq!(
+        checked, 52,
+        "expected all 52 vendor arith+RLE channels to be checked"
+    );
+    assert!(
+        escape_lens_seen[1] && escape_lens_seen[3],
+        "escape lengths 1 and 3 both covered"
+    );
 }

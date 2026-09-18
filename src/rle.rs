@@ -9,86 +9,104 @@
 //!
 //! - **Raw bytes** (channel-header `0x05..0x07`, escape_len = h - 4):
 //!   `expand_raw` post-processes a borrowed byte slice directly.
-//! - **Modern range coder, post-process form** (channel-header
-//!   `0x01..0x03`, escape_len = h): the dispatcher decodes the full
-//!   range-coder symbol stream first (driven by the channel's u32
-//!   pre-RLE symbol-stream length field per `spec/06` §1.4), then
-//!   feeds those bytes into `expand_raw`. `spec/05` §1.3 / `spec/06`
-//!   §2.2 note that the proprietary fuses RLE expansion into the
-//!   range-coder loop as an optimisation; the post-process form is
-//!   bit-equivalent to a clean-room implementation.
+//! - **Modern range coder, inline form** (channel-header
+//!   `0x01..0x03`, escape_len = h): `expand_from` pulls one symbol
+//!   from the range coder per step and stops when the plane is full
+//!   (`spec/06` §2.3 escape-state counter + §2.6 termination clause;
+//!   §5 step 6 validation-corrected 2026-09-12). The channel's u32
+//!   pre-RLE length field only selects the dispatch (`spec/06` §1.4);
+//!   on every vendor-encoded `0x01` / `0x03` channel the lazily
+//!   consumed symbol count equals that field exactly. (Rounds 1–458
+//!   decoded exactly `u32` symbols and expanded them as a post-process
+//!   — bit-equivalent on conformant streams, but it made the field
+//!   load-bearing where the vendor decoder ignores it.)
 
 use crate::error::{Error, Result};
 use crate::tables::rle_fwd_lut;
+
+/// Expand an escaped symbol sequence into a plane buffer of
+/// `n_pixels` residuals, pulling symbols on demand from `next`
+/// (`Ok(None)` = the transport has no more symbols). Returns the
+/// plane and the number of symbols consumed.
+///
+/// This is the `spec/05` §4.1 state machine in its lazy,
+/// output-driven form (`spec/06` §2.3 escape-state counter, §2.6
+/// termination clause): the loop runs **until the output cursor
+/// reaches `n_pixels`**, never a symbol count. Each decoded zero is
+/// written (the buffer is pre-zeroed, so the cursor just advances)
+/// and bumps a consecutive-zero counter; when that counter reaches
+/// `escape_len` — i.e. the `escape_len`-th consecutive zero has just
+/// been written — the **very next** symbol is the run-length
+/// supplement `s`, and the cursor advances by a further `LUT[s]`
+/// zeros (`spec/05` §2.3: `total_zero_run = escape_len + LUT[s]`),
+/// clamped at the plane end (§4.2). There is no `(escape_len + 1)`-th
+/// zero (`spec/06` §5 step 6, validation-corrected). A non-zero
+/// symbol resets the counter and is stored literally.
+///
+/// Used by both transports: the modern range coder (headers
+/// `0x01..0x03`, one symbol per call) and the raw byte body (headers
+/// `0x05..0x07`, via [`expand_raw`]). For the arithmetic transport the
+/// channel's u32 pre-RLE length field is only a dispatch hint
+/// (`spec/06` §2.6); on every vendor-encoded `0x01` / `0x03` channel
+/// the lazily consumed symbol count equals that field exactly
+/// (pinned in `roundtrip_tests`).
+///
+/// `escape_len` must be in `1..=3`.
+pub(crate) fn expand_from<F>(
+    mut next: F,
+    escape_len: usize,
+    n_pixels: usize,
+) -> Result<(Vec<u8>, usize)>
+where
+    F: FnMut() -> Result<Option<u8>>,
+{
+    debug_assert!((1..=3).contains(&escape_len));
+    let lut = rle_fwd_lut();
+    let mut out = vec![0u8; n_pixels];
+    let mut j: usize = 0; // output cursor
+    let mut consumed: usize = 0; // symbols pulled from the transport
+    let mut zeros: usize = 0; // consecutive-zero counter
+    while j < n_pixels {
+        let Some(b) = next()? else {
+            return Err(Error::Truncated {
+                context: "RLE input ran out before output filled",
+            });
+        };
+        consumed += 1;
+        if b != 0 {
+            zeros = 0;
+            out[j] = b;
+            j += 1;
+            continue;
+        }
+        // A zero residual: already in the pre-zeroed buffer.
+        j += 1;
+        zeros += 1;
+        if zeros == escape_len {
+            // The escape fires on the `escape_len`-th consecutive
+            // zero; the next symbol is the run-length supplement.
+            let Some(s) = next()? else {
+                return Err(Error::Truncated {
+                    context: "RLE escape supplement byte",
+                });
+            };
+            consumed += 1;
+            // `escape_len` zeros are already written; extend the run
+            // by `LUT[s]`, clamped at the plane end (`spec/05` §4.2).
+            j = j.saturating_add(lut[s as usize] as usize).min(n_pixels);
+            zeros = 0;
+        }
+    }
+    Ok((out, consumed))
+}
 
 /// Expand an escaped byte sequence into a plane buffer of `n_pixels`
 /// residuals. Returns the number of bytes consumed from `src`.
 ///
 /// `escape_len` must be in `1..=3`.
 pub fn expand_raw(src: &[u8], escape_len: usize, n_pixels: usize) -> Result<(Vec<u8>, usize)> {
-    debug_assert!((1..=3).contains(&escape_len));
-    let lut = rle_fwd_lut();
-    let mut out = vec![0u8; n_pixels];
-    let mut j: usize = 0; // output cursor
-    let mut i: usize = 0; // input cursor
-
-    while j < n_pixels {
-        // Look at the next up-to-`escape_len` bytes for a leading
-        // zero run.
-        let remaining_input = src.len().saturating_sub(i);
-        // If we don't have enough input bytes for a full escape
-        // probe, the channel must have a shorter literal tail. Fall
-        // back to literal byte handling below.
-        let probe_len = escape_len.min(remaining_input);
-        let mut zero_run = 0usize;
-        for k in 0..probe_len {
-            if src[i + k] == 0 {
-                zero_run += 1;
-            } else {
-                break;
-            }
-        }
-        if zero_run == escape_len {
-            // Escape fires: consume escape_len zeros + one
-            // supplement byte and emit (escape_len + LUT[s])
-            // residuals as zero.
-            if remaining_input < escape_len + 1 {
-                return Err(Error::Truncated {
-                    context: "RLE escape supplement byte",
-                });
-            }
-            let s = src[i + escape_len] as usize;
-            i += escape_len + 1;
-            let total_zeros = escape_len + lut[s] as usize;
-            // Output buffer is pre-zeroed; just advance the cursor
-            // (clamp at n_pixels per `spec/05` §4.2).
-            let advance = total_zeros.min(n_pixels - j);
-            j += advance;
-        } else {
-            // Either zero_run < escape_len followed by non-zero (or
-            // by end-of-input). Emit `zero_run` zeros literally,
-            // then if input remains emit the next byte literally.
-            for _ in 0..zero_run {
-                if j >= n_pixels {
-                    break;
-                }
-                out[j] = 0;
-                j += 1;
-            }
-            i += zero_run;
-            if j < n_pixels {
-                if i >= src.len() {
-                    return Err(Error::Truncated {
-                        context: "RLE input ran out before output filled",
-                    });
-                }
-                out[j] = src[i];
-                j += 1;
-                i += 1;
-            }
-        }
-    }
-    Ok((out, i))
+    let mut it = src.iter().copied();
+    expand_from(|| Ok(it.next()), escape_len, n_pixels)
 }
 
 /// Supplement byte for a desired escape padding `n` (the run-length
