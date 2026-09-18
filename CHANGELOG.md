@@ -8,6 +8,24 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- round 459 — **pow2 model normaliser re-derived from the corrected
+  chapters and pinned on the vendor corpus** (`src/model.rs`,
+  `src/roundtrip_tests.rs`
+  `vendor_non_pow2_channels_require_the_pow2_normaliser`). `spec/04` §5
+  (validation-corrected 2026-09-12) withdraws "the decoder performs
+  `q = range / total` on the raw histogram": the loaded table is
+  normalised to `2^shift >= total` (truncating rescale + the
+  cumulative-sum correction of §9 item 2) and the coder uses
+  `q = range >> shift` (`spec/02` §5 step 1 / §9 item 1) — exactly the
+  `0x180001050` recovery this crate wired in round 407, now confirmed
+  end-to-end on vendor bytes: of the corpus's 495 arithmetic channels,
+  189 carry a non-power-of-two wire total, **all 189** decode to a
+  different symbol stream under a raw-total model than under the
+  normaliser (whose decode the frame-level pins prove byte-exact), and
+  187 of them exercise the correction walk (non-zero deficit after the
+  truncating rescale). `spec/04` §9 item 2's "rounding settled" note
+  (the i386 build truncates too) retires the `provenance/52` §5
+  rounding caveat in the module docs.
 - round 459 — **SIMD first-column Rule B pinned on the vendor corpus**
   (`src/roundtrip_tests.rs`
   `vendor_rgb_family_streams_decode_only_under_rule_b`,

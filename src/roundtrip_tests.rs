@@ -6739,3 +6739,111 @@ fn vendor_arith_rle_channels_consume_exactly_the_u32_symbol_count() {
         "escape lengths 1 and 3 both covered"
     );
 }
+
+/// `spec/04` §5 (validation-corrected 2026-09-12) + `spec/02` §5 /
+/// §9 item 1: the wire carries the RAW histogram, but the coder's
+/// model is the `0x180001050`-normalised power-of-two-total form —
+/// smallest `2^shift >= total`, truncating rescale, cumulative-sum
+/// correction so `sum == 2^shift`, `q = range >> shift`. "A decoder
+/// that divides by the raw total mis-parses every non-power-of-two
+/// plane." Pinned on the vendor corpus: every arithmetic channel with
+/// a non-power-of-two wire total (the `noise` / `gradient` / `edges`
+/// planes at 5x7, 33x27, 64x48, 320x240 and every pre-RLE stream)
+/// decodes to a *different* symbol stream under a raw-total model
+/// than under the normaliser — and the normaliser's decode is the one
+/// the frame-level corpus pins prove byte-exact. The correction walk
+/// (deficit hand-out after the truncating rescale) is exercised on
+/// the majority of those channels.
+#[test]
+fn vendor_non_pow2_channels_require_the_pow2_normaliser() {
+    use crate::frame::{split_channels, FrameType};
+    use crate::range_coder::{Cdf, RangeDecoder};
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/vendor_corpus");
+    let manifest = std::fs::read_to_string(root.join("manifest.tsv")).unwrap();
+    let (mut arith, mut non_pow2, mut diverged, mut with_deficit) =
+        (0usize, 0usize, 0usize, 0usize);
+    for line in manifest.lines().filter(|l| !l.starts_with('#')) {
+        let f: Vec<&str> = line.split('\t').collect();
+        let (name, w, h) = (
+            f[0],
+            f[2].parse::<u32>().unwrap(),
+            f[3].parse::<u32>().unwrap(),
+        );
+        let Ok(frame) = std::fs::read(root.join(name).join("frame.lags")) else {
+            continue;
+        };
+        let Ok(ty) = FrameType::from_byte(frame[0]) else {
+            continue;
+        };
+        let n_ch = ty.n_channels();
+        if n_ch == 0 || ty == FrameType::LegacyRgb {
+            continue;
+        }
+        let n = (w * h) as usize;
+        let counts = ty
+            .wire_plane_pixel_counts(w, h)
+            .unwrap_or_else(|| vec![n; n_ch]);
+        let slices = split_channels(&frame, n_ch).unwrap();
+        for (ci, ch) in slices.iter().enumerate() {
+            let header = ch[0];
+            let (prefix_off, symbols) = match header {
+                0x00 => (1usize, counts[ci]),
+                0x01..=0x03 => {
+                    let field = u32::from_le_bytes([ch[1], ch[2], ch[3], ch[4]]) as usize;
+                    if field >= counts[ci] {
+                        (1, counts[ci])
+                    } else {
+                        (5, field)
+                    }
+                }
+                _ => continue,
+            };
+            let (freq, prefix_bytes) =
+                crate::fibonacci::decode_freq_table(&ch[prefix_off..]).unwrap();
+            let total: u32 = freq.iter().sum();
+            assert_eq!(
+                total as usize, symbols,
+                "{name} ch{ci}: raw total is the symbol count"
+            );
+            arith += 1;
+            if total.is_power_of_two() {
+                continue;
+            }
+            non_pow2 += 1;
+            let pow2 = total.next_power_of_two();
+            let scale = f64::from(pow2) / f64::from(total);
+            let truncated: u32 = freq.iter().map(|&x| (f64::from(x) * scale) as u32).sum();
+            if truncated < pow2 {
+                with_deficit += 1;
+            }
+            let body = &ch[prefix_off + prefix_bytes..];
+            let decode = |cdf: &Cdf| -> Vec<u8> {
+                let mut dec = RangeDecoder::new(body).unwrap();
+                (0..symbols)
+                    .map(|_| dec.decode_symbol(cdf).unwrap())
+                    .collect()
+            };
+            let normalised = decode(&Cdf::from_wire_frequencies(&freq).unwrap());
+            let raw = decode(&Cdf::from_frequencies(&freq).unwrap());
+            if normalised != raw {
+                diverged += 1;
+            }
+        }
+    }
+    eprintln!(
+        "vendor arithmetic channels: {arith}; non-pow2 totals: {non_pow2}; raw-model divergent: {diverged}; correction-walk deficit: {with_deficit}"
+    );
+    assert!(arith > 300, "arithmetic channels seen: {arith}");
+    assert!(
+        non_pow2 > 150,
+        "non-power-of-two wire totals seen: {non_pow2}"
+    );
+    assert_eq!(
+        diverged, non_pow2,
+        "every non-pow2 vendor channel must decode differently under a raw-total model"
+    );
+    assert!(
+        with_deficit * 2 > non_pow2,
+        "the cumulative-sum correction walk must be exercised on most non-pow2 channels ({with_deficit}/{non_pow2})"
+    );
+}

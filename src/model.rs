@@ -47,14 +47,22 @@
 //! legacy type-7 coder builds its CDF differently (per-frame
 //! histogram prefix-sum; `spec/07`) and is untouched.
 //!
-//! ## Rounding-mode caveat
+//! ## Rounding mode — settled
 //!
-//! `provenance/52` §5 notes the i386 build converts with `fistp`
-//! (rounding per the x87 control word) where the x86-64 build
-//! truncates with `cvttsd2si`. Per the trace's recommendation this
-//! implementation targets the **x86-64 truncation semantics** (Rust
-//! `as u32` on a non-negative in-range `f64` truncates toward zero,
-//! exactly `cvttsd2si`).
+//! `provenance/52` §5 once left open whether the i386 build's `fistp`
+//! conversion rounds differently from the x86-64 build's `cvttsd2si`
+//! truncation. `spec/04` §9 item 2 ("Rounding settled", 2026-09-12)
+//! closes it: the i386 rescale is wrapped in the control-word
+//! truncation idiom and its captured `cum[]` tables equal
+//! `trunc(freq * pow2 / total)` in double arithmetic on every entry the
+//! correction leaves alone — both builds derive the same table. This
+//! implementation's `as u32` on a non-negative in-range `f64`
+//! truncates toward zero, exactly that. The vendor-encoded corpus
+//! confirms the whole derivation end-to-end: every non-power-of-two
+//! wire total in it (noise / gradient / edges planes and every pre-RLE
+//! stream) decodes byte-exactly through this normaliser and
+//! mis-parses under a raw-total model
+//! (`roundtrip_tests::vendor_non_pow2_channels_require_the_pow2_normaliser`).
 
 use crate::error::{Error, Result};
 use crate::range_coder::INIT_RANGE;
