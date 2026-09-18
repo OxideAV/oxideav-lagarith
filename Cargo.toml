@@ -9,6 +9,10 @@ authors = ["Mark Karpeles"]
 description = "Pure-Rust Lagarith lossless video decoder for the oxideav framework"
 
 readme = "README.md"
+# The vendored vendor-encoded fixture corpus (`tests/vendor_corpus/`)
+# and the cargo-fuzz sub-crate are CI-only; keep them out of the
+# crates.io package.
+exclude = ["/tests", "/fuzz"]
 homepage = "https://github.com/OxideAV/oxideav-lagarith"
 keywords = ["multimedia", "video", "lagarith", "lossless", "codec"]
 categories = ["multimedia::encoding", "multimedia::video"]

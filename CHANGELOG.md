@@ -8,6 +8,22 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- round 459 — **vendor-corpus conformance harness** (`tests/vendor_corpus.rs`,
+  `tests/vendor_corpus/`, `examples/vendor_corpus.rs`). The 240-stream
+  corpus produced by the vendor's own encoder (docs staging of
+  2026-09-12: 187 byte-exact round-trip streams + the 3-frame NULL
+  sequence + 52 degenerate geometries where the vendor codec is itself
+  lossy) is vendored with the SHA-256 the vendor decoder's output must
+  hash to, and CI decodes every stream through the public entry points:
+  streams outside the `KNOWN_GAPS` table must match, streams inside it
+  must still miss (so the table only shrinks by fixing the decoder), and
+  the scorecard is pinned. A second pin encodes every vendored input
+  through `encode_frame`, requires byte-exact self-roundtrip, and floors
+  the count of streams reproduced byte-identically to the vendor's
+  bytes. Baseline at the start of the round: **163/188** vendor-byte-exact
+  streams, **9/52** vendor-lossy streams, encoder vendor-identical 23/179.
+  `[package] exclude = ["/tests", "/fuzz"]` keeps the corpus out of the
+  crates.io package.
 - round 451 — **black-box cross-validation harness + pins**
   (`examples/blackbox_capture.rs`, `tests/blackbox_encode_pins.rs`).
   An out-of-CI driver encodes a 27-case deterministic matrix covering
