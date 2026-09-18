@@ -10,7 +10,7 @@
 //! | `0x01..=0x03` | u32 length at offsets 1..4 (only when `< n_pixels`); Fibonacci prefix at offset 5; arithmetic body produces `u32` pre-RLE symbols. Post-process RLE-expand with `escape_len = header` to fill `n_pixels`. The "u32 ≥ n_pixels" fall-back diverts to header-`0x00` style. |
 //! | `0x04` | `n_pixels` raw bytes at offset 1. No entropy. |
 //! | `0x05..=0x07` | Raw bytes at offset 1, post-processed with RLE escape `escape_len = header - 4`. |
-//! | `0xff` | Constant fill: byte at offset 1 replicated `n_pixels` times. |
+//! | `0xff` | "Solid plane": zeroed plane with the byte at offset 1 stored at position 0 — a residual plane `{v, 0, 0, …}` the predictor turns into a solid `v` (`spec/03` §2.1 corrected blockquote). |
 
 use crate::error::{Error, Result};
 use crate::fibonacci;
@@ -435,7 +435,23 @@ pub(crate) fn decode_channel(channel: &[u8], n_pixels: usize) -> Result<Vec<u8>>
                     context: "header 0xff fill byte",
                 });
             }
-            Ok(vec![channel[1]; n_pixels])
+            // `spec/03` §2.1 (validation-corrected blockquote, normative)
+            // + `spec/06` §5 step 2: the "solid plane" form is NOT a
+            // memset of byte 1. The dispatcher zeroes the plane and
+            // stores byte 1 into position 0 only, leaving the
+            // *residual* plane `{v, 0, 0, ...}` that then runs through
+            // the predictor (and, for RGB, the cross-plane stage) like
+            // every other channel. Every predictor maps it to a solid
+            // plane of `v` (the YUY2 coordinator additionally copies
+            // `Y[0]` into `Y[1]`, since its row-0 rule takes `Y[1]`
+            // raw — see `decode_arith_yuy2`). Vendor fixtures
+            // `rgb24-4x4-nearflat` (`07,ff,ff`) and `yv12-*-flat`
+            // (`ff,ff,ff`) isolate the difference from a fill.
+            let mut plane = vec![0u8; n_pixels];
+            if let Some(first) = plane.first_mut() {
+                *first = channel[1];
+            }
+            Ok(plane)
         }
         other => Err(Error::BadChannelHeader(other)),
     }

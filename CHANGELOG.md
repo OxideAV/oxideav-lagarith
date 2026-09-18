@@ -55,6 +55,23 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- round 459 — **header-`0xff` "solid plane" is a residual plane, not a
+  fill** (`src/channel.rs`, `src/decoder.rs`). Per `spec/03` §2.1's
+  validation-corrected blockquote (normative) and `spec/06` §5 step 2
+  the dispatcher zeroes the plane and stores byte 1 into position 0
+  only; the resulting `{v, 0, 0, …}` residual plane then runs through
+  the predictor and, for RGB, the cross-plane stage like any other
+  channel — so a solid `B'` / `R'` plane adds `G` per pixel, and the
+  YUY2 coordinator copies `Y[0]` into `Y[1]` first (`spec/06` §3.8;
+  this family stores the second row-0 luma sample raw). The crate had
+  filled the plane with byte 1 *and then* run the predictor over the
+  fill, which reproduced neither reading. Closes the round-451
+  "`spec/06` §5 header-`0xff` semantics" open item. Vendor corpus:
+  **163/188 → 187/188** byte-exact (every `flat` / `nearflat` / `ramp`
+  / `grey` stream carrying a `ff` channel: `rgb24-4x4-nearflat`
+  `07,ff,ff`, `rgb24-16x16-ramp` `ff,03,ff`, `yv12-*-flat` `ff,ff,ff`,
+  `yuy2-*-flat` `05,ff,ff`, …); the one remaining byte-exact miss
+  (`rgb24-1x2-edges`) is the host DIB-stride quirk, not a wire fact.
 - round 451 (second pass) — **complete YUY2 predictor recovery**
   (`src/predict.rs` `apply_plane_{forward,inverse}_yuy2`): the type-3
   family's planes reconstruct with (1) a **raw second row-0 luma

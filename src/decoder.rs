@@ -755,6 +755,16 @@ fn decode_arith_yuy2(
     let mut plane_y = decode_channel(slices[0], y_pixels)?;
     let mut plane_u = decode_channel(slices[1], c_pixels)?;
     let mut plane_v = decode_channel(slices[2], c_pixels)?;
+    // `spec/06` §3.8 / §5 step 2: when the Y channel is the two-byte
+    // header-`0xff` "solid plane" form — a residual plane `{v, 0, 0,
+    // …}` — the YUY2 coordinator first copies `Y[0]` into `Y[1]`,
+    // because this family's row-0 rule stores the second luma sample
+    // raw (`apply_plane_inverse_yuy2`) and would otherwise leave it
+    // at 0 instead of `v`. Vendor fixtures `yuy2-*-flat` (`05,ff,ff`)
+    // and `yuy2-16x16-black` pin both sides of the patch.
+    if slices[0].first() == Some(&0xff) && plane_y.len() >= 2 {
+        plane_y[1] = plane_y[0];
+    }
 
     // Round-451 oracle-recovered YUY2 predictor
     // (`apply_plane_inverse_yuy2`): row-0 raw second luma sample,

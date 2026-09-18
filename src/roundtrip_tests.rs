@@ -525,13 +525,83 @@ fn channel_header_04_raw_memcpy() {
     assert_eq!(decoded, plane);
 }
 
+/// `spec/03` §2.1 (validation-corrected blockquote, normative) +
+/// `spec/06` §5 step 2: header `0xff` is **not** a memset of byte 1.
+/// The dispatcher zeroes the plane and stores byte 1 into position 0
+/// only, so the channel yields the *residual* plane `{v, 0, 0, …}`
+/// that the predictor then integrates into a solid plane of `v`.
+/// Vendor fixtures `rgb24-4x4-nearflat` (`07,ff,ff`) and
+/// `yv12-*-flat` (`ff,ff,ff`) pin the frame-level consequence in
+/// `tests/vendor_corpus.rs`; this pins the channel-level contract.
 #[test]
-fn channel_header_ff_solid_fill() {
+fn channel_header_ff_is_a_residual_plane_not_a_fill() {
     let channel = vec![0xff, 0x42];
     let decoded = decode_channel(&channel, 64).unwrap();
     assert_eq!(decoded.len(), 64);
-    for b in &decoded {
-        assert_eq!(*b, 0x42);
+    assert_eq!(decoded[0], 0x42);
+    assert!(decoded[1..].iter().all(|&b| b == 0));
+    // Zero-length planes (YUY2 `W = 1` chroma) accept the form too.
+    assert_eq!(decode_channel(&channel, 0).unwrap(), Vec::<u8>::new());
+}
+
+/// Frame-level consequence of the residual reading: a `0xff v`
+/// channel comes out of every family's predictor as a solid plane of
+/// `v` — for the RGB families *before* the cross-plane stage, so a
+/// solid `B'` / `R'` plane adds `G` per pixel. Hand-built frames per
+/// family; the vendor corpus pins the same on real streams.
+#[test]
+fn channel_header_ff_integrates_to_a_solid_plane_per_family() {
+    // RGB24 type 4 (4x4): B' = 0x10 solid, G arithmetic gradient,
+    // R' = 0x20 solid -> B = 0x10 + G, R = 0x20 + G.
+    let (w, h) = (4u32, 4u32);
+    let n = (w * h) as usize;
+    let g_plane: Vec<u8> = (0..n).map(|i| (i * 9 + 3) as u8).collect();
+    let g_res = crate::predict::apply_plane_forward_with_rule(
+        &g_plane,
+        w as usize,
+        h as usize,
+        crate::predict::FirstColRule::B,
+    );
+    let g_chan = crate::encoder::encode_channel_simple(&g_res);
+    let mut frame = vec![0x04u8];
+    let off_g = 9u32 + 2;
+    let off_r = off_g + g_chan.len() as u32;
+    frame.extend_from_slice(&off_g.to_le_bytes());
+    frame.extend_from_slice(&off_r.to_le_bytes());
+    frame.extend_from_slice(&[0xff, 0x10]);
+    frame.extend_from_slice(&g_chan);
+    frame.extend_from_slice(&[0xff, 0x20]);
+    let dec = decode_frame(&frame, w, h, PixelKind::Bgr24).unwrap();
+    for (i, px) in dec.pixels.chunks_exact(3).enumerate() {
+        let g = g_plane[i];
+        assert_eq!(
+            px,
+            [0x10u8.wrapping_add(g), g, 0x20u8.wrapping_add(g)],
+            "pixel {i}"
+        );
+    }
+
+    // YV12 type 10 (8x8): every plane `0xff v` -> solid Y/V/U.
+    let (w, h) = (8u32, 8u32);
+    let mut frame = vec![0x0au8];
+    frame.extend_from_slice(&11u32.to_le_bytes());
+    frame.extend_from_slice(&13u32.to_le_bytes());
+    frame.extend_from_slice(&[0xff, 0x5a, 0xff, 0x9d, 0xff, 0x6c]);
+    let dec = decode_frame(&frame, w, h, PixelKind::Yv12).unwrap();
+    assert!(dec.pixels[..64].iter().all(|&b| b == 0x5a));
+    assert!(dec.pixels[64..80].iter().all(|&b| b == 0x9d));
+    assert!(dec.pixels[80..].iter().all(|&b| b == 0x6c));
+
+    // YUY2 type 3 (8x8): the luma `0xff v` form relies on the
+    // coordinator's `Y[1] = Y[0]` patch (`spec/06` §3.8) because this
+    // family stores the second row-0 luma sample raw.
+    let mut frame = vec![0x03u8];
+    frame.extend_from_slice(&11u32.to_le_bytes());
+    frame.extend_from_slice(&13u32.to_le_bytes());
+    frame.extend_from_slice(&[0xff, 0x5a, 0xff, 0x6c, 0xff, 0x9d]);
+    let dec = decode_frame(&frame, w, h, PixelKind::Yuy2).unwrap();
+    for mp in dec.pixels.chunks_exact(4) {
+        assert_eq!(mp, [0x5a, 0x6c, 0x5a, 0x9d]);
     }
 }
 

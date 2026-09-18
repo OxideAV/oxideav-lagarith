@@ -131,11 +131,9 @@ fn decodes_to_expected(s: &Stream) -> Result<bool, String> {
 /// The conformance test asserts these still miss, so a fix must remove
 /// its rows here in the same commit.
 const KNOWN_GAPS: &[(&str, &str)] = &[
-    ("rgb24-16x16-nearflat", "header-0xff solid-plane form decoded as a memset fill (spec/03 §2.1 corrected blockquote)"),
-    ("rgb24-16x16-ramp", "header-0xff solid-plane form decoded as a memset fill (spec/03 §2.1 corrected blockquote)"),
     ("rgb24-1x2-edges", "host DIB-stride re-layout of 24-bpp rows (spec/06 §3.2 step 1 validated note); the vendor round trip passes only because the pad byte equals the input"),
     ("rgb24-1x2-flat", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("rgb24-1x2-grey", "header-0xff solid-plane form decoded as a memset fill (spec/03 §2.1 corrected blockquote)"),
+    ("rgb24-1x2-grey", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
     ("rgb24-1x2-nearflat", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
     ("rgb24-1x2-noise", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
     ("rgb24-1x2-ramp", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
@@ -157,17 +155,13 @@ const KNOWN_GAPS: &[(&str, &str)] = &[
     ("rgb24-3x3-nearflat", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
     ("rgb24-3x3-noise", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
     ("rgb24-3x3-ramp", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("rgb24-4x4-nearflat", "header-0xff solid-plane form decoded as a memset fill (spec/03 §2.1 corrected blockquote)"),
-    ("rgb24-4x4-ramp", "header-0xff solid-plane form decoded as a memset fill (spec/03 §2.1 corrected blockquote)"),
     ("rgb24-5x7-edges", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
     ("rgb24-5x7-flat", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
+    ("rgb24-5x7-grey", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
     ("rgb24-5x7-gradient", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("rgb24-5x7-grey", "header-0xff solid-plane form decoded as a memset fill (spec/03 §2.1 corrected blockquote)"),
     ("rgb24-5x7-nearflat", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
     ("rgb24-5x7-noise", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
     ("rgb24-5x7-ramp", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("rgb32-16x16-nearflat", "header-0xff solid-plane form decoded as a memset fill (spec/03 §2.1 corrected blockquote)"),
-    ("rgb32-16x16-ramp", "header-0xff solid-plane form decoded as a memset fill (spec/03 §2.1 corrected blockquote)"),
     ("rgb32-1x1-edges", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
     ("rgb32-1x1-flat", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
     ("rgb32-1x1-grey", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
@@ -176,35 +170,17 @@ const KNOWN_GAPS: &[(&str, &str)] = &[
     ("rgb32-1x1-ramp", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
     ("rgb32-2x1-edges", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
     ("rgb32-2x1-flat", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("rgb32-2x1-grey", "header-0xff solid-plane form decoded as a memset fill (spec/03 §2.1 corrected blockquote)"),
+    ("rgb32-2x1-grey", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
     ("rgb32-2x1-nearflat", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
     ("rgb32-2x1-noise", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
     ("rgb32-2x1-ramp", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("rgb32-4x4-nearflat", "header-0xff solid-plane form decoded as a memset fill (spec/03 §2.1 corrected blockquote)"),
-    ("rgb32-4x4-ramp", "header-0xff solid-plane form decoded as a memset fill (spec/03 §2.1 corrected blockquote)"),
-    ("rgb32-5x7-nearflat", "header-0xff solid-plane form decoded as a memset fill (spec/03 §2.1 corrected blockquote)"),
-    ("rgb32-5x7-ramp", "header-0xff solid-plane form decoded as a memset fill (spec/03 §2.1 corrected blockquote)"),
-    ("yuy2-16x16-flat", "header-0xff solid-plane form decoded as a memset fill (spec/03 §2.1 corrected blockquote)"),
-    ("yuy2-16x16-nearflat", "header-0xff solid-plane form decoded as a memset fill (spec/03 §2.1 corrected blockquote)"),
-    ("yuy2-32x24-flat", "header-0xff solid-plane form decoded as a memset fill (spec/03 §2.1 corrected blockquote)"),
-    ("yuy2-32x24-nearflat", "header-0xff solid-plane form decoded as a memset fill (spec/03 §2.1 corrected blockquote)"),
-    ("yuy2-64x48-flat", "header-0xff solid-plane form decoded as a memset fill (spec/03 §2.1 corrected blockquote)"),
-    ("yuy2-8x8-flat", "header-0xff solid-plane form decoded as a memset fill (spec/03 §2.1 corrected blockquote)"),
-    ("yuy2-8x8-nearflat", "header-0xff solid-plane form decoded as a memset fill (spec/03 §2.1 corrected blockquote)"),
-    ("yv12-16x16-flat", "header-0xff solid-plane form decoded as a memset fill (spec/03 §2.1 corrected blockquote)"),
-    ("yv12-16x16-nearflat", "header-0xff solid-plane form decoded as a memset fill (spec/03 §2.1 corrected blockquote)"),
-    ("yv12-32x24-flat", "header-0xff solid-plane form decoded as a memset fill (spec/03 §2.1 corrected blockquote)"),
-    ("yv12-32x24-nearflat", "header-0xff solid-plane form decoded as a memset fill (spec/03 §2.1 corrected blockquote)"),
     ("yv12-4x2-noise", "vendor-lossy geometry (host DIB-stride / degenerate-size quirks, spec/06 §3.2 / §3.7 / §3.8)"),
-    ("yv12-64x48-flat", "header-0xff solid-plane form decoded as a memset fill (spec/03 §2.1 corrected blockquote)"),
-    ("yv12-8x8-flat", "header-0xff solid-plane form decoded as a memset fill (spec/03 §2.1 corrected blockquote)"),
-    ("yv12-8x8-nearflat", "header-0xff solid-plane form decoded as a memset fill (spec/03 §2.1 corrected blockquote)"),
 ];
 
 /// Scorecard floors: (vendor-byte-exact streams incl. the null
 /// sequence, vendor-lossy streams reproducing the vendor decoder).
 /// Raised in the same commit as each decoder fix.
-const EXPECTED_SCORECARD: (usize, usize) = (163, 9);
+const EXPECTED_SCORECARD: (usize, usize) = (187, 9);
 
 #[test]
 fn vendor_corpus_decodes_byte_exactly() {
