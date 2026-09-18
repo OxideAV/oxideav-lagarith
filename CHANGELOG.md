@@ -6,6 +6,120 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.2](https://github.com/OxideAV/oxideav-lagarith/compare/v0.0.1...v0.0.2) - 2026-09-18
+
+### Other
+
+- round-459 README/CHANGELOG — vendor-corpus scorecard (187/188 byte-exact, 42/52 vendor-lossy, encoder 45/179 identical), errata pins, vendor-layout entry point
+- drive decode_frame_vendor_layout + stateful Decoder in the decode target, seed 220 vendor streams — 9.2M execs / 541 s clean
+- header-0xff for every solid residual plane (YUY2 luma shape included) + opaque 32-bpp input encoded as RGB32 — vendor-identical streams 23/179 → 45/179
+- decode_frame_vendor_layout reproduces the vendor host-buffer quirks — vendor-lossy parity 9/52 → 42/52, vendor layout 188/188 on the byte-exact class
+- pow2 normaliser re-derived from the corrected spec/04 §5 / spec/02 §5 and pinned on the vendor corpus — 189/189 non-pow2 channels need it (187/188 unchanged)
+- inline RLE decodes lazily until the plane is full — the u32 field is a dispatch hint; all 52 vendor 0x01/0x03 channels consume exactly their u32 (187/188 unchanged)
+- pin the SIMD first-column Rule B on the vendor corpus — 12 RGB-family + 3 YV12 streams discriminate the rules (187/188 unchanged)
+- header-0xff solid plane is a residual plane {v,0,0,…}, not a fill — vendor corpus 163/188 → 187/188
+- vendor-corpus conformance harness — 240 vendor-encoded streams pinned by digest (baseline 163/188 exact, 9/52 lossy)
+- reference_pins doc — the cross-parity re-capture item is closed
+- capture + docs: even-width YUY2 joins the oracle-EXACT class (19/26)
+- complete YUY2 recovery — raw Y1 seed, plain-L row-1 chunk, wrapping median
+- round-451 status — third-party decodability landed, remaining gaps scoped
+- NULL ("JUMP") emission for repeat frames + packet PTS passthrough
+- freeze the oracle-validated capture as CI byte pins
+- blackbox capture harness: LAGS-AVI mux + third-party oracle sweep of every emittable frame type
+- wire semantics: absorbing top-symbol interval, Yuv first-column rule, cross-validated election
+- encode bench — flat and random content-class cases
+- harden both public entry points against absurd dimensions
+- README — round-432 encoder election, RLE capacity, gating numbers
+- clippy needless_range_loop fix in the scorer pin test
+- fuzz the round-432 encoder paths + freeze scorer decisions
+- cost-model gate skips unwinnable arithmetic passes (-68% random)
+- prune arith+RLE candidates through the cost model (-11% zero-heavy)
+- transmitted-model downscale election (cost-modeled, never-larger)
+- selector hot path — shared RLE contractions + lazy candidates (-22%)
+- full-capacity RLE escapes via the spec/05 §5.3 algebraic inverse
+- single-source embedded fixtures + CI conformance guard
+- re-capture bench/profiling fixtures under the normalized model
+- prose sweep — retire the raw-total quotient narrative
+- end-to-end wire regressions for the normalized model
+- wire the recovered 0x180001050 model normalizer into the modern range coder
+- bundle + machine-check the range-coder reciprocal-multiply LUT
+- add CI / crates.io / docs.rs / MIT-license badges
+- encode-side profiling driver (examples/profile_encode.rs)
+- encoder size-guard property suite (never larger than raw)
+- rustfmt benches/encode.rs closure (CI fmt fix)
+- encode hot-path Criterion benchmark (benches/encode.rs)
+- framework Decoder now replays NULL (JUMP) frames
+- expose direct make_decoder / make_encoder factory endpoints
+- wire framework Encoder trait + make_encoder factory
+- promote encoder to public API (encode_frame + encode_null)
+- YV12 odd-dim decode-direction wire-contract pin (floor chroma byte counts)
+- lagarith README: note odd-dimension fuzz + CI panic-freedom coverage
+- fuzz + CI panic-freedom coverage for odd-dimension YV12/YUY2 decode
+- decode-determinism property suite (purity + no-drift)
+- neutral-validator-name provenance scrub + untrack fuzz/Cargo.lock
+- rename ffmpeg_pins.rs -> reference_pins.rs (neutral filename; black-box validator invocation unchanged)
+- YV12 odd-dimension SPECGAP encode closure + README
+- extend YUY2 odd-width closure to property + size-guard suites
+- encode_arith_yuy2 odd-width (floor-chroma) closure + roundtrip matrix
+- README + CHANGELOG — round 341 encoder-completeness milestone
+- in-crate encoder fuzz harness — 1900 randomized encode→decode roundtrips
+- exhaustive encoder→decoder self-roundtrip matrix + full sub-form encodability proof
+- round 338 — correct stale modern-path normalisation prose (spec/04 §6/§8, spec/02 §5)
+- round 338 milestone lock — all colour modes decode sample-exact at non-pow2 totals
+- round 335: standalone profiling driver examples/profile_decode.rs
+- pin header-0x01..0x03 u32 length-field dispatch boundary (spec/06 §1.4 / §6.2)
+- guard modern range coder against q==0 divide-by-zero on malformed probability total
+- refresh to current status, drop per-round changelog cruft
+- round 310: typed FrameType::wire_plane_roles() accessor + WirePlaneRole enum
+- round 308 — typed FrameType::wire_plane_pixel_counts accessor (spec/03 §6.1/§6.2)
+- round 301: Criterion decode benchmark harness + README predictor-rule prose fix
+- spec-anchor YV12/YUY2/reduced-res first-column predictor to Rule A (spec/06 §3.8)
+- add decode_lagarith libFuzzer target; fix u32 probability-table overflow panic
+- round 276 — frame-level solid-colour fast path (spec/01 §3.1)
+- round 262: typed FrameType solid-frame wire-size accessors
+- round 261 — typed FrameType::has_alpha_plane wire-form accessor
+- round 257 — typed LegacyChannelHeader::prefix_size accessor
+- round 253 — typed FrameType x PixelKind compatibility relation accessor
+- round 250 — typed ChannelHeader structural accessors (freq_table_offset + prefix_size)
+- drop release-plz.toml — use release-plz defaults across the workspace
+- round 245 — typed PixelKind classification accessors on the host-side pixel-format selector
+- round 242 — typed FrameType classification accessors on the outermost wire byte
+- round 239 — typed LegacyChannelHeader accessor on the legacy (type-7) per-plane channel-header byte
+- round 236 — typed ChannelHeader accessor on the modern per-plane channel-header byte
+- round 229 — type-7 (legacy adaptive-CDF RGB) frame-level type-1 size guard
+- round 222 — frame-level type-1 (uncompressed) size guard
+- round 216 — packed-RGB(A) pack-loop branch hoist
+- round 211 — lazy alpha-plane decode + early pixel-kind validation on the modern RGB(A) and legacy-RGB paths
+- round 204 — randomised encoder→decoder self-roundtrip property suite
+- round 198 — deeper channel-body fuzz: bit-XOR + multi-byte burst + shift sweeps
+- release v0.0.1 ([#3](https://github.com/OxideAV/oxideav-lagarith/pull/3))
+- round 192 — truncation + single-byte-flip fuzz harness on valid encoded frames
+- round 187 — reduced-resolution (type 11) host-dimension guard
+- round 181 — defensive harness for malformed-input no-panic invariants
+- round 174 — per-frame-type header-form selector flip
+- round 15 — legacy-fork per-channel header-form selection
+- round 14 — per-channel header-form selection across all 8 wire forms
+- round 13 — modern probability-model write path: q>=1 frequency rescale
+- round 12 — encoder spec/02 §6.3 final-flush FF-chain bulk-fill
+- round 127 — extend ffmpeg pin set to 7 pow2 sizes + pattern-sensitivity characterisation
+- round 124 — modern RGB(A) predictor Rule B + ffmpeg pins
+- update is_rare_symbol_cluster doc for Strategy F
+- round 96 — pair-packed 513-entry CDF decode (Strategy F)
+- round 11 — encoder-side spec/02 §5 Step-C freqs[] cache
+- round 10 — encoder-side spec/02 §5 Step-B fast path + cache Option→bool refactor
+- round 9 — encoder-side spec/02 §5 Step-A fast path + FF-chain bulk flush
+- round 8 — spec/02 §5 three-way fast path + 2-byte refill window
+- round-7 test count + decoder-side defensive harness mention
+- Round 7: type-7 decoder defensive harness (audit/12 §7.1)
+- Round 6: Strategy E encoder integration (audit/12 §7.1)
+- Round 5: type 7 Rule B predictor + RLE-then-Fibonacci channel sub-path
+- Round 4: type 7 (legacy RGB / spec/07 adaptive-CDF range coder)
+- Round 3: YUY2 (type 3), reduced-resolution (type 11), SIMD parity
+- Round 2: YV12 (frame type 10) + stateful NULL-frame replay
+- bundle RLE LUT CSVs into crate to fix CI build
+- Round 1: clean-room rebuild — modern arithmetic-coded RGB family decoder
+- Round 0 — clean-room rebuild scaffold (orphan master)
+
 ### Added
 
 - round 459 — **fuzz: vendor-layout + stateful paths, vendor seeds**
