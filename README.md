@@ -145,6 +145,8 @@ Stateless decode of a single frame:
 
 ```rust
 use oxideav_lagarith::{decode_frame, PixelKind};
+# let (width, height): (u32, u32) = (16, 16);
+# let payload: Vec<u8> = Vec::new(); // one LAGS frame payload
 
 let decoded = decode_frame(&payload, width, height, PixelKind::Bgra32)?;
 assert_eq!(decoded.pixels.len(), (width as usize) * (height as usize) * 4);
@@ -155,6 +157,8 @@ YV12 produces concatenated Y / V / U planes:
 
 ```rust
 use oxideav_lagarith::{decode_frame, PixelKind};
+# let (width, height): (u32, u32) = (16, 16);
+# let payload: Vec<u8> = Vec::new();
 
 let yv12 = decode_frame(&payload, width, height, PixelKind::Yv12)?;
 assert_eq!(yv12.pixels.len(), PixelKind::Yv12.buffer_len(width, height));
@@ -178,6 +182,8 @@ predecessor (`spec/01` §1.1):
 
 ```rust
 use oxideav_lagarith::{Decoder, PixelKind};
+# let (width, height): (u32, u32) = (16, 16);
+# let payload_a: Vec<u8> = Vec::new();
 
 let mut dec = Decoder::new();
 let frame_a = dec.decode(&payload_a, width, height, PixelKind::Bgra32)?;
@@ -207,6 +213,8 @@ Stateless encode of a single frame, the symmetric counterpart of
 
 ```rust
 use oxideav_lagarith::{encode_frame, decode_frame, PixelKind};
+# let (width, height): (u32, u32) = (16, 16);
+let pixels = vec![0u8; (width * height * 4) as usize]; // BGRA
 
 let frame = encode_frame(&pixels, width, height, PixelKind::Bgra32)?;
 // Round-trips byte-exactly back through the decoder.
