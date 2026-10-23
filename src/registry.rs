@@ -13,7 +13,7 @@ use oxideav_core::{
     TimeBase, VideoFrame, VideoPlane,
 };
 
-use crate::decoder::{decode_frame_with_prev, DecodedFrame, PixelKind};
+use crate::decoder::{DecodedFrame, PixelKind, decode_frame_with_prev};
 use crate::encoder::encode_frame;
 
 /// Canonical codec id. `oxideav-meta::register_all` calls
@@ -770,7 +770,7 @@ mod tests {
                 // 4 wide × 2 high × 4 bpp BGRA = 32 bytes
                 assert_eq!(v.planes.len(), 1);
                 assert_eq!(v.planes[0].data.len(), 32);
-                for chunk in v.planes[0].data.chunks_exact(4) {
+                for chunk in v.planes[0].data.as_chunks::<4>().0 {
                     assert_eq!(chunk, &[0x77, 0x77, 0x77, 0xff]);
                 }
             }

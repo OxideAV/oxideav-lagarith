@@ -130,7 +130,7 @@ pub fn expand_raw(src: &[u8], escape_len: usize, n_pixels: usize) -> Result<(Vec
 #[inline]
 fn supplement_for_padding(n: usize) -> u8 {
     debug_assert!(n <= 255, "escape padding {n} out of range");
-    if n % 2 == 0 {
+    if n.is_multiple_of(2) {
         (n / 2) as u8
     } else {
         (255 - (n - 1) / 2) as u8
@@ -217,7 +217,7 @@ mod tests {
     #[test]
     fn rle_roundtrip_long_run() {
         let mut plane = vec![1u8, 2];
-        plane.extend(std::iter::repeat(0u8).take(500));
+        plane.extend(std::iter::repeat_n(0u8, 500));
         plane.extend_from_slice(&[3, 4]);
         for e in 1..=3 {
             roundtrip_one(&plane, e);
@@ -229,7 +229,7 @@ mod tests {
         // exactly escape_len zeros adjacent to non-zero.
         for e in 1..=3 {
             let mut plane = vec![5u8];
-            plane.extend(std::iter::repeat(0u8).take(e));
+            plane.extend(std::iter::repeat_n(0u8, e));
             plane.extend_from_slice(&[7, 8]);
             roundtrip_one(&plane, e);
         }
@@ -238,7 +238,7 @@ mod tests {
     #[test]
     fn rle_roundtrip_terminal_run() {
         let mut plane = vec![1u8, 2, 3];
-        plane.extend(std::iter::repeat(0u8).take(100));
+        plane.extend(std::iter::repeat_n(0u8, 100));
         for e in 1..=3 {
             roundtrip_one(&plane, e);
         }
@@ -317,8 +317,8 @@ mod tests {
         let plane = vec![0u8; 4096];
         let encoded = contract_raw(&plane, 1);
         assert_eq!(encoded.len(), 32, "expected 16 x [0x00, 0x80] escapes");
-        for pair in encoded.chunks_exact(2) {
-            assert_eq!(pair, [0x00, 0x80]);
+        for pair in encoded.as_chunks::<2>().0 {
+            assert_eq!(*pair, [0x00, 0x80]);
         }
         let (got, _) = expand_raw(&encoded, 1, plane.len()).unwrap();
         assert_eq!(got, plane);

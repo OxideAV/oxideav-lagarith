@@ -15,8 +15,8 @@
 use crate::error::{Error, Result};
 use crate::fibonacci;
 use crate::legacy_range_coder::{
-    build_legacy_cdf, build_legacy_pair_packed_cdf, decode_legacy_freq_table,
-    is_rare_symbol_cluster, LegacyRangeDecoder,
+    LegacyRangeDecoder, build_legacy_cdf, build_legacy_pair_packed_cdf, decode_legacy_freq_table,
+    is_rare_symbol_cluster,
 };
 use crate::range_coder::{Cdf, RangeDecoder};
 use crate::rle;
@@ -598,8 +598,8 @@ fn decode_legacy_rle_then_fib(
     let (fib_buffer, rle_in_consumed) = rle::expand_raw(rle_in, escape_len, post_rle_len)?;
     let (freq, fib_bytes, fib_aligned) = decode_legacy_freq_table(&fib_buffer)?;
     let _ = fib_bytes; // freq table fits within the post-RLE buffer
-                       // by construction; the Fib helper consumes
-                       // `fib_bytes` of it which is <= post_rle_len.
+    // by construction; the Fib helper consumes
+    // `fib_bytes` of it which is <= post_rle_len.
     let body_offset = 5 + rle_in_consumed + if fib_aligned { 1 } else { 0 };
     legacy_decode_body(channel, body_offset, &freq, n_pixels)
 }

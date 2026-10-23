@@ -23,9 +23,9 @@
 //! Run with:
 //!     cargo bench -p oxideav-lagarith --bench encode
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 
-use oxideav_lagarith::{decode_frame, encode_frame, PixelKind};
+use oxideav_lagarith::{PixelKind, decode_frame, encode_frame};
 
 const W: u32 = 64;
 const H: u32 = 64;

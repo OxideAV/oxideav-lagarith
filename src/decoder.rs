@@ -36,10 +36,10 @@
 
 use crate::channel::{decode_channel, decode_legacy_channel};
 use crate::error::{Error, Result};
-use crate::frame::{split_channels, FrameType};
+use crate::frame::{FrameType, split_channels};
 use crate::predict::{
-    apply_plane_inverse_with_rule, apply_plane_inverse_yuv_seeded, apply_plane_inverse_yuy2,
-    cross_plane_decorrelate_rgb, FirstColRule,
+    FirstColRule, apply_plane_inverse_with_rule, apply_plane_inverse_yuv_seeded,
+    apply_plane_inverse_yuy2, cross_plane_decorrelate_rgb,
 };
 
 /// What pixel format the caller wants the decoder to produce.
@@ -275,7 +275,7 @@ fn decode_frame_inner(
         FrameType::ArithmeticYuy2 => decode_arith_yuy2(payload, width, height, pixel_kind),
         FrameType::ReducedResYv12 => decode_reduced_res(payload, width, height, pixel_kind),
     }?;
-    if vendor && pixel_kind == PixelKind::Bgr24 && width % 4 != 0 {
+    if vendor && pixel_kind == PixelKind::Bgr24 && !width.is_multiple_of(4) {
         relayout_rows_on_dib_stride(&mut frame.pixels, width as usize, height as usize);
     }
     Ok(frame)
@@ -458,7 +458,7 @@ fn decode_solid(
     match pixel_kind {
         PixelKind::Bgr24 => {
             pixels = vec![0u8; n * 3];
-            for px in pixels.chunks_exact_mut(3) {
+            for px in pixels.as_chunks_mut::<3>().0 {
                 px[0] = b;
                 px[1] = g;
                 px[2] = r;
@@ -466,7 +466,7 @@ fn decode_solid(
         }
         PixelKind::Bgra32 => {
             pixels = vec![0u8; n * 4];
-            for px in pixels.chunks_exact_mut(4) {
+            for px in pixels.as_chunks_mut::<4>().0 {
                 px[0] = b;
                 px[1] = g;
                 px[2] = r;
@@ -622,17 +622,17 @@ fn decode_arith_rgba(
     let mut plane_b = decode_channel(slices[0], n_pixels)?; // wire R -> output +0 = B
     let mut plane_g = decode_channel(slices[1], n_pixels)?;
     let mut plane_r = decode_channel(slices[2], n_pixels)?; // wire B -> output +2 = R
-                                                            // **Lazy alpha decode** (round 211). The alpha plane has no
-                                                            // cross-plane decorrelation interaction (`spec/03` §4.3 — alpha
-                                                            // is stored raw) and is only read at the final pack step for
-                                                            // `PixelKind::Bgra32`. When the host asked for `Bgr24` the alpha
-                                                            // bytes are discarded, so we skip the entire fourth-channel
-                                                            // dispatch (Fibonacci probability prefix + modern range coder +
-                                                            // optional RLE expansion + predictor inverse) for that case.
-                                                            // Spec-grounded: spec/03 §4.3's "alpha plane is unchanged" plus
-                                                            // spec/04 §5 item 5's "channels are compressed independently"
-                                                            // guarantee independence — discarding the alpha slice carries no
-                                                            // side-effect on the other three planes.
+    // **Lazy alpha decode** (round 211). The alpha plane has no
+    // cross-plane decorrelation interaction (`spec/03` §4.3 — alpha
+    // is stored raw) and is only read at the final pack step for
+    // `PixelKind::Bgra32`. When the host asked for `Bgr24` the alpha
+    // bytes are discarded, so we skip the entire fourth-channel
+    // dispatch (Fibonacci probability prefix + modern range coder +
+    // optional RLE expansion + predictor inverse) for that case.
+    // Spec-grounded: spec/03 §4.3's "alpha plane is unchanged" plus
+    // spec/04 §5 item 5's "channels are compressed independently"
+    // guarantee independence — discarding the alpha slice carries no
+    // side-effect on the other three planes.
     let plane_a_opt = if matches!(pixel_kind, PixelKind::Bgra32) {
         let mut plane_a = decode_channel(slices[3], n_pixels)?;
         apply_plane_inverse_with_rule(
@@ -969,7 +969,7 @@ fn decode_reduced_res(
     // silently zero the chroma planes and in debug would
     // `debug_assert!` panic — neither is a reasonable response to
     // malformed input).
-    if width % 4 != 0 || height % 4 != 0 {
+    if !width.is_multiple_of(4) || !height.is_multiple_of(4) {
         return Err(Error::BadDimensions { width, height });
     }
     let half_w = width / 2;

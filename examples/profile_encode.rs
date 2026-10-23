@@ -42,7 +42,7 @@
 
 use std::hint::black_box;
 
-use oxideav_lagarith::{decode_frame, encode_frame, PixelKind};
+use oxideav_lagarith::{PixelKind, decode_frame, encode_frame};
 
 /// 64x64 host surface — matches the bench / decode-profiler workload
 /// size so the three harnesses profile the same shape.

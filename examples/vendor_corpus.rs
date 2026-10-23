@@ -19,7 +19,7 @@ use std::fs;
 use std::path::Path;
 
 use oxideav_lagarith::{
-    decode_frame, decode_frame_vendor_layout, encode_frame, Decoder, FrameType, PixelKind,
+    Decoder, FrameType, PixelKind, decode_frame, decode_frame_vendor_layout, encode_frame,
 };
 
 #[path = "../tests/common/sha256.rs"]
@@ -102,7 +102,7 @@ fn main() {
         .filter_map(|e| e.ok())
         .filter(|e| e.path().is_dir())
         .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| filter.as_ref().map_or(true, |f| n.contains(f.as_str())))
+        .filter(|n| filter.as_ref().is_none_or(|f| n.contains(f.as_str())))
         .collect();
     names.sort();
 

@@ -54,7 +54,7 @@
 
 use std::hint::black_box;
 
-use oxideav_lagarith::{decode_frame, PixelKind};
+use oxideav_lagarith::{PixelKind, decode_frame};
 
 /// 64x64 host surface — the decoded frame dimensions for the
 /// embedded fixture below. Matches the bench's `W`/`H` so the two

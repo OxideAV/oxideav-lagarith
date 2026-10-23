@@ -48,7 +48,7 @@
 //!   so the crate's spec/03 §6.2 floor-chroma odd-width form is
 //!   validated by self-roundtrip only.
 
-use oxideav_lagarith::{decode_frame, encode_frame, encode_null, wire_forms, PixelKind};
+use oxideav_lagarith::{PixelKind, decode_frame, encode_frame, encode_null, wire_forms};
 use std::io::Write as _;
 use std::process::Command;
 

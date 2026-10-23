@@ -12,7 +12,7 @@
 //! wire-semantics change that invalidates a capture fails CI instead
 //! of the next profiling session.
 
-use oxideav_lagarith::{decode_frame, PixelKind};
+use oxideav_lagarith::{PixelKind, decode_frame};
 
 #[allow(dead_code)]
 mod fixtures {

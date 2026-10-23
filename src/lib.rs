@@ -111,8 +111,8 @@ pub mod wire_forms {
     };
 }
 pub use crate::decoder::{
-    decode_frame, decode_frame_vendor_layout, decode_frame_with_prev, DecodedFrame, Decoder,
-    PixelKind,
+    DecodedFrame, Decoder, PixelKind, decode_frame, decode_frame_vendor_layout,
+    decode_frame_with_prev,
 };
 pub use crate::encoder::{encode_frame, encode_null};
 pub use crate::error::{Error, Result};
@@ -122,7 +122,7 @@ pub use crate::frame::{FrameType, WirePlaneRole};
 // `make_decoder` / `make_encoder` are the dual-API convention's direct
 // factory endpoints, exposed alongside the `register!` registry path.
 #[cfg(feature = "registry")]
-pub use crate::registry::{make_decoder, make_encoder, register, register_codecs, CODEC_ID_STR};
+pub use crate::registry::{CODEC_ID_STR, make_decoder, make_encoder, register, register_codecs};
 
 #[cfg(feature = "registry")]
 oxideav_core::register!("oxideav-lagarith", register);

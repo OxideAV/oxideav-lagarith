@@ -965,11 +965,7 @@ mod tests {
             let msym_per_s = total_syms / elapsed.as_secs_f64() / 1.0e6;
             eprintln!(
                 "BENCH/range-coder signal-heavy: {:.2} MSym/s ({} syms x {} reps in {:.3?}; sink={})",
-                msym_per_s,
-                n,
-                REPS,
-                elapsed,
-                sink
+                msym_per_s, n, REPS, elapsed, sink
             );
         }
     }
@@ -1160,11 +1156,7 @@ mod tests {
             let msym_per_s = total_syms / elapsed.as_secs_f64() / 1.0e6;
             eprintln!(
                 "BENCH/range-coder ENCODE signal-heavy: {:.2} MSym/s ({} syms x {} reps in {:.3?}; sink={})",
-                msym_per_s,
-                n,
-                REPS,
-                elapsed,
-                sink
+                msym_per_s, n, REPS, elapsed, sink
             );
         }
     }
@@ -1329,11 +1321,7 @@ mod tests {
             let msym_per_s = total_syms / elapsed.as_secs_f64() / 1.0e6;
             eprintln!(
                 "BENCH/range-coder ENCODE step-b-heavy: {:.2} MSym/s ({} syms x {} reps in {:.3?}; sink={})",
-                msym_per_s,
-                n,
-                REPS,
-                elapsed,
-                sink
+                msym_per_s, n, REPS, elapsed, sink
             );
         }
     }
@@ -1498,11 +1486,7 @@ mod tests {
             let msym_per_s = total_syms / elapsed.as_secs_f64() / 1.0e6;
             eprintln!(
                 "BENCH/range-coder ENCODE step-c-heavy: {:.2} MSym/s ({} syms x {} reps in {:.3?}; sink={})",
-                msym_per_s,
-                n,
-                REPS,
-                elapsed,
-                sink
+                msym_per_s, n, REPS, elapsed, sink
             );
         }
     }
@@ -2007,21 +1991,11 @@ mod tests {
 
             eprintln!(
                 "BENCH/range-coder ENCODE finish-heavy [RESIZE]: {:.2} MSym/s ({} chans x {} syms x {} reps in {:.3?}; sink={})",
-                msym_per_s_fast,
-                N_CHANNELS,
-                SYMBOLS_PER_CHANNEL,
-                REPS,
-                elapsed_fast,
-                sink_fast
+                msym_per_s_fast, N_CHANNELS, SYMBOLS_PER_CHANNEL, REPS, elapsed_fast, sink_fast
             );
             eprintln!(
                 "BENCH/range-coder ENCODE finish-heavy [PUSH ]: {:.2} MSym/s ({} chans x {} syms x {} reps in {:.3?}; sink={})",
-                msym_per_s_ref,
-                N_CHANNELS,
-                SYMBOLS_PER_CHANNEL,
-                REPS,
-                elapsed_ref,
-                sink_ref
+                msym_per_s_ref, N_CHANNELS, SYMBOLS_PER_CHANNEL, REPS, elapsed_ref, sink_ref
             );
             eprintln!(
                 "BENCH/range-coder ENCODE finish-heavy [SPEEDUP RESIZE/PUSH]: {:.3}x",

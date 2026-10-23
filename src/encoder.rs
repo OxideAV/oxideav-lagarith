@@ -20,11 +20,11 @@ use crate::error::{Error, Result};
 use crate::fibonacci::encode_freq_table;
 use crate::frame::pack_channels;
 use crate::legacy_range_coder::{
-    build_legacy_cdf, encode_legacy_freq_table, is_rare_symbol_cluster, LegacyRangeEncoder,
+    LegacyRangeEncoder, build_legacy_cdf, encode_legacy_freq_table, is_rare_symbol_cluster,
 };
 use crate::predict::{
-    apply_plane_forward_with_rule, apply_plane_forward_yuy2, cross_plane_decorrelate_rgb_forward,
-    FirstColRule,
+    FirstColRule, apply_plane_forward_with_rule, apply_plane_forward_yuy2,
+    cross_plane_decorrelate_rgb_forward,
 };
 use crate::range_coder::{Cdf, RangeEncoder, TOP};
 use crate::rle::contract_raw;
@@ -687,16 +687,15 @@ pub fn encode_channel_best(plane: &[u8]) -> Vec<u8> {
     // Same gate as the 0x00 form: encode the picked arith+RLE
     // candidate only when the estimate says it can still beat the
     // best actual-or-known length.
-    if let Some(escape_len) = rle_pick {
-        if rle_pick_est <= best.len().min(known_raw_min) as f64 + EST_GATE_MARGIN {
-            let symbols = &contractions[escape_len - 1];
-            if let Some(candidate) =
-                build_header_arith_rle_from_symbols(plane.len(), symbols, escape_len)
-            {
-                if candidate.len() < best.len() {
-                    best = candidate;
-                }
-            }
+    if let Some(escape_len) = rle_pick
+        && rle_pick_est <= best.len().min(known_raw_min) as f64 + EST_GATE_MARGIN
+    {
+        let symbols = &contractions[escape_len - 1];
+        if let Some(candidate) =
+            build_header_arith_rle_from_symbols(plane.len(), symbols, escape_len)
+            && candidate.len() < best.len()
+        {
+            best = candidate;
         }
     }
 
@@ -761,16 +760,16 @@ pub fn encode_channel_best(plane: &[u8]) -> Vec<u8> {
             // another full pass.
             let wrap = if header == 0x00 { 1 } else { 5 };
             let table = downscaled_table(&counts, d);
-            if let Some(alt) = encode_prefix_and_body(symbols, &table) {
-                if wrap + alt.len() < best.len() {
-                    let mut v = Vec::with_capacity(wrap + alt.len());
-                    v.push(header);
-                    if header != 0x00 {
-                        v.extend_from_slice(&(symbols.len() as u32).to_le_bytes());
-                    }
-                    v.extend_from_slice(&alt);
-                    best = v;
+            if let Some(alt) = encode_prefix_and_body(symbols, &table)
+                && wrap + alt.len() < best.len()
+            {
+                let mut v = Vec::with_capacity(wrap + alt.len());
+                v.push(header);
+                if header != 0x00 {
+                    v.extend_from_slice(&(symbols.len() as u32).to_le_bytes());
                 }
+                v.extend_from_slice(&alt);
+                best = v;
             }
         }
     }
@@ -844,7 +843,7 @@ pub fn encode_arith_rgb24(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
     let mut plane_b = Vec::with_capacity(n); // wire R
     let mut plane_g = Vec::with_capacity(n);
     let mut plane_r = Vec::with_capacity(n); // wire B
-    for px in pixels.chunks_exact(3) {
+    for px in pixels.as_chunks::<3>().0 {
         plane_b.push(px[0]);
         plane_g.push(px[1]);
         plane_r.push(px[2]);
@@ -873,7 +872,7 @@ pub fn encode_arith_rgb24(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
     let ch_r = encode_channel_best(&res_r);
 
     // Choose type 4 (width % 4 == 0) or type 2 (otherwise).
-    let type_byte = if width % 4 == 0 { 4 } else { 2 };
+    let type_byte = if width.is_multiple_of(4) { 4 } else { 2 };
     pack_channels(type_byte, &[&ch_b, &ch_g, &ch_r])
 }
 
@@ -1366,7 +1365,7 @@ pub fn encode_legacy_rgb_best(pixels: &[u8], width: u32, height: u32) -> Vec<u8>
     let mut plane_b = Vec::with_capacity(n);
     let mut plane_g = Vec::with_capacity(n);
     let mut plane_r = Vec::with_capacity(n);
-    for px in pixels.chunks_exact(3) {
+    for px in pixels.as_chunks::<3>().0 {
         plane_b.push(px[0]);
         plane_g.push(px[1]);
         plane_r.push(px[2]);
@@ -1450,7 +1449,7 @@ pub fn encode_legacy_rgb(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
     let mut plane_b = Vec::with_capacity(n);
     let mut plane_g = Vec::with_capacity(n);
     let mut plane_r = Vec::with_capacity(n);
-    for px in pixels.chunks_exact(3) {
+    for px in pixels.as_chunks::<3>().0 {
         plane_b.push(px[0]);
         plane_g.push(px[1]);
         plane_r.push(px[2]);
@@ -1510,7 +1509,7 @@ pub fn encode_legacy_rgb_rle(pixels: &[u8], width: u32, height: u32, escape_len:
     let mut plane_b = Vec::with_capacity(n);
     let mut plane_g = Vec::with_capacity(n);
     let mut plane_r = Vec::with_capacity(n);
-    for px in pixels.chunks_exact(3) {
+    for px in pixels.as_chunks::<3>().0 {
         plane_b.push(px[0]);
         plane_g.push(px[1]);
         plane_r.push(px[2]);
@@ -1548,7 +1547,7 @@ pub fn encode_arith_rgba(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
     let mut plane_g = Vec::with_capacity(n);
     let mut plane_r = Vec::with_capacity(n);
     let mut plane_a = Vec::with_capacity(n);
-    for px in pixels.chunks_exact(4) {
+    for px in pixels.as_chunks::<4>().0 {
         plane_b.push(px[0]);
         plane_g.push(px[1]);
         plane_r.push(px[2]);
@@ -1618,11 +1617,7 @@ pub fn encode_arith_rgba(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
 pub fn encode_arith_rgb24_or_uncompressed(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
     let arith = encode_arith_rgb24(pixels, width, height);
     let raw = encode_uncompressed(pixels);
-    if raw.len() < arith.len() {
-        raw
-    } else {
-        arith
-    }
+    if raw.len() < arith.len() { raw } else { arith }
 }
 
 /// Frame-level **size-based type-1 fallback** wrapping
@@ -1630,11 +1625,7 @@ pub fn encode_arith_rgb24_or_uncompressed(pixels: &[u8], width: u32, height: u32
 pub fn encode_arith_yv12_or_uncompressed(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
     let arith = encode_arith_yv12(pixels, width, height);
     let raw = encode_uncompressed(pixels);
-    if raw.len() < arith.len() {
-        raw
-    } else {
-        arith
-    }
+    if raw.len() < arith.len() { raw } else { arith }
 }
 
 /// Frame-level **size-based type-1 fallback** wrapping
@@ -1642,11 +1633,7 @@ pub fn encode_arith_yv12_or_uncompressed(pixels: &[u8], width: u32, height: u32)
 pub fn encode_arith_yuy2_or_uncompressed(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
     let arith = encode_arith_yuy2(pixels, width, height);
     let raw = encode_uncompressed(pixels);
-    if raw.len() < arith.len() {
-        raw
-    } else {
-        arith
-    }
+    if raw.len() < arith.len() { raw } else { arith }
 }
 
 /// Frame-level **size-based type-1 fallback** wrapping
@@ -1654,11 +1641,7 @@ pub fn encode_arith_yuy2_or_uncompressed(pixels: &[u8], width: u32, height: u32)
 pub fn encode_arith_rgba_or_uncompressed(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
     let arith = encode_arith_rgba(pixels, width, height);
     let raw = encode_uncompressed(pixels);
-    if raw.len() < arith.len() {
-        raw
-    } else {
-        arith
-    }
+    if raw.len() < arith.len() { raw } else { arith }
 }
 
 /// Frame-level **size-based type-1 fallback** wrapping
@@ -1734,7 +1717,7 @@ pub fn encode_legacy_rgb_or_uncompressed(pixels: &[u8], width: u32, height: u32)
 /// is no input pixel to copy colour bytes from per `spec/01`
 /// §2.2.1's encoder mirror).
 fn solid_colour_bgr(pixels: &[u8]) -> Option<(u8, u8, u8)> {
-    let mut it = pixels.chunks_exact(3);
+    let mut it = pixels.as_chunks::<3>().0.iter();
     let first = it.next()?;
     let (b, g, r) = (first[0], first[1], first[2]);
     it.all(|px| px[0] == b && px[1] == g && px[2] == r)
@@ -1745,7 +1728,7 @@ fn solid_colour_bgr(pixels: &[u8]) -> Option<(u8, u8, u8)> {
 /// Returns the common `(B, G, R, A)` tuple when every pixel equals
 /// pixel 0, `None` otherwise (including on an empty buffer).
 fn solid_colour_bgra(pixels: &[u8]) -> Option<(u8, u8, u8, u8)> {
-    let mut it = pixels.chunks_exact(4);
+    let mut it = pixels.as_chunks::<4>().0.iter();
     let first = it.next()?;
     let (b, g, r, a) = (first[0], first[1], first[2], first[3]);
     it.all(|px| px[0] == b && px[1] == g && px[2] == r && px[3] == a)
@@ -1859,7 +1842,7 @@ pub fn encode_frame(pixels: &[u8], width: u32, height: u32, kind: PixelKind) -> 
             }
         }
         PixelKind::Bgra32 => {
-            if pixels.chunks_exact(4).all(|px| px[3] == 0xff) {
+            if pixels.as_chunks::<4>().0.iter().all(|px| px[3] == 0xff) {
                 // RGB32 (round 459): a 32-bpp host buffer whose alpha
                 // byte is `0xff` throughout carries no alpha
                 // information, and that is exactly what the RGB
@@ -1876,7 +1859,9 @@ pub fn encode_frame(pixels: &[u8], width: u32, height: u32, kind: PixelKind) -> 
                 // format verbatim), so it is sized against the
                 // 32-bpp buffer, not the 24-bpp intermediate.
                 let bgr: Vec<u8> = pixels
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .flat_map(|px| [px[0], px[1], px[2]])
                     .collect();
                 if let Some((b, g, r)) = solid_colour_bgr(&bgr) {
@@ -1888,11 +1873,7 @@ pub fn encode_frame(pixels: &[u8], width: u32, height: u32, kind: PixelKind) -> 
                 } else {
                     let arith = encode_arith_rgb24(&bgr, width, height);
                     let raw = encode_uncompressed(pixels);
-                    if raw.len() < arith.len() {
-                        raw
-                    } else {
-                        arith
-                    }
+                    if raw.len() < arith.len() { raw } else { arith }
                 }
             } else if let Some((b, g, r, a)) = solid_colour_bgra(pixels) {
                 encode_solid_rgba(b, g, r, a)
@@ -2062,7 +2043,9 @@ mod tests {
         let channel = encode_channel_simple(&plane);
         assert_eq!(
             channel,
-            [0, 30, 155, 154, 254, 216, 125, 25, 128, 94, 147, 211, 200, 53, 2, 154, 59, 176, 0],
+            [
+                0, 30, 155, 154, 254, 216, 125, 25, 128, 94, 147, 211, 200, 53, 2, 154, 59, 176, 0
+            ],
             "normalized-model header-0x00 wire drifted at a non-pow2 total"
         );
         let decoded = decode_channel(&channel, plane.len()).unwrap();
@@ -2323,16 +2306,15 @@ mod tests {
                     rle_pick = Some(escape_len);
                 }
             }
-            if let Some(escape_len) = rle_pick {
-                if rle_pick_est <= best.len().min(known_raw_min) as f64 + EST_GATE_MARGIN {
-                    let symbols = crate::rle::contract_raw(plane, escape_len);
-                    if let Some(candidate) =
-                        build_header_arith_rle_from_symbols(plane.len(), &symbols, escape_len)
-                    {
-                        if candidate.len() < best.len() {
-                            best = candidate;
-                        }
-                    }
+            if let Some(escape_len) = rle_pick
+                && rle_pick_est <= best.len().min(known_raw_min) as f64 + EST_GATE_MARGIN
+            {
+                let symbols = crate::rle::contract_raw(plane, escape_len);
+                if let Some(candidate) =
+                    build_header_arith_rle_from_symbols(plane.len(), &symbols, escape_len)
+                    && candidate.len() < best.len()
+                {
+                    best = candidate;
                 }
             }
             let mut raw = Vec::with_capacity(1 + plane.len());
@@ -2361,16 +2343,16 @@ mod tests {
                 if d > 0 {
                     let wrap = if header == 0x00 { 1usize } else { 5 };
                     let table = downscaled_table(&counts, d);
-                    if let Some(alt) = encode_prefix_and_body(&symbols, &table) {
-                        if wrap + alt.len() < best.len() {
-                            let mut v = Vec::with_capacity(wrap + alt.len());
-                            v.push(header);
-                            if header != 0x00 {
-                                v.extend_from_slice(&(symbols.len() as u32).to_le_bytes());
-                            }
-                            v.extend_from_slice(&alt);
-                            best = v;
+                    if let Some(alt) = encode_prefix_and_body(&symbols, &table)
+                        && wrap + alt.len() < best.len()
+                    {
+                        let mut v = Vec::with_capacity(wrap + alt.len());
+                        v.push(header);
+                        if header != 0x00 {
+                            v.extend_from_slice(&(symbols.len() as u32).to_le_bytes());
                         }
+                        v.extend_from_slice(&alt);
+                        best = v;
                     }
                 }
             }
@@ -2707,7 +2689,7 @@ mod tests {
     /// §1.2 channel-offset header).
     #[test]
     fn legacy_rgb_best_frame_roundtrips() {
-        use crate::decoder::{decode_frame, PixelKind};
+        use crate::decoder::{PixelKind, decode_frame};
         // 4×4, 8×8, 16×12 — the existing legacy_rgb_roundtrip_*
         // sizes from `roundtrip_tests.rs`. Stick to RGB-pattern
         // inputs that won't trigger Strategy E.
@@ -2897,7 +2879,7 @@ mod tests {
     /// split and an odd width, on pseudo-random content.
     #[test]
     fn public_encode_frame_roundtrips_every_kind() {
-        use crate::decoder::{decode_frame, PixelKind};
+        use crate::decoder::{PixelKind, decode_frame};
         // (w, h) chosen to span width%4==0 (8), width%4!=0 (6), and an
         // odd width (5) — the latter drives the YUY2 floor-chroma /
         // type-2 unaligned-RGB branches.
@@ -2936,7 +2918,7 @@ mod tests {
     /// decodes to the constant buffer.
     #[test]
     fn public_encode_frame_solid_fast_path() {
-        use crate::decoder::{decode_frame, PixelKind};
+        use crate::decoder::{PixelKind, decode_frame};
         // BGR grey (B==G==R) → type 5 (2 bytes).
         let grey = vec![0x40u8; 4 * 4 * 3];
         let f = encode_frame(&grey, 4, 4, PixelKind::Bgr24).unwrap();
@@ -3010,7 +2992,7 @@ mod tests {
     /// size bound never comes at the cost of correctness.
     #[test]
     fn public_encode_frame_never_exceeds_uncompressed() {
-        use crate::decoder::{decode_frame, PixelKind};
+        use crate::decoder::{PixelKind, decode_frame};
         // (w, h): the width%4 split (8 vs 6), an odd width (5), a
         // 1-row and a 1-col edge.
         let dims = [(8u32, 8u32), (6, 6), (5, 4), (8, 1), (1, 8)];
@@ -3046,8 +3028,8 @@ mod tests {
                 if len == 0 {
                     continue;
                 }
-                for (pname, gen) in patterns {
-                    let mut pixels = gen(len);
+                for (pname, r#gen) in patterns {
+                    let mut pixels = r#gen(len);
                     // YUY2 odd-width: neutralise the odd-tail chroma slot
                     // so the buffer is decoder-producible (round-trips).
                     if kind == PixelKind::Yuy2 && w % 2 == 1 {

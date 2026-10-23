@@ -1428,7 +1428,7 @@ mod tests {
     /// colour bytes 1..=N before filling the host buffer).
     #[test]
     fn frame_type_solid_wire_size_is_decoder_minimum_length() {
-        use crate::decoder::{decode_frame, PixelKind};
+        use crate::decoder::{PixelKind, decode_frame};
         for ft in [
             FrameType::SolidGrey,
             FrameType::SolidRgb,

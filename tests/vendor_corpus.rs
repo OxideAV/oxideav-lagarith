@@ -31,7 +31,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use oxideav_lagarith::{
-    decode_frame, decode_frame_vendor_layout, encode_frame, Decoder, PixelKind,
+    Decoder, PixelKind, decode_frame, decode_frame_vendor_layout, encode_frame,
 };
 
 #[path = "common/sha256.rs"]

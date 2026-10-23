@@ -65,7 +65,7 @@
 //! unchanged by the round-451 semantics; the pinned frames were
 //! re-verified oracle-exact through the same AVI pipeline).
 
-use oxideav_lagarith::{decode_frame, PixelKind};
+use oxideav_lagarith::{PixelKind, decode_frame};
 
 pub const RGB24_16X16_FRAME: &[u8] = &[
     0x04, 0x30, 0x00, 0x00, 0x00, 0x67, 0x00, 0x00, 0x00, 0x00, 0xb5, 0x86, 0xed, 0xf9, 0xb4, 0x6d,

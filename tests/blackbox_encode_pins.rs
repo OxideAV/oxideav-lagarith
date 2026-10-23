@@ -41,7 +41,7 @@
 //!    rows ≥ 2 (`src/predict.rs`; closes `spec/06` §6.4 for YV12,
 //!    `spec/06` §3.8 erratum candidate).
 
-use oxideav_lagarith::{decode_frame, encode_frame, wire_forms, PixelKind};
+use oxideav_lagarith::{PixelKind, decode_frame, encode_frame, wire_forms};
 
 /// 64-bit LCG — must stay bit-identical to the capture example's.
 struct Lcg(u64);

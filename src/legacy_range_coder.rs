@@ -198,7 +198,7 @@ fn rescale_freq(freq: &[u32; 256]) -> Result<([u32; 256], u32)> {
             if c == 256 {
                 c = 0;
                 idx = 0;
-            } else if c % 2 == 0 {
+            } else if c.is_multiple_of(2) {
                 idx = (c >> 1) as i32;
             } else {
                 idx = -(((c + 1) >> 1) as i32);
@@ -699,7 +699,7 @@ pub(crate) fn encode_legacy_freq_table(freq: &[u32; 256]) -> (Vec<u8>, bool) {
         let v = f.saturating_add(1);
         let m = v.ilog2();
         let length_class = m + 1; // = v.ilog2() + 1; always >= 1.
-                                  // Emit length-class via Zeckendorf decomposition + terminator.
+        // Emit length-class via Zeckendorf decomposition + terminator.
         let positions: std::collections::HashSet<usize> =
             legacy_zeckendorf(length_class).into_iter().collect();
         let highest = *positions.iter().max().expect("length_class >= 1");

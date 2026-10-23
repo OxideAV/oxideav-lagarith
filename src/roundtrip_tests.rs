@@ -14,7 +14,7 @@
 #![cfg(test)]
 
 use crate::channel::decode_channel;
-use crate::decoder::{decode_frame, decode_frame_with_prev, Decoder, PixelKind};
+use crate::decoder::{Decoder, PixelKind, decode_frame, decode_frame_with_prev};
 use crate::encoder::{
     encode_arith_reduced_res, encode_arith_rgb24, encode_arith_rgba, encode_arith_yuy2,
     encode_arith_yv12, encode_channel_arith_rle, encode_legacy_rgb, encode_legacy_rgb_rle,
@@ -49,7 +49,7 @@ fn pattern_bgra32(width: u32, height: u32) -> Vec<u8> {
 /// Packed YUY2 (`Y0 U Y1 V` per pair of pixels). `width` must be
 /// even so the chroma macropixel boundaries are well-defined.
 fn pattern_yuy2(width: u32, height: u32) -> Vec<u8> {
-    debug_assert!(width % 2 == 0);
+    debug_assert!(width.is_multiple_of(2));
     let n = width as usize * height as usize;
     let mut out = Vec::with_capacity(n * 2);
     for y in 0..height {
@@ -68,7 +68,7 @@ fn pattern_yuy2(width: u32, height: u32) -> Vec<u8> {
 /// Y + V + U planes concatenated. `width` and `height` must both be
 /// even so the chroma sub-sampling lands on whole pixels.
 fn pattern_yv12(width: u32, height: u32) -> Vec<u8> {
-    debug_assert!(width % 2 == 0 && height % 2 == 0);
+    debug_assert!(width.is_multiple_of(2) && height.is_multiple_of(2));
     let y_pixels = width as usize * height as usize;
     let c_pixels = y_pixels / 4;
     let mut out = Vec::with_capacity(y_pixels + 2 * c_pixels);
@@ -111,7 +111,7 @@ fn solid_grey_roundtrip() {
     let frame = encode_solid_grey(0x42);
     let dec = decode_frame(&frame, w, h, PixelKind::Bgr24).unwrap();
     assert_eq!(dec.pixels.len(), 3 * 5 * 3);
-    for chunk in dec.pixels.chunks_exact(3) {
+    for chunk in dec.pixels.as_chunks::<3>().0 {
         assert_eq!(chunk, &[0x42, 0x42, 0x42]);
     }
 }
@@ -121,7 +121,7 @@ fn solid_rgb_roundtrip() {
     let (w, h) = (4, 4);
     let frame = encode_solid_rgb(0x10, 0x20, 0x30);
     let dec = decode_frame(&frame, w, h, PixelKind::Bgr24).unwrap();
-    for chunk in dec.pixels.chunks_exact(3) {
+    for chunk in dec.pixels.as_chunks::<3>().0 {
         assert_eq!(chunk, &[0x10, 0x20, 0x30]);
     }
 }
@@ -131,7 +131,7 @@ fn solid_rgba_roundtrip() {
     let (w, h) = (2, 6);
     let frame = encode_solid_rgba(0x11, 0x22, 0x33, 0x80);
     let dec = decode_frame(&frame, w, h, PixelKind::Bgra32).unwrap();
-    for chunk in dec.pixels.chunks_exact(4) {
+    for chunk in dec.pixels.as_chunks::<4>().0 {
         assert_eq!(chunk, &[0x11, 0x22, 0x33, 0x80]);
     }
 }
@@ -223,7 +223,9 @@ fn arith_rgba_bgr24_matches_bgra32_bgr_portion() {
     // Strip the alpha bytes from the Bgra32 output and compare.
     let bgr_portion: Vec<u8> = dec_bgra32
         .pixels
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .flat_map(|p| [p[0], p[1], p[2]])
         .collect();
     assert_eq!(
@@ -266,7 +268,9 @@ fn arith_rgba_bgr24_skips_alpha_plane_decode() {
             corruption sits in the alpha body",
     );
     let expected_bgr: Vec<u8> = pixels
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .flat_map(|p| [p[0], p[1], p[2]])
         .collect();
     assert_eq!(dec_bgr24.pixels, expected_bgr);
@@ -356,11 +360,11 @@ fn channel_header_01_arith_rle_roundtrip() {
     // sprinkled non-zeros — exercises both the in-band RLE escape
     // and the literal byte path.
     let mut plane = vec![5u8, 7, 11];
-    plane.extend(std::iter::repeat(0u8).take(4));
+    plane.extend(std::iter::repeat_n(0u8, 4));
     plane.extend_from_slice(&[13]);
-    plane.extend(std::iter::repeat(0u8).take(7));
+    plane.extend(std::iter::repeat_n(0u8, 7));
     plane.extend_from_slice(&[17, 19, 23]);
-    plane.extend(std::iter::repeat(0u8).take(30));
+    plane.extend(std::iter::repeat_n(0u8, 30));
     plane.push(29);
 
     for escape_len in 1..=3 {
@@ -409,9 +413,9 @@ fn arith_rle_length_field_dispatch_boundary() {
     // emits a u32 length field below `n_pixels` and the natural
     // dispatch takes call site A.
     let mut plane = vec![5u8, 7, 11];
-    plane.extend(std::iter::repeat(0u8).take(6)); // one escape-able run
+    plane.extend(std::iter::repeat_n(0u8, 6)); // one escape-able run
     plane.extend_from_slice(&[13, 17]);
-    plane.extend(std::iter::repeat(0u8).take(10));
+    plane.extend(std::iter::repeat_n(0u8, 10));
     plane.push(29);
     let n_pixels = plane.len();
 
@@ -508,9 +512,9 @@ fn channel_header_05_07_raw_rle_roundtrip() {
     // using header byte 0x05..0x07 (raw RLE without arithmetic).
     use crate::rle::contract_raw;
     let mut plane = vec![5u8, 7, 11];
-    plane.extend(std::iter::repeat(0u8).take(4));
+    plane.extend(std::iter::repeat_n(0u8, 4));
     plane.extend_from_slice(&[13]);
-    plane.extend(std::iter::repeat(0u8).take(20));
+    plane.extend(std::iter::repeat_n(0u8, 20));
     plane.extend_from_slice(&[17]);
 
     for escape_len in 1..=3 {
@@ -578,10 +582,10 @@ fn channel_header_ff_integrates_to_a_solid_plane_per_family() {
     frame.extend_from_slice(&g_chan);
     frame.extend_from_slice(&[0xff, 0x20]);
     let dec = decode_frame(&frame, w, h, PixelKind::Bgr24).unwrap();
-    for (i, px) in dec.pixels.chunks_exact(3).enumerate() {
+    for (i, px) in dec.pixels.as_chunks::<3>().0.iter().enumerate() {
         let g = g_plane[i];
         assert_eq!(
-            px,
+            *px,
             [0x10u8.wrapping_add(g), g, 0x20u8.wrapping_add(g)],
             "pixel {i}"
         );
@@ -606,8 +610,8 @@ fn channel_header_ff_integrates_to_a_solid_plane_per_family() {
     frame.extend_from_slice(&13u32.to_le_bytes());
     frame.extend_from_slice(&[0xff, 0x5a, 0xff, 0x6c, 0xff, 0x9d]);
     let dec = decode_frame(&frame, w, h, PixelKind::Yuy2).unwrap();
-    for mp in dec.pixels.chunks_exact(4) {
-        assert_eq!(mp, [0x5a, 0x6c, 0x5a, 0x9d]);
+    for mp in dec.pixels.as_chunks::<4>().0 {
+        assert_eq!(*mp, [0x5a, 0x6c, 0x5a, 0x9d]);
     }
 }
 
@@ -719,7 +723,7 @@ fn yv12_odd_dims_decode_consumes_floor_chroma_byte_counts() {
         let ch = (h / 2) as usize;
         let y_pixels = w as usize * h as usize;
         let c_pixels = y_pixels / 4; // floor(W*H/4) per audit/00 §9.3
-                                     // Confirm we are on the genuine non-divisible branch.
+        // Confirm we are on the genuine non-divisible branch.
         assert_ne!(cw * ch, c_pixels, "{w}×{h} should trigger the floor branch");
 
         let pixels = yv12_odd_buffer(0x5f12_0c0d ^ ((w as u64) << 8) ^ h as u64, w, h);
@@ -860,7 +864,7 @@ fn stateful_decoder_updates_predecessor_on_each_decode() {
     // Solid grey frame -> first predecessor.
     let solid = encode_solid_grey(0x33);
     let f0 = dec.decode(&solid, w, h, PixelKind::Bgr24).unwrap();
-    for c in f0.pixels.chunks_exact(3) {
+    for c in f0.pixels.as_chunks::<3>().0 {
         assert_eq!(c, &[0x33, 0x33, 0x33]);
     }
 
@@ -1319,8 +1323,8 @@ fn yuy2_odd_width_decode_matches_floor_chroma_layout() {
     let w: u32 = 5;
     let h: u32 = 4;
     let cw = (w / 2) as usize; // = 2
-                               // Each channel = [0xff, 0x00] solid-fill encoding -> all-zero
-                               // residuals -> all-zero reconstructed plane.
+    // Each channel = [0xff, 0x00] solid-fill encoding -> all-zero
+    // residuals -> all-zero reconstructed plane.
     let ch_y = vec![0xff, 0x00];
     let ch_u = vec![0xff, 0x00];
     let ch_v = vec![0xff, 0x00];
@@ -1472,7 +1476,7 @@ fn legacy_rgb_roundtrip_to_bgra32_widens_with_opaque_alpha() {
     let dec = decode_frame(&frame, w, h, PixelKind::Bgra32).unwrap();
     // Widen pixels into BGRA32 with alpha=0xff for comparison.
     let mut expected = Vec::with_capacity(pixels.len() * 4 / 3);
-    for px in pixels.chunks_exact(3) {
+    for px in pixels.as_chunks::<3>().0 {
         expected.push(px[0]);
         expected.push(px[1]);
         expected.push(px[2]);
@@ -2004,7 +2008,7 @@ mod best_pipeline_size_delta {
     use crate::encoder::{encode_channel_simple, encode_uncompressed};
     use crate::frame::pack_channels;
     use crate::predict::{
-        apply_plane_forward_with_rule, cross_plane_decorrelate_rgb_forward, FirstColRule,
+        FirstColRule, apply_plane_forward_with_rule, cross_plane_decorrelate_rgb_forward,
     };
 
     /// A zero-heavy byte profile that mimics a post-gradient
@@ -2039,7 +2043,7 @@ mod best_pipeline_size_delta {
         let mut plane_b = Vec::with_capacity(n);
         let mut plane_g = Vec::with_capacity(n);
         let mut plane_r = Vec::with_capacity(n);
-        for px in pixels.chunks_exact(3) {
+        for px in pixels.as_chunks::<3>().0 {
             plane_b.push(px[0]);
             plane_g.push(px[1]);
             plane_r.push(px[2]);
@@ -2066,7 +2070,7 @@ mod best_pipeline_size_delta {
         let ch_b = encode_channel_simple(&res_b);
         let ch_g = encode_channel_simple(&res_g);
         let ch_r = encode_channel_simple(&res_r);
-        let type_byte = if width % 4 == 0 { 4 } else { 2 };
+        let type_byte = if width.is_multiple_of(4) { 4 } else { 2 };
         pack_channels(type_byte, &[&ch_b, &ch_g, &ch_r])
     }
 
@@ -2077,7 +2081,7 @@ mod best_pipeline_size_delta {
         let mut plane_g = Vec::with_capacity(n);
         let mut plane_r = Vec::with_capacity(n);
         let mut plane_a = Vec::with_capacity(n);
-        for px in pixels.chunks_exact(4) {
+        for px in pixels.as_chunks::<4>().0 {
             plane_b.push(px[0]);
             plane_g.push(px[1]);
             plane_r.push(px[2]);
@@ -2377,7 +2381,7 @@ mod best_pipeline_size_delta {
             let mut plane_b = Vec::with_capacity(n);
             let mut plane_g = Vec::with_capacity(n);
             let mut plane_r = Vec::with_capacity(n);
-            for px in pixels.chunks_exact(3) {
+            for px in pixels.as_chunks::<3>().0 {
                 plane_b.push(px[0]);
                 plane_g.push(px[1]);
                 plane_r.push(px[2]);
@@ -2475,8 +2479,8 @@ mod best_pipeline_size_delta {
 
 mod decoder_defensive_harness {
     use super::*;
-    use crate::frame::pack_channels;
     use crate::Error;
+    use crate::frame::pack_channels;
 
     // ─── frame-type / dispatch-level malformed inputs ───
 
@@ -2548,7 +2552,7 @@ mod decoder_defensive_harness {
     fn decode_uncompressed_truncated_body_is_truncated() {
         // 4×4 BGR24 needs 48 body bytes + 1 type byte = 49; offer 10.
         let mut payload = vec![1u8];
-        payload.extend(std::iter::repeat(0u8).take(9));
+        payload.extend(std::iter::repeat_n(0u8, 9));
         let r = decode_frame(&payload, 4, 4, PixelKind::Bgr24);
         assert!(
             matches!(r, Err(Error::Truncated { .. })),
@@ -2638,9 +2642,9 @@ mod decoder_defensive_harness {
         let mut payload = vec![4u8];
         payload.extend_from_slice(&0xffff_ffffu32.to_le_bytes()); // offset to G
         payload.extend_from_slice(&0u32.to_le_bytes()); // offset to B
-                                                        // pad some channel-body bytes so split_channels gets a non-tiny
-                                                        // frame to grade against
-        payload.extend(std::iter::repeat(0u8).take(64));
+        // pad some channel-body bytes so split_channels gets a non-tiny
+        // frame to grade against
+        payload.extend(std::iter::repeat_n(0u8, 64));
         let r = decode_frame(&payload, 4, 4, PixelKind::Bgr24);
         assert!(
             matches!(r, Err(Error::OffsetOutOfRange)),
@@ -2658,7 +2662,7 @@ mod decoder_defensive_harness {
         let mut payload = vec![4u8];
         payload.extend_from_slice(&30u32.to_le_bytes()); // offset to G
         payload.extend_from_slice(&20u32.to_le_bytes()); // offset to B
-        payload.extend(std::iter::repeat(0u8).take(64));
+        payload.extend(std::iter::repeat_n(0u8, 64));
         let r = decode_frame(&payload, 4, 4, PixelKind::Bgr24);
         assert!(
             matches!(r, Err(Error::OffsetOutOfRange)),
@@ -3114,12 +3118,12 @@ mod decoder_defensive_harness {
 #[cfg(test)]
 mod decoder_truncation_fuzz {
     use super::*;
+    use crate::Error;
     use crate::encoder::{
         encode_arith_reduced_res, encode_arith_rgb24, encode_arith_rgba, encode_arith_yuy2,
         encode_arith_yv12, encode_legacy_rgb, encode_solid_grey, encode_solid_rgb,
         encode_solid_rgba, encode_uncompressed,
     };
-    use crate::Error;
 
     /// Pattern body used as the encoder input — deterministic
     /// `i * 73 + 11` modulo 256 (the same pattern `pattern_bgr24`
@@ -3881,7 +3885,7 @@ mod encoder_random_roundtrip_property {
     /// Build a pseudo-random packed YUY2 pixel buffer
     /// (`Y0 U Y1 V` per pair of pixels, `width` must be even).
     fn random_yuy2(seed: u64, width: u32, height: u32) -> Vec<u8> {
-        debug_assert!(width % 2 == 0);
+        debug_assert!(width.is_multiple_of(2));
         lcg_bytes(seed, PixelKind::Yuy2.buffer_len(width, height))
     }
 
@@ -4247,9 +4251,9 @@ mod encoder_random_roundtrip_property {
     #[test]
     fn milestone_reduced_res_type11_fixed_point_non_pow2_inner() {
         let (w, h) = (12, 12); // inner half-res luma = 6×6 = 36 (non-pow2)
-                               // Encode a host-resolution YV12 buffer, downsample+re-encode as
-                               // type 11, decode, and re-encode the decoded output: the type-11
-                               // path is idempotent on its own fixed point.
+        // Encode a host-resolution YV12 buffer, downsample+re-encode as
+        // type 11, decode, and re-encode the decoded output: the type-11
+        // path is idempotent on its own fixed point.
         let host = random_yv12(MILESTONE_SEED ^ 0x6, w, h);
         let frame = encode_arith_reduced_res(&host, w, h);
         assert_eq!(frame[0], 11, "expected type-11 reduced-resolution");
@@ -4314,7 +4318,7 @@ mod pack_loop_byte_layout_pins {
         let decoded = decode_frame(&frame, W, H, PixelKind::Bgra32)
             .expect("RGB24-coded frame decodes to Bgra32");
         assert_eq!(decoded.pixels.len(), (W * H * 4) as usize);
-        for px in decoded.pixels.chunks_exact(4) {
+        for px in decoded.pixels.as_chunks::<4>().0 {
             assert_eq!(
                 px[3], 0xff,
                 "RGB-coded Bgra32 must fill alpha with 0xff (round-216 hoist invariant)",
@@ -4327,8 +4331,10 @@ mod pack_loop_byte_layout_pins {
             decode_frame(&frame, W, H, PixelKind::Bgr24).expect("RGB24 also decodes to Bgr24");
         for (i, (rgb, rgba)) in decoded_bgr
             .pixels
-            .chunks_exact(3)
-            .zip(decoded.pixels.chunks_exact(4))
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .zip(decoded.pixels.as_chunks::<4>().0)
             .enumerate()
         {
             assert_eq!(
@@ -4353,7 +4359,7 @@ mod pack_loop_byte_layout_pins {
         // non-constant gradient. The encoder maps interleaved
         // `B, G, R, A` -> four wire planes (`spec/01` §2.3).
         let mut pixels = vec![0u8; (W * H * 4) as usize];
-        for (i, px) in pixels.chunks_exact_mut(4).enumerate() {
+        for (i, px) in pixels.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             px[0] = (i & 0xff) as u8;
             px[1] = ((i >> 1) & 0xff) as u8;
             px[2] = ((i >> 2) & 0xff) as u8;
@@ -4373,8 +4379,10 @@ mod pack_loop_byte_layout_pins {
         assert_eq!(decoded_bgr.pixels.len(), (W * H * 3) as usize);
         for (i, (bgr, bgra)) in decoded_bgr
             .pixels
-            .chunks_exact(3)
-            .zip(decoded.pixels.chunks_exact(4))
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .zip(decoded.pixels.as_chunks::<4>().0)
             .enumerate()
         {
             assert_eq!(
@@ -4397,7 +4405,7 @@ mod pack_loop_byte_layout_pins {
         let decoded = decode_frame(&frame, W, H, PixelKind::Bgra32)
             .expect("legacy-RGB frame decodes to Bgra32");
         assert_eq!(decoded.pixels.len(), (W * H * 4) as usize);
-        for px in decoded.pixels.chunks_exact(4) {
+        for px in decoded.pixels.as_chunks::<4>().0 {
             assert_eq!(
                 px[3], 0xff,
                 "legacy-RGB Bgra32 must fill alpha with 0xff (round-216 hoist invariant)",
@@ -4408,8 +4416,10 @@ mod pack_loop_byte_layout_pins {
             decode_frame(&frame, W, H, PixelKind::Bgr24).expect("legacy-RGB also decodes to Bgr24");
         for (i, (bgr, bgra)) in decoded_bgr
             .pixels
-            .chunks_exact(3)
-            .zip(decoded.pixels.chunks_exact(4))
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .zip(decoded.pixels.as_chunks::<4>().0)
             .enumerate()
         {
             assert_eq!(
@@ -4441,12 +4451,12 @@ mod pack_loop_byte_layout_pins {
         let frame5 = encode_solid_grey(0x42);
         let dec5_24 = decode_frame(&frame5, W, H, PixelKind::Bgr24).expect("solid-grey Bgr24");
         assert_eq!(dec5_24.pixels.len(), N * 3);
-        for px in dec5_24.pixels.chunks_exact(3) {
+        for px in dec5_24.pixels.as_chunks::<3>().0 {
             assert_eq!(px, &[0x42, 0x42, 0x42][..]);
         }
         let dec5_32 = decode_frame(&frame5, W, H, PixelKind::Bgra32).expect("solid-grey Bgra32");
         assert_eq!(dec5_32.pixels.len(), N * 4);
-        for px in dec5_32.pixels.chunks_exact(4) {
+        for px in dec5_32.pixels.as_chunks::<4>().0 {
             assert_eq!(px, &[0x42, 0x42, 0x42, 0xff][..]);
         }
 
@@ -4455,11 +4465,11 @@ mod pack_loop_byte_layout_pins {
         let (b, g, r) = (0x11u8, 0x22, 0x33);
         let frame6 = encode_solid_rgb(b, g, r);
         let dec6_24 = decode_frame(&frame6, W, H, PixelKind::Bgr24).expect("solid-rgb Bgr24");
-        for px in dec6_24.pixels.chunks_exact(3) {
+        for px in dec6_24.pixels.as_chunks::<3>().0 {
             assert_eq!(px, &[b, g, r][..]);
         }
         let dec6_32 = decode_frame(&frame6, W, H, PixelKind::Bgra32).expect("solid-rgb Bgra32");
-        for px in dec6_32.pixels.chunks_exact(4) {
+        for px in dec6_32.pixels.as_chunks::<4>().0 {
             assert_eq!(px, &[b, g, r, 0xff][..]);
         }
 
@@ -4467,7 +4477,7 @@ mod pack_loop_byte_layout_pins {
         let (b, g, r, a) = (0x44u8, 0x55, 0x66, 0x77);
         let frame9 = encode_solid_rgba(b, g, r, a);
         let dec9_32 = decode_frame(&frame9, W, H, PixelKind::Bgra32).expect("solid-rgba Bgra32");
-        for px in dec9_32.pixels.chunks_exact(4) {
+        for px in dec9_32.pixels.as_chunks::<4>().0 {
             assert_eq!(
                 px,
                 &[b, g, r, a][..],
@@ -4556,7 +4566,7 @@ mod pack_loop_byte_layout_pins {
 ///    length, the wrapper returns the arithmetic form unchanged.
 #[cfg(test)]
 mod frame_uncompressed_size_guard {
-    use crate::decoder::{decode_frame, PixelKind};
+    use crate::decoder::{PixelKind, decode_frame};
     use crate::encoder::{
         encode_arith_rgb24, encode_arith_rgb24_or_uncompressed, encode_arith_rgba,
         encode_arith_rgba_or_uncompressed, encode_arith_yuy2, encode_arith_yuy2_or_uncompressed,
@@ -4794,9 +4804,12 @@ mod frame_uncompressed_size_guard {
         let arith = encode_arith_rgb24(&pixels, W, H);
         let guarded = encode_arith_rgb24_or_uncompressed(&pixels, W, H);
         assert_eq!(
-            guarded[0], 0x01,
+            guarded[0],
+            0x01,
             "expected type-1 wire (byte 0 = 0x01), got byte 0 = {:#x} (arith len {}, guarded len {})",
-            guarded[0], arith.len(), guarded.len(),
+            guarded[0],
+            arith.len(),
+            guarded.len(),
         );
         assert!(
             guarded.len() < arith.len(),
@@ -4918,7 +4931,7 @@ mod frame_uncompressed_size_guard {
 ///    wrapper does not double-emit or mutate the Strategy E output).
 #[cfg(test)]
 mod legacy_frame_uncompressed_size_guard {
-    use crate::decoder::{decode_frame, PixelKind};
+    use crate::decoder::{PixelKind, decode_frame};
     use crate::encoder::{
         encode_legacy_rgb, encode_legacy_rgb_or_uncompressed, encode_uncompressed,
     };
@@ -5011,9 +5024,12 @@ mod legacy_frame_uncompressed_size_guard {
         let legacy = encode_legacy_rgb(&pixels, W, H);
         let guarded = encode_legacy_rgb_or_uncompressed(&pixels, W, H);
         assert_eq!(
-            guarded[0], 0x01,
+            guarded[0],
+            0x01,
             "expected type-1 wire (byte 0 = 0x01), got byte 0 = {:#x} (legacy len {}, guarded len {})",
-            guarded[0], legacy.len(), guarded.len(),
+            guarded[0],
+            legacy.len(),
+            guarded.len(),
         );
         assert!(
             guarded.len() < legacy.len(),
@@ -5152,7 +5168,7 @@ mod legacy_frame_uncompressed_size_guard {
 ///    9- / 13-byte preamble + per-plane bodies).
 #[cfg(test)]
 mod frame_solid_fast_path {
-    use crate::decoder::{decode_frame, PixelKind};
+    use crate::decoder::{PixelKind, decode_frame};
     use crate::encoder::{
         encode_arith_rgb24, encode_arith_rgb24_or_solid, encode_arith_rgba,
         encode_arith_rgba_or_solid,
@@ -5933,9 +5949,9 @@ mod encoder_exhaustive_matrix {
         // literals) that contraction at each escape length is well
         // defined and the arithmetic histogram has >= 2 symbols.
         let mut plane = vec![5u8, 7, 11, 2];
-        plane.extend(std::iter::repeat(0u8).take(5));
+        plane.extend(std::iter::repeat_n(0u8, 5));
         plane.extend_from_slice(&[13, 0, 0, 17]);
-        plane.extend(std::iter::repeat(0u8).take(11));
+        plane.extend(std::iter::repeat_n(0u8, 11));
         plane.extend_from_slice(&[19, 23, 0, 0, 0, 29, 31]);
         let n = plane.len();
 
@@ -6213,7 +6229,7 @@ mod encoder_fuzz_harness {
                 // Occasional step.
                 level = level.wrapping_add(((lcg_next(state) >> 40) & 0x0f) as u8);
             }
-            let b = if lcg_next(state) % 191 == 0 {
+            let b = if lcg_next(state).is_multiple_of(191) {
                 // Sparse impulse.
                 (lcg_next(state) >> 33) as u8
             } else {
@@ -6552,7 +6568,7 @@ fn decode_rgb_family_with_rule(
 fn vendor_rgb_family_streams_decode_only_under_rule_b() {
     use crate::predict::FirstColRule;
     macro_rules! case {
-        ($dir:literal, $ext:literal, $w:expr, $h:expr, $bpp:expr) => {
+        ($dir:literal, $ext:literal, $w:expr_2021, $h:expr_2021, $bpp:expr_2021) => {
             (
                 $dir,
                 include_bytes!(concat!("../tests/vendor_corpus/", $dir, "/frame.lags")) as &[u8],
@@ -6613,7 +6629,7 @@ fn vendor_rgb_family_streams_decode_only_under_rule_b() {
 #[test]
 fn vendor_yv12_streams_decode_only_under_the_yuv_rule() {
     use crate::frame::split_channels;
-    use crate::predict::{apply_plane_inverse_with_rule, FirstColRule};
+    use crate::predict::{FirstColRule, apply_plane_inverse_with_rule};
     type Case = (&'static str, &'static [u8], &'static [u8], u32, u32);
     let cases: [Case; 3] = [
         (
@@ -6676,7 +6692,7 @@ fn vendor_yv12_streams_decode_only_under_the_yuv_rule() {
 /// mis-place every run).
 #[test]
 fn vendor_arith_rle_channels_consume_exactly_the_u32_symbol_count() {
-    use crate::frame::{split_channels, FrameType};
+    use crate::frame::{FrameType, split_channels};
     use crate::range_coder::{Cdf, RangeDecoder};
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/vendor_corpus");
     let manifest = std::fs::read_to_string(root.join("manifest.tsv")).unwrap();
@@ -6758,7 +6774,7 @@ fn vendor_arith_rle_channels_consume_exactly_the_u32_symbol_count() {
 /// the majority of those channels.
 #[test]
 fn vendor_non_pow2_channels_require_the_pow2_normaliser() {
-    use crate::frame::{split_channels, FrameType};
+    use crate::frame::{FrameType, split_channels};
     use crate::range_coder::{Cdf, RangeDecoder};
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/vendor_corpus");
     let manifest = std::fs::read_to_string(root.join("manifest.tsv")).unwrap();
@@ -6960,10 +6976,10 @@ fn vendor_layout_skips_recorrelation_on_single_row_rgb32() {
     let vendor = decode_frame_vendor_layout(&frame, w, h, PixelKind::Bgra32)
         .unwrap()
         .pixels;
-    for (i, px) in vendor.chunks_exact(4).enumerate() {
+    for (i, px) in vendor.as_chunks::<4>().0.iter().enumerate() {
         let (b, g, r) = (pixels[3 * i], pixels[3 * i + 1], pixels[3 * i + 2]);
         assert_eq!(
-            px,
+            *px,
             [b.wrapping_sub(g), g, r.wrapping_sub(g), 0xff],
             "pixel {i}"
         );
@@ -7038,8 +7054,8 @@ fn vendor_layout_seeds_tiny_yv12_first_column_from_the_preceding_byte() {
 #[test]
 fn yuv_seeded_predictor_with_plane0_seed_equals_the_yuv_rule() {
     use crate::predict::{
-        apply_plane_forward_with_rule, apply_plane_inverse_with_rule,
-        apply_plane_inverse_yuv_seeded, FirstColRule,
+        FirstColRule, apply_plane_forward_with_rule, apply_plane_inverse_with_rule,
+        apply_plane_inverse_yuv_seeded,
     };
     for (w, h) in [(4usize, 4usize), (6, 5), (16, 3)] {
         let plane: Vec<u8> = (0..w * h).map(|i| ((i * 37) ^ (i >> 2)) as u8).collect();
@@ -7151,7 +7167,9 @@ fn encoder_treats_opaque_bgra32_as_rgb32() {
     let (w, h) = (16u32, 16u32);
     let bgr = pattern_bgr24(w, h);
     let opaque: Vec<u8> = bgr
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .flat_map(|p| [p[0], p[1], p[2], 0xff])
         .collect();
     let frame = encode_frame(&opaque, w, h, PixelKind::Bgra32).unwrap();
@@ -7181,7 +7199,9 @@ fn encoder_treats_opaque_bgra32_as_rgb32() {
     // Unaligned width -> type 2.
     let (w2, h2) = (5u32, 7u32);
     let opaque2: Vec<u8> = pattern_bgr24(w2, h2)
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .flat_map(|p| [p[0], p[1], p[2], 0xff])
         .collect();
     let frame2 = encode_frame(&opaque2, w2, h2, PixelKind::Bgra32).unwrap();
