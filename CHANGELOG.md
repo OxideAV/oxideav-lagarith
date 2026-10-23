@@ -6,6 +6,12 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/OxideAV/oxideav-lagarith/compare/v0.0.2...v0.0.3) - 2026-10-23
+
+### Other
+
+- edition 2024, MSRV 1.95
+
 - edition 2024, MSRV 1.95
 
 ## [0.0.2](https://github.com/OxideAV/oxideav-lagarith/compare/v0.0.1...v0.0.2) - 2026-10-04
