@@ -6,6 +6,10 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- API hygiene: `Error`, `FrameType`, `PixelKind` and `DecodedFrame` are now `#[non_exhaustive]`. `ChannelHeader`, `LegacyChannelHeader` and `WirePlaneRole` stay exhaustive because the channel-header byte and the plane layout fix their value sets.
+
 - edition 2024, MSRV 1.95
 
 ## [0.0.2](https://github.com/OxideAV/oxideav-lagarith/compare/v0.0.1...v0.0.2) - 2026-10-04

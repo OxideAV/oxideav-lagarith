@@ -8,6 +8,7 @@ use crate::error::{Error, Result};
 /// YUY2 (3) and reduced-resolution (11); round 4 adds legacy RGB
 /// (type 7, `spec/07` adaptive-CDF range coder).
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FrameType {
     Uncompressed,    // 1
     UnalignedRgb24,  // 2

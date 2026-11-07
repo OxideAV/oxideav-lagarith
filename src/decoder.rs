@@ -44,6 +44,7 @@ use crate::predict::{
 
 /// What pixel format the caller wants the decoder to produce.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PixelKind {
     /// 24-bpp BGR (Windows `BI_RGB` 24-bpp DIB convention).
     Bgr24,
@@ -170,6 +171,7 @@ impl PixelKind {
 
 /// Decoded frame payload.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct DecodedFrame {
     pub width: u32,
     pub height: u32,

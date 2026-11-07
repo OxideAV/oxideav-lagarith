@@ -332,6 +332,7 @@ fn bit_count(kind: PixelKind) -> u16 {
         PixelKind::Bgra32 => 32,
         PixelKind::Yuy2 => 16,
         PixelKind::Yv12 => 12,
+        other => unreachable!("no capture layout for {other:?}"),
     }
 }
 
@@ -341,6 +342,7 @@ fn oracle_pix_fmt(kind: PixelKind) -> &'static str {
         PixelKind::Bgra32 => "bgra",
         PixelKind::Yuy2 => "yuyv422",
         PixelKind::Yv12 => "yuv420p",
+        other => unreachable!("no oracle pixel format for {other:?}"),
     }
 }
 
@@ -821,6 +823,7 @@ fn run_oracle(
         PixelKind::Yv12 => {
             candidates.push(("swap_vu", per_frame_xform(&|f: &[u8]| swap_vu(f, c.w, c.h))));
         }
+        _ => {}
     }
     for (name, cand) in &candidates {
         if cand == &got {

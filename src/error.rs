@@ -3,6 +3,7 @@
 
 /// Errors produced by the Lagarith decoder.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// Frame payload was empty (a NULL frame; presumed identical to
     /// the previous frame per `spec/01` §1.1). Decoders are expected
